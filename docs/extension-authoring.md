@@ -65,6 +65,19 @@ async fn main() -> Result<(), CoreError> {
 - `apply` 失败 → `FiberState::Failed`，句柄仍返回；查 `last_error()`。
 - 热更新：同 Key → `fiber.replace(new)`；跨 Key → `Runtime::unmount(old)` 后再 `plugin(new)`。
 
+## 配置更新
+
+插件实例应持有已经由宿主校验完成的强类型、不可变配置。`cordis-core` 不接收 JSON、
+不执行 Schema 校验，也不提供 `update(config)`。
+
+```text
+宿主读取配置 → 插件 Schema 校验/反序列化 → 构造新实例 → fiber.replace(new_instance)
+```
+
+- 校验或反序列化失败时，宿主不得调用 `replace`；旧 Active 实例保持运行。
+- `replace` 开始后旧实例会被释放；新实例的 `apply` 失败使 Fiber 进入 `Failed`，不会自动回滚旧实例。
+- 不得修改已挂载实例的内部配置后调用 `restart()`；`restart()` 仅用于配置未变的重新执行。
+
 ## ServiceKey / Event Key
 
 - 稳定 `&'static str`；同 Runtime 内 ID 永久绑定类型（事件另绑模式）。

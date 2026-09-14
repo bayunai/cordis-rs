@@ -10,6 +10,30 @@
 
 `cordis-core` **不包含** HTTP、数据库、Redis、JSON 配置、Manifest、WASM 或网关语义。
 
+## Bootstrap 配置边界
+
+宿主必须从本地、可人工恢复的**极小启动配置文件**启动；默认约定为
+`bootstrap.toml`。它是 Runtime 之外唯一不可由扩展自身替代的配置来源，目的是避免
+“配置扩展需要先读取自身配置”的启动循环。
+
+启动文件只能包含启动锚点：配置存储位置与类型、扩展包目录、信任公钥位置、基础日志
+设置，以及密钥的环境变量或外部引用；不得承载应用、路由、策略或任意插件业务配置，
+也不得保存凭证明文。
+
+```text
+bootstrap.toml
+  → 宿主创建 Runtime 并挂载配置存储扩展
+  → 配置扩展读取运行期主配置
+  → 宿主校验配置、构造不可变 Plugin 实例
+  → 挂载或 replace 已启用扩展
+```
+
+- 单机一体化部署可用本地 SQLite 作为运行期主配置存储。
+- 多节点部署必须使用 PostgreSQL 等网络数据库；禁止将 SQLite 放在 NFS、SMB 或其他
+  网络文件系统上作为共享配置库。
+- SQLite/PostgreSQL 配置存储、文件热更新和配置发布均是宿主或扩展能力，不进入
+  `cordis-core`。
+
 ## Runtime 与 Tokio
 
 - `Runtime::new()` **必须**在 Tokio Runtime 上下文中调用，否则返回 `SchedulerUnavailable`。
@@ -45,7 +69,11 @@ Context::plugin(Arc<dyn Plugin>)
                 跨 Key：Runtime::unmount(key) 后再 plugin(new)
 ```
 
-Provider 变化时，依赖该 Key 的 Plugin Fiber 自动 `Active → Pending → Active`。配置更新 = 宿主构造新 Plugin + `Fiber::replace`（Core **无** `update(json)`）。
+Provider 变化时，依赖该 Key 的 Plugin Fiber 自动 `Active → Pending → Active`。配置更新固定为：宿主读取并校验配置 → 构造新的不可变 Plugin 实例 → `Fiber::replace`（Core **无** `update(json)`）。
+
+- 配置无效：宿主记录配置错误，**不得调用** `replace`；旧 Active 实例继续运行。
+- 新实例 `apply` 失败：旧实例已释放，Fiber 进入 `Failed`；Core 不回滚配置或恢复旧实例。
+- `restart()` 只用于配置未变时的重新执行、依赖变化或人工恢复，禁止作为可变配置更新入口。
 
 `Context::inject` 仍返回 `InjectionHandle`（派生依赖），与 Plugin Fiber 分开诊断。
 

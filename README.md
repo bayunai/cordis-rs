@@ -16,6 +16,9 @@
 - [架构与边界](docs/architecture.md)
 - [扩展编写指南](docs/extension-authoring.md)
 
+启动约束：宿主从本地 `bootstrap.toml` 读取配置存储与扩展目录等最小启动锚点；SQLite
+或 PostgreSQL 中的运行期主配置由配置扩展读取。详见[Bootstrap 配置边界](docs/architecture.md#bootstrap-配置边界)。
+
 ## 快速开始
 
 ```rust

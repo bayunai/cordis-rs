@@ -28,9 +28,11 @@ impl fmt::Debug for PluginKey {
     }
 }
 
-/// 可挂载到 Context 的极简插件。
+/// 可挂载到 Context 的极简插件实例。
 ///
-/// 宿主负责构造插件对象；Core 只负责挂载与 Fiber 生命周期。
+/// 宿主负责校验配置并据此构造新的、配置不可变的插件实例；Core 只负责挂载与
+/// Fiber 生命周期，不保存 JSON、Schema 或可变插件配置。配置变更应由宿主构造
+/// 新实例后调用 [`crate::Fiber::replace`]，而不是修改已挂载实例后 `restart()`。
 #[async_trait]
 pub trait Plugin: Send + Sync {
     /// 稳定插件身份；`Runtime::unmount` / Fiber 归组按此 Key。

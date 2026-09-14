@@ -145,7 +145,11 @@ impl Fiber {
         self.inner.try_activate().await
     }
 
-    /// 先等待旧任务结束，再替换 Plugin 并重新激活。
+    /// 先等待旧任务结束，再替换为同 Key 的预校验不可变 Plugin 实例并重新激活。
+    ///
+    /// 配置 Schema、反序列化与校验属于宿主：配置无效时宿主不得调用本方法，旧
+    /// Active 实例继续运行。本方法开始后旧实例已释放；新实例 `apply()` 失败时
+    /// Fiber 进入 [`FiberState::Failed`]，不会自动恢复旧实例。
     pub async fn replace(&mut self, plugin: Arc<dyn Plugin>) -> Result<(), CoreError> {
         if self.is_disposed() {
             return Err(CoreError::FiberDisposed);
