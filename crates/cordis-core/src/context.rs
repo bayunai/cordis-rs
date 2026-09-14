@@ -34,12 +34,13 @@ impl Context {
     ///
     /// 视图不拥有独立 Scope；Service 与订阅的生命周期仍归属当前 Effect/Fiber。
     pub fn extend(&self) -> Result<Self, CoreError> {
-        self.extend_with_isolations(HashMap::new())
+        self.extend_with(HashMap::new(), HashMap::new())
     }
 
-    fn extend_with_isolations(
+    fn extend_with(
         &self,
         isolations: HashMap<ServiceId, IsolationLabel>,
+        configs: HashMap<crate::config::ConfigId, crate::config::ErasedConfig>,
     ) -> Result<Self, CoreError> {
         self.ensure_alive()?;
         let id = self.inner.registry.allocate_id();
@@ -50,7 +51,8 @@ impl Context {
                 .into_iter()
                 .map(|(key, label)| (key, label.id()))
                 .collect(),
-        );
+            configs,
+        )?;
         self.inner
             .registry
             .bind_node_lifecycle(id, &self.inner.scope);
@@ -70,7 +72,7 @@ impl Context {
     ) -> Result<(Self, IsolationLabel), CoreError> {
         self.ensure_alive()?;
         let label = self.inner.registry.allocate_isolation_label();
-        let view = self.extend_with_isolations(HashMap::from([(key.id(), label.clone())]))?;
+        let view = self.extend_with(HashMap::from([(key.id(), label.clone())]), HashMap::new())?;
         Ok((view, label))
     }
 
@@ -82,7 +84,7 @@ impl Context {
     ) -> Result<Self, CoreError> {
         self.ensure_alive()?;
         label.ensure_runtime(self.inner.registry.runtime_token())?;
-        self.extend_with_isolations(HashMap::from([(key.id(), label)]))
+        self.extend_with(HashMap::from([(key.id(), label)]), HashMap::new())
     }
 
     /// 创建带不可变配置覆盖的派生 Context；父与兄弟节点不变。
@@ -92,14 +94,16 @@ impl Context {
         value: T,
     ) -> Result<Self, CoreError> {
         self.ensure_alive()?;
-        let derived = self.extend()?;
-        derived.inner.registry.set_node_config(
-            derived.inner.id,
-            key.id(),
-            key.type_id(),
-            Arc::new(value),
-        )?;
-        Ok(derived)
+        self.extend_with(
+            HashMap::new(),
+            HashMap::from([(
+                key.id(),
+                crate::config::ErasedConfig {
+                    type_id: key.type_id(),
+                    value: Arc::new(value),
+                },
+            )]),
+        )
     }
 
     /// 自当前节点向父解析最近配置覆盖。

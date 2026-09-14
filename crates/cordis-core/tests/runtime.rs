@@ -1535,10 +1535,19 @@ async fn intercept_type_conflict_and_plugin_can_read_config() {
     let runtime = runtime();
     let root = runtime.root();
     let scoped = root.intercept(FLAG, Flag(true)).unwrap();
+    let context_count = runtime.diagnostics().contexts.len();
     assert!(matches!(
         root.intercept(FLAG_AS_OTHER, OtherFlag),
         Err(CoreError::ConfigKeyTypeConflict { .. })
     ));
+    assert_eq!(runtime.diagnostics().contexts.len(), context_count);
+    for _ in 0..3 {
+        assert!(matches!(
+            root.intercept(FLAG_AS_OTHER, OtherFlag),
+            Err(CoreError::ConfigKeyTypeConflict { .. })
+        ));
+    }
+    assert_eq!(runtime.diagnostics().contexts.len(), context_count);
     assert!(matches!(
         scoped.config(FLAG_AS_OTHER),
         Err(CoreError::ConfigTypeMismatch { .. })
@@ -1558,6 +1567,154 @@ async fn intercept_type_conflict_and_plugin_can_read_config() {
     let mut fiber = scoped.plugin(Arc::new(ConfigReader)).await.unwrap();
     assert_eq!(fiber.state(), FiberState::Active);
     fiber.dispose();
+}
+
+#[tokio::test]
+async fn waterfall_short_circuit_does_not_evaluate_downstream_metadata() {
+    let runtime = runtime();
+    let root = runtime.root();
+    let key = WaterfallKey::<Ping>::new("test.waterfall.short-metadata@1");
+    let delegate = Arc::new(AtomicBool::new(false));
+    let delegate_flag = delegate.clone();
+    root.on_waterfall(key, move |value, next| {
+        let delegate_flag = delegate_flag.clone();
+        async move {
+            if delegate_flag.load(Ordering::SeqCst) {
+                next.call(value).await
+            } else {
+                Ok(Ping(99))
+            }
+        }
+    })
+    .unwrap();
+    root.on_waterfall_with_options(
+        key,
+        ListenOptions::new().filter(|_: &Ping| Err(CoreError::EventListener("blocked".into()))),
+        |_value, _next| async move { Ok(Ping(0)) },
+    )
+    .unwrap();
+
+    assert_eq!(root.waterfall(key, Ping(1)).await.unwrap(), Ping(99));
+    delegate.store(true, Ordering::SeqCst);
+    assert!(matches!(
+        root.waterfall(key, Ping(1)).await,
+        Err(CoreError::EventListener(message)) if message == "blocked"
+    ));
+}
+
+#[tokio::test]
+async fn waterfall_once_is_claimed_only_when_listener_runs() {
+    let runtime = runtime();
+    let root = runtime.root();
+    let key = WaterfallKey::<Ping>::new("test.waterfall.once-at-invocation@1");
+    let delegate = Arc::new(AtomicBool::new(false));
+    let delegate_flag = delegate.clone();
+    let hits = Arc::new(AtomicUsize::new(0));
+    root.on_waterfall(key, move |value, next| {
+        let delegate_flag = delegate_flag.clone();
+        async move {
+            if delegate_flag.load(Ordering::SeqCst) {
+                next.call(value).await
+            } else {
+                Ok(value)
+            }
+        }
+    })
+    .unwrap();
+    let count = hits.clone();
+    root.on_waterfall_with_options(key, ListenOptions::new().once(), move |value, next| {
+        let count = count.clone();
+        async move {
+            count.fetch_add(1, Ordering::SeqCst);
+            next.call(value).await
+        }
+    })
+    .unwrap();
+
+    root.waterfall(key, Ping(1)).await.unwrap();
+    assert_eq!(hits.load(Ordering::SeqCst), 0);
+    delegate.store(true, Ordering::SeqCst);
+    root.waterfall(key, Ping(1)).await.unwrap();
+    root.waterfall(key, Ping(1)).await.unwrap();
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn waterfall_filter_receives_transformed_payload() {
+    let runtime = runtime();
+    let root = runtime.root();
+    let key = WaterfallKey::<Ping>::new("test.waterfall.transformed-filter@1");
+    let hits = Arc::new(AtomicUsize::new(0));
+    root.on_waterfall(key, |value, next| async move {
+        next.call(Ping(value.0 + 1)).await
+    })
+    .unwrap();
+    let count = hits.clone();
+    root.on_waterfall_with_options(
+        key,
+        ListenOptions::new().filter(|value: &Ping| Ok(value.0 == 2)),
+        move |value, next| {
+            let count = count.clone();
+            async move {
+                count.fetch_add(1, Ordering::SeqCst);
+                next.call(value).await
+            }
+        },
+    )
+    .unwrap();
+
+    assert_eq!(root.waterfall(key, Ping(1)).await.unwrap(), Ping(2));
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn parallel_filter_error_prevents_all_handlers_and_skipped_once_remains_available() {
+    let runtime = runtime();
+    let root = runtime.root();
+    let rejected = ParallelKey::<Ping>::new("test.parallel.filter-error@1");
+    let ran = Arc::new(AtomicUsize::new(0));
+    root.on_parallel_with_options(
+        rejected,
+        ListenOptions::new().filter(|_: &Ping| Err(CoreError::EventListener("blocked".into()))),
+        |_| async move { Ok(()) },
+    )
+    .unwrap();
+    let ran_flag = ran.clone();
+    root.on_parallel(rejected, move |_| {
+        let ran_flag = ran_flag.clone();
+        async move {
+            ran_flag.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    })
+    .unwrap();
+    assert!(matches!(
+        root.parallel(rejected, &Ping(1)).await,
+        Err(CoreError::EventListener(message)) if message == "blocked"
+    ));
+    assert_eq!(ran.load(Ordering::SeqCst), 0);
+
+    let once_key = ParallelKey::<Ping>::new("test.parallel.skipped-once@1");
+    let once_hits = Arc::new(AtomicUsize::new(0));
+    let count = once_hits.clone();
+    root.on_parallel_with_options(
+        once_key,
+        ListenOptions::new()
+            .once()
+            .filter(|value: &Ping| Ok(value.0 == 2)),
+        move |_| {
+            let count = count.clone();
+            async move {
+                count.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        },
+    )
+    .unwrap();
+    root.parallel(once_key, &Ping(1)).await.unwrap();
+    root.parallel(once_key, &Ping(2)).await.unwrap();
+    root.parallel(once_key, &Ping(2)).await.unwrap();
+    assert_eq!(once_hits.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]

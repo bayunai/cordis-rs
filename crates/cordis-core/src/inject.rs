@@ -446,20 +446,33 @@ impl Registry {
         id: NodeId,
         parent: Option<NodeId>,
         isolations: HashMap<ServiceId, u64>,
-    ) {
-        if let Ok(mut state) = self.state.lock() {
-            state
-                .isolations_seen
-                .extend(isolations.values().copied().map(|id| (id, ())));
-            state.nodes.insert(
-                id,
-                NodeRecord {
-                    parent,
-                    isolations,
-                    configs: HashMap::new(),
-                },
-            );
+        configs: HashMap<ConfigId, ErasedConfig>,
+    ) -> Result<(), CoreError> {
+        let mut state = self.state.lock().map_err(|_| CoreError::ContextDisposed)?;
+        for (key, config) in &configs {
+            if state
+                .config_types
+                .get(key)
+                .is_some_and(|expected| *expected != config.type_id)
+            {
+                return Err(CoreError::ConfigKeyTypeConflict { config: *key });
+            }
         }
+        for (key, config) in &configs {
+            state.config_types.entry(*key).or_insert(config.type_id);
+        }
+        state
+            .isolations_seen
+            .extend(isolations.values().copied().map(|id| (id, ())));
+        state.nodes.insert(
+            id,
+            NodeRecord {
+                parent,
+                isolations,
+                configs,
+            },
+        );
+        Ok(())
     }
 
     pub(crate) fn bind_node_lifecycle(self: &Arc<Self>, id: NodeId, scope: &EffectScope) {
@@ -504,42 +517,6 @@ impl Registry {
                 }
             }
         }
-    }
-
-    fn lock_config_type(
-        state: &mut RegistryState,
-        key: ConfigId,
-        type_id: TypeId,
-    ) -> Result<(), CoreError> {
-        match state.config_types.entry(key) {
-            std::collections::hash_map::Entry::Vacant(entry) => {
-                entry.insert(type_id);
-                Ok(())
-            }
-            std::collections::hash_map::Entry::Occupied(entry) => {
-                if *entry.get() == type_id {
-                    Ok(())
-                } else {
-                    Err(CoreError::ConfigKeyTypeConflict { config: key })
-                }
-            }
-        }
-    }
-
-    pub(crate) fn set_node_config(
-        &self,
-        node: NodeId,
-        key: ConfigId,
-        type_id: TypeId,
-        value: Arc<dyn Any + Send + Sync>,
-    ) -> Result<(), CoreError> {
-        let mut state = self.state.lock().map_err(|_| CoreError::ContextDisposed)?;
-        Self::lock_config_type(&mut state, key, type_id)?;
-        let Some(record) = state.nodes.get_mut(&node) else {
-            return Err(CoreError::ContextDisposed);
-        };
-        record.configs.insert(key, ErasedConfig { type_id, value });
-        Ok(())
     }
 
     pub(crate) fn resolve_config(
@@ -958,7 +935,7 @@ impl Registry {
     }
 
     pub(crate) async fn waterfall_event<T: Send + Sync + 'static>(
-        &self,
+        self: &Arc<Self>,
         node: NodeId,
         event_id: &'static str,
         value: T,
@@ -981,28 +958,29 @@ impl Registry {
                 .collect::<Vec<_>>()
         };
 
-        let mut handlers = Vec::new();
-        for (id, handler, meta) in selected {
-            if !Self::apply_filter(&meta.filter, payload_box.as_ref())? {
-                continue;
-            }
-            if meta.once {
-                if meta
-                    .once_gate
-                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                    .is_err()
-                {
-                    continue;
-                }
-                self.unsubscribe_event(event_id, id);
-            }
-            handlers.push(handler);
-        }
-
         let mut next: ErasedNext = Box::new(|boxed| Box::pin(async move { Ok(boxed) }));
-        for handler in handlers.into_iter().rev() {
+        for (id, handler, meta) in selected.into_iter().rev() {
             let prev = next;
-            next = Box::new(move |boxed| Box::pin(async move { handler(boxed, prev).await }));
+            let registry = self.clone();
+            next = Box::new(move |boxed| {
+                Box::pin(async move {
+                    if !Registry::apply_filter(&meta.filter, boxed.as_ref())? {
+                        return prev(boxed).await;
+                    }
+                    if meta.once
+                        && meta
+                            .once_gate
+                            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                            .is_err()
+                    {
+                        return prev(boxed).await;
+                    }
+                    if meta.once {
+                        registry.unsubscribe_event(event_id, id);
+                    }
+                    handler(boxed, prev).await
+                })
+            });
         }
         let boxed = next(payload_box).await?;
         boxed
@@ -1090,21 +1068,15 @@ impl Registry {
                 })
                 .collect::<Vec<_>>()
         };
-        let mut handlers = Vec::new();
-        let mut filter_errors = Vec::new();
+        let mut eligible = Vec::new();
         for (id, handler, meta) in selected {
-            match Self::apply_filter(&meta.filter, payload) {
-                Ok(false) => continue,
-                Ok(true) => {}
-                Err(CoreError::EventListener(message)) => {
-                    filter_errors.push(message);
-                    continue;
-                }
-                Err(other) => {
-                    filter_errors.push(other.to_string());
-                    continue;
-                }
+            if Self::apply_filter(&meta.filter, payload)? {
+                eligible.push((id, handler, meta));
             }
+        }
+
+        let mut handlers = Vec::new();
+        for (id, handler, meta) in eligible {
             if meta.once {
                 if meta
                     .once_gate
@@ -1118,12 +1090,14 @@ impl Registry {
             handlers.push(handler);
         }
         let results = join_all(handlers.iter().map(|handler| handler.invoke(payload))).await;
-        let mut errors = filter_errors;
-        errors.extend(results.into_iter().filter_map(|result| match result {
-            Ok(()) => None,
-            Err(CoreError::EventListener(message)) => Some(message),
-            Err(other) => Some(other.to_string()),
-        }));
+        let errors = results
+            .into_iter()
+            .filter_map(|result| match result {
+                Ok(()) => None,
+                Err(CoreError::EventListener(message)) => Some(message),
+                Err(other) => Some(other.to_string()),
+            })
+            .collect::<Vec<_>>();
         if errors.is_empty() {
             Ok(())
         } else {
