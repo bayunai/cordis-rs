@@ -1,0 +1,12 @@
+[package]
+name = "cordis-testkit"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Test helpers for cordis-core (not for production hosts)."
+
+[dependencies]
+async-trait.workspace = true
+cordis-core.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
