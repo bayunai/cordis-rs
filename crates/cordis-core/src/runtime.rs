@@ -30,7 +30,7 @@ impl Runtime {
         registry.start_scheduler()?;
         let root_id = registry.allocate_id();
         let root_scope = EffectScope::root();
-        registry.add_node(root_id, None);
+        registry.add_node(root_id, None, std::collections::HashMap::new());
         registry.bind_node_lifecycle(root_id, &root_scope);
         Ok(Self {
             inner: Arc::new(RuntimeInner {
@@ -40,7 +40,6 @@ impl Runtime {
                         id: root_id,
                         registry,
                         scope: root_scope,
-                        isolations: std::sync::Mutex::new(std::collections::HashMap::new()),
                     }),
                 },
                 shutdown_completed: AtomicBool::new(false),

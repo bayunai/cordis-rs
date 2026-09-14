@@ -316,18 +316,11 @@ impl FiberInner {
                 return Err(CoreError::ContextDisposed);
             }
         };
-        let isolations = mount
-            .inner
-            .isolations
-            .lock()
-            .map(|guard| guard.clone())
-            .unwrap_or_default();
         let apply_ctx = Context {
             inner: Arc::new(crate::context::ContextInner {
                 id: mount.inner.id,
                 registry: mount.inner.registry.clone(),
                 scope: effect_scope.clone(),
-                isolations: Mutex::new(isolations),
             }),
         };
         registry.register_effect(

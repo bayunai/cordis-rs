@@ -66,14 +66,15 @@ async fn late_provider_activates_consumer_without_manual_settle() {
 }
 
 #[tokio::test]
-async fn child_context_overrides_then_disposal_falls_back_to_parent() {
+async fn effect_owned_extended_context_overrides_then_disposal_falls_back_to_parent() {
     let runtime = runtime();
     let root = runtime.root();
     root.provide(NUMBER, Number(1)).unwrap();
-    let child = root.child().unwrap();
+    let owner = root.effect().unwrap();
+    let child = owner.extend().unwrap();
     child.provide(NUMBER, Number(2)).unwrap();
     assert_eq!(child.get(NUMBER).unwrap().0, 2);
-    child.dispose();
+    owner.dispose();
     assert_eq!(root.get(NUMBER).unwrap().0, 1);
 }
 
@@ -181,8 +182,9 @@ async fn shutdown_cancels_and_waits_for_controlled_tasks() {
 #[tokio::test]
 async fn disposed_context_fail_fast() {
     let runtime = runtime();
-    let child = runtime.root().child().unwrap();
-    child.dispose();
+    let owner = runtime.root().effect().unwrap();
+    let child = owner.extend().unwrap();
+    owner.dispose();
     assert!(matches!(
         child.provide(NUMBER, Number(1)),
         Err(CoreError::ContextDisposed)
@@ -193,8 +195,8 @@ async fn disposed_context_fail_fast() {
 #[tokio::test]
 async fn cross_context_isolation() {
     let runtime = runtime();
-    let left = runtime.root().child().unwrap();
-    let right = runtime.root().child().unwrap();
+    let left = runtime.root().extend().unwrap();
+    let right = runtime.root().extend().unwrap();
     left.provide(NUMBER, Number(1)).unwrap();
     assert_service_unavailable(&right, NUMBER);
     assert_eq!(left.get(NUMBER).unwrap().0, 1);
@@ -509,7 +511,7 @@ async fn scope_dispose_interleaved_with_child_cleanup_and_spawn() {
             effect.on_dispose(move || {
                 counter.fetch_add(1, Ordering::SeqCst);
             });
-            let _child = effect.child();
+            let _child = effect.extend();
             let _ = effect.spawn(|cancel| async move {
                 cancel.cancelled().await;
             });
@@ -758,7 +760,8 @@ async fn plugin_apply_races_parent_dispose_returns_no_handle() {
         }
     }
 
-    let parent = root.child().unwrap();
+    let parent_owner = root.effect().unwrap();
+    let parent = parent_owner.extend().unwrap();
     let parent_for_mount = parent.clone();
     let mount = tokio::spawn(async move {
         parent_for_mount
@@ -769,7 +772,7 @@ async fn plugin_apply_races_parent_dispose_returns_no_handle() {
             .await
     });
     entered_rx.await.expect("plugin entered apply");
-    parent.dispose();
+    parent_owner.dispose();
     let _ = gate_tx.send(());
     let result = mount.await.expect("join").expect("fiber handle");
     assert_eq!(result.state(), cordis_core::FiberState::Disposed);
@@ -782,7 +785,7 @@ async fn service_and_event_key_types_are_globally_locked() {
     let root = runtime.root();
     root.provide(NUMBER, Number(1)).unwrap();
 
-    let child = root.child().unwrap();
+    let child = root.extend().unwrap();
     assert!(matches!(
         child.provide(OTHER_NUMBER, Other),
         Err(CoreError::ServiceKeyTypeConflict { .. })
@@ -791,11 +794,12 @@ async fn service_and_event_key_types_are_globally_locked() {
     // Provider 撤销后类型合同仍保留。
     let provider = root.effect().unwrap();
     // root 已占用同 Key；用子 Context 提供后再撤销验证合同。
-    let scoped = root.child().unwrap();
+    let scoped_owner = root.effect().unwrap();
+    let scoped = scoped_owner.extend().unwrap();
     scoped.provide(NUMBER, Number(2)).unwrap();
-    scoped.dispose();
+    scoped_owner.dispose();
     assert!(matches!(
-        root.child().unwrap().provide(OTHER_NUMBER, Other),
+        root.extend().unwrap().provide(OTHER_NUMBER, Other),
         Err(CoreError::ServiceKeyTypeConflict { .. })
     ));
     let _ = provider;
@@ -812,16 +816,17 @@ async fn service_and_event_key_types_are_globally_locked() {
 }
 
 #[tokio::test]
-async fn context_dispose_removes_node_from_diagnostics() {
+async fn effect_dispose_removes_extended_nodes_from_diagnostics() {
     let runtime = runtime();
     let root = runtime.root();
     let before = runtime.diagnostics().contexts.len();
-    let child = root.child().unwrap();
+    let owner = root.effect().unwrap();
+    let child = owner.extend().unwrap();
     child.provide(NUMBER, Number(1)).unwrap();
     child.on(PING, |_| Ok(())).unwrap();
     assert_eq!(runtime.diagnostics().contexts.len(), before + 1);
     assert!(!runtime.diagnostics().providers.is_empty());
-    child.dispose();
+    owner.dispose();
     assert_eq!(runtime.diagnostics().contexts.len(), before);
     assert!(runtime.diagnostics().providers.is_empty());
     root.emit(PING, &Ping(1)).unwrap();
@@ -920,7 +925,7 @@ async fn drop_runtime_without_shutdown_allows_new_runtime() {
 }
 
 #[tokio::test]
-async fn child_dispose_then_drop_context_parent_shutdown_waits_task() {
+async fn effect_dispose_then_drop_parent_shutdown_waits_task() {
     let runtime = runtime();
     let root = runtime.root();
     let finished = Arc::new(AtomicBool::new(false));
@@ -943,26 +948,51 @@ async fn child_dispose_then_drop_context_parent_shutdown_waits_task() {
 }
 
 #[tokio::test]
+async fn isolate_derives_view_without_mutating_parent_or_siblings() {
+    let runtime = runtime();
+    let root = runtime.root();
+    root.provide(NUMBER, Number(1)).unwrap();
+    let sibling = root.extend().unwrap();
+
+    let (isolated, label) = root.isolate(NUMBER).unwrap();
+    assert_eq!(root.get(NUMBER).unwrap().0, 1);
+    assert_eq!(sibling.get(NUMBER).unwrap().0, 1);
+    assert_service_unavailable(&isolated, NUMBER);
+
+    let owner = isolated.effect().unwrap();
+    owner.provide(NUMBER, Number(2)).unwrap();
+    let nested = isolated.extend().unwrap();
+    let shared = root.isolate_with(NUMBER, label).unwrap();
+    assert_eq!(isolated.get(NUMBER).unwrap().0, 2);
+    assert_eq!(nested.get(NUMBER).unwrap().0, 2);
+    assert_eq!(shared.get(NUMBER).unwrap().0, 2);
+    assert_eq!(root.get(NUMBER).unwrap().0, 1);
+    assert_eq!(sibling.get(NUMBER).unwrap().0, 1);
+
+    owner.dispose();
+    assert_service_unavailable(&isolated, NUMBER);
+    assert_eq!(root.get(NUMBER).unwrap().0, 1);
+}
+
+#[tokio::test]
 async fn isolation_label_shares_service_across_sibling_contexts() {
     let rt = runtime();
     let root = rt.root();
-    let room = root.child().unwrap();
-    let label = room.isolate(NUMBER).unwrap();
+    let room_base = root.extend().unwrap();
+    let (room, label) = room_base.isolate(NUMBER).unwrap();
     room.provide(NUMBER, Number(11)).unwrap();
 
-    let a = root.child().unwrap();
-    a.isolate_with(NUMBER, label.clone()).unwrap();
+    let a = root.isolate_with(NUMBER, label.clone()).unwrap();
     assert_eq!(a.get(NUMBER).unwrap().0, 11);
 
-    let b = root.child().unwrap();
-    b.isolate_with(NUMBER, label).unwrap();
+    let b = root.isolate_with(NUMBER, label).unwrap();
     assert_eq!(b.get(NUMBER).unwrap().0, 11);
 
-    let plain = root.child().unwrap();
+    let plain = root.extend().unwrap();
     assert_service_unavailable(&plain, NUMBER);
 
     let other_rt = runtime();
-    let foreign = other_rt.root().isolate(NUMBER).unwrap();
+    let (_, foreign) = other_rt.root().isolate(NUMBER).unwrap();
     assert!(matches!(
         room.isolate_with(NUMBER, foreign),
         Err(CoreError::IsolationRuntimeMismatch)
@@ -973,8 +1003,8 @@ async fn isolation_label_shares_service_across_sibling_contexts() {
 async fn isolation_provider_change_reactivates_plugin_fiber() {
     let runtime = runtime();
     let root = runtime.root();
-    let _label = root.isolate(NUMBER).unwrap();
-    let provider = root.effect_named("provider").unwrap();
+    let (isolated, _label) = root.isolate(NUMBER).unwrap();
+    let provider = isolated.effect_named("provider").unwrap();
     provider.provide(NUMBER, Number(1)).unwrap();
 
     struct DepPlugin;
@@ -989,7 +1019,7 @@ async fn isolation_provider_change_reactivates_plugin_fiber() {
         }
     }
 
-    let mut fiber = root.plugin(Arc::new(DepPlugin)).await.unwrap();
+    let mut fiber = isolated.plugin(Arc::new(DepPlugin)).await.unwrap();
     assert_eq!(fiber.state(), FiberState::Active);
 
     provider.dispose();
@@ -997,7 +1027,7 @@ async fn isolation_provider_change_reactivates_plugin_fiber() {
     wait_until(|| fiber.state() == FiberState::Pending).await;
     assert_ne!(fiber.state(), FiberState::Loading);
 
-    let again = root.effect_named("provider2").unwrap();
+    let again = isolated.effect_named("provider2").unwrap();
     again.provide(NUMBER, Number(2)).unwrap();
     runtime.settle().await;
     wait_until(|| fiber.state() == FiberState::Active).await;
@@ -1279,7 +1309,8 @@ async fn provider_replaced_during_loading_reactivates_with_fresh() {
 async fn restart_during_parent_dispose_keeps_disposed() {
     let runtime = runtime();
     let root = runtime.root();
-    let parent = root.child().unwrap();
+    let parent_owner = root.effect().unwrap();
+    let parent = parent_owner.extend().unwrap();
     let finished = Arc::new(AtomicBool::new(false));
     let flag = finished.clone();
 
@@ -1315,7 +1346,7 @@ async fn restart_during_parent_dispose_keeps_disposed() {
     });
     // 给 restart 进入 dispose_wait 的窗口。
     tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    parent.dispose();
+    parent_owner.dispose();
     let (fiber, result) = restart.await.expect("join");
     assert!(matches!(result, Err(CoreError::FiberDisposed)));
     assert_eq!(fiber.state(), FiberState::Disposed);
@@ -1335,7 +1366,8 @@ async fn restart_during_parent_dispose_keeps_disposed() {
 async fn replace_during_parent_dispose_keeps_disposed_and_skips_new_plugin() {
     let runtime = runtime();
     let root = runtime.root();
-    let parent = root.child().unwrap();
+    let parent_owner = root.effect().unwrap();
+    let parent = parent_owner.extend().unwrap();
     let (cancelled_tx, cancelled_rx) = oneshot::channel::<()>();
     let (release_tx, release_rx) = oneshot::channel::<()>();
     let cancelled_tx = Arc::new(Mutex::new(Some(cancelled_tx)));
@@ -1395,7 +1427,7 @@ async fn replace_during_parent_dispose_keeps_disposed_and_skips_new_plugin() {
         (fiber, result)
     });
     cancelled_rx.await.expect("old effect was cancelled");
-    parent.dispose();
+    parent_owner.dispose();
     let _ = release_tx.send(());
 
     let (fiber, result) = replace.await.expect("join");

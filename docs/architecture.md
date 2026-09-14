@@ -19,7 +19,8 @@
 ## Isolation
 
 - `IsolationLabel` 由 Runtime 分配，跨 Runtime 使用 → `IsolationRuntimeMismatch`。
-- `Context::isolate(key)` 为指定 Service 新建标签；`isolate_with(key, label)` 加入既有标签。
+- `Context::extend()` 创建派生 Context 节点，不创建 Scope；父 Context 不会被修改。
+- `Context::isolate(key)` 返回 `(派生 Context, 新标签)`；`isolate_with(key, label)` 返回加入既有标签的派生 Context。
 - 解析：若当前 Context 谱系对该 Key 有隔离覆盖，则只看同 label 的 Provider；否则走父子 Local 覆盖。
 - 隔离**只影响声明的 Key**；其他 Service 仍按父子链解析。
 
@@ -27,7 +28,7 @@
 
 1. `Context::inject(deps, callback)` 登记派生 inject fiber；依赖未齐时为 `Pending`。
 2. `provide` / Provider 释放会标记 dirty，调度器串行重算。
-3. 子 Context 覆盖父 Provider（未隔离 Key）；子释放后回退。
+3. 派生 Context 覆盖父 Provider（未隔离 Key）；Effect/Fiber 释放后 Provider 自动回退。
 4. 同槽冲突返回 `ServiceConflict`；Runtime 内 ID↔TypeId 永久锁定。
 
 ## Fiber（Plugin 生命周期）
@@ -50,7 +51,7 @@ Provider 变化时，依赖该 Key 的 Plugin Fiber 自动 `Active → Pending �
 ## Effect
 
 - 具名 `EffectHandle`（`effect()` / `effect_named`）；记录父子、取消状态与资源计数。
-- Provider / 订阅 / 任务 / 子 Fiber 挂在创建它们的 Effect 上。
+- Provider / 订阅 / 任务 / 子 Fiber 挂在创建它们的 Effect 或 Fiber 上；Context 只是视图，不能单独释放。
 - `dispose` 上收任务；`dispose_wait` 本地 await（热卸载）。
 
 ## Event

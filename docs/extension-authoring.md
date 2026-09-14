@@ -43,9 +43,16 @@ async fn main() -> Result<(), CoreError> {
 
 ## Isolation
 
-- `ctx.isolate(KEY)` / `ctx.isolate_with(KEY, label)` 只隔离声明的 Service。
+- `let (isolated, label) = ctx.isolate(KEY)?` 创建带新标签的派生 Context；原 `ctx` 不变。
+- `ctx.isolate_with(KEY, label)?` 创建加入既有标签的派生 Context。
 - 同 label 的兄弟 Context 共享该 Key；未加入 label 的 Context 不可见。
 - 标签不可跨 Runtime。
+
+## Context 与资源生命周期
+
+- `Context::extend()`、`isolate()` 返回的都是派生视图，没有 `dispose()`。
+- 需要可卸载的 Provider、订阅或任务时，先通过 `ctx.effect()` 获取 `EffectContext`，再在其上 `extend()` 或创建资源。
+- 资源只由 `EffectContext`、`Fiber` 或 `Runtime::shutdown()` 释放；不要把 Context 句柄当作资源所有者。
 
 ## Fiber
 

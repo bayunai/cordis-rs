@@ -214,15 +214,6 @@ impl Registry {
         label
     }
 
-    pub(crate) fn set_node_isolation(&self, node: NodeId, key: ServiceId, label_id: u64) {
-        if let Ok(mut state) = self.state.lock() {
-            state.isolations_seen.insert(label_id, ());
-            if let Some(record) = state.nodes.get_mut(&node) {
-                record.isolations.insert(key, label_id);
-            }
-        }
-    }
-
     pub(crate) fn mark_dirty_public(self: &Arc<Self>) {
         self.mark_dirty();
     }
@@ -335,15 +326,17 @@ impl Registry {
         self.next_id.fetch_add(1, Ordering::Relaxed)
     }
 
-    pub(crate) fn add_node(self: &Arc<Self>, id: NodeId, parent: Option<NodeId>) {
+    pub(crate) fn add_node(
+        self: &Arc<Self>,
+        id: NodeId,
+        parent: Option<NodeId>,
+        isolations: HashMap<ServiceId, u64>,
+    ) {
         if let Ok(mut state) = self.state.lock() {
-            state.nodes.insert(
-                id,
-                NodeRecord {
-                    parent,
-                    isolations: HashMap::new(),
-                },
-            );
+            state
+                .isolations_seen
+                .extend(isolations.values().copied().map(|id| (id, ())));
+            state.nodes.insert(id, NodeRecord { parent, isolations });
         }
     }
 

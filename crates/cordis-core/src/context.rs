@@ -21,7 +21,6 @@ pub(crate) struct ContextInner {
     pub(crate) id: NodeId,
     pub(crate) registry: Arc<Registry>,
     pub(crate) scope: EffectScope,
-    pub(crate) isolations: Mutex<HashMap<ServiceId, IsolationLabel>>,
 }
 
 /// 通用的层级 Service Context。
@@ -31,75 +30,59 @@ pub struct Context {
 }
 
 impl Context {
-    /// 创建继承当前 Context Service 可见性的子 Context。
-    pub fn child(&self) -> Result<Self, CoreError> {
+    /// 创建继承当前 Context 的派生视图。
+    ///
+    /// 视图不拥有独立 Scope；Service 与订阅的生命周期仍归属当前 Effect/Fiber。
+    pub fn extend(&self) -> Result<Self, CoreError> {
+        self.extend_with_isolations(HashMap::new())
+    }
+
+    fn extend_with_isolations(
+        &self,
+        isolations: HashMap<ServiceId, IsolationLabel>,
+    ) -> Result<Self, CoreError> {
         self.ensure_alive()?;
         let id = self.inner.registry.allocate_id();
-        let scope = self.inner.scope.child_named("context");
-        self.inner.registry.add_node(id, Some(self.inner.id));
-        let isolations = self
-            .inner
-            .isolations
-            .lock()
-            .map_err(|_| CoreError::ContextDisposed)?
-            .clone();
-        for (key, label) in &isolations {
-            self.inner.registry.set_node_isolation(id, *key, label.id());
-        }
-        self.inner.registry.bind_node_lifecycle(id, &scope);
-        self.inner.registry.register_effect(
-            scope.id(),
-            scope.name().to_string(),
-            scope.parent_id(),
-            Some(id),
-            None,
-            &scope,
+        self.inner.registry.add_node(
+            id,
+            Some(self.inner.id),
+            isolations
+                .into_iter()
+                .map(|(key, label)| (key, label.id()))
+                .collect(),
         );
+        self.inner
+            .registry
+            .bind_node_lifecycle(id, &self.inner.scope);
         Ok(Self {
             inner: Arc::new(ContextInner {
                 id,
                 registry: self.inner.registry.clone(),
-                scope,
-                isolations: Mutex::new(isolations),
+                scope: self.inner.scope.clone(),
             }),
         })
     }
 
-    /// 在当前 Context 为指定 Service 建立新隔离标签。
+    /// 创建仅对派生 Context 生效的新隔离标签。
     pub fn isolate<T: Send + Sync + 'static>(
         &self,
         key: ServiceKey<T>,
-    ) -> Result<IsolationLabel, CoreError> {
+    ) -> Result<(Self, IsolationLabel), CoreError> {
         self.ensure_alive()?;
         let label = self.inner.registry.allocate_isolation_label();
-        self.inner
-            .registry
-            .set_node_isolation(self.inner.id, key.id(), label.id());
-        self.inner
-            .isolations
-            .lock()
-            .map_err(|_| CoreError::ContextDisposed)?
-            .insert(key.id(), label.clone());
-        Ok(label)
+        let view = self.extend_with_isolations(HashMap::from([(key.id(), label.clone())]))?;
+        Ok((view, label))
     }
 
-    /// 加入既有隔离标签；跨 Runtime 标签报错。
+    /// 创建加入既有隔离标签的派生 Context；跨 Runtime 标签报错。
     pub fn isolate_with<T: Send + Sync + 'static>(
         &self,
         key: ServiceKey<T>,
         label: IsolationLabel,
-    ) -> Result<(), CoreError> {
+    ) -> Result<Self, CoreError> {
         self.ensure_alive()?;
         label.ensure_runtime(self.inner.registry.runtime_token())?;
-        self.inner
-            .registry
-            .set_node_isolation(self.inner.id, key.id(), label.id());
-        self.inner
-            .isolations
-            .lock()
-            .map_err(|_| CoreError::ContextDisposed)?
-            .insert(key.id(), label);
-        Ok(())
+        self.extend_with_isolations(HashMap::from([(key.id(), label)]))
     }
 
     /// 在当前 Context 注册类型化 Service；当前 Scope 释放时自动撤销。
@@ -149,12 +132,6 @@ impl Context {
         let parent = self.inner.scope.clone();
         let template = self.clone();
         let callback = Arc::new(move |services: Services, child: EffectScope| {
-            let isolations = template
-                .inner
-                .isolations
-                .lock()
-                .map(|guard| guard.clone())
-                .unwrap_or_default();
             template.inner.registry.register_effect(
                 child.id(),
                 child.name().to_string(),
@@ -169,7 +146,6 @@ impl Context {
                         id: template.inner.id,
                         registry: template.inner.registry.clone(),
                         scope: child,
-                        isolations: Mutex::new(isolations),
                     }),
                 },
             };
@@ -188,7 +164,7 @@ impl Context {
         })
     }
 
-    /// 创建一个与当前 Context 一同释放的普通 Effect（默认名 `"effect"`）。
+    /// 创建归属当前 Effect/Fiber Scope 的普通 Effect（默认名 `"effect"`）。
     pub fn effect(&self) -> Result<EffectContext, CoreError> {
         self.effect_named("effect")
     }
@@ -197,12 +173,6 @@ impl Context {
     pub fn effect_named(&self, name: &'static str) -> Result<EffectContext, CoreError> {
         self.ensure_alive()?;
         let scope = self.inner.scope.child_named(name);
-        let isolations = self
-            .inner
-            .isolations
-            .lock()
-            .map_err(|_| CoreError::ContextDisposed)?
-            .clone();
         self.inner.registry.register_effect(
             scope.id(),
             scope.name().to_string(),
@@ -217,7 +187,6 @@ impl Context {
                     id: self.inner.id,
                     registry: self.inner.registry.clone(),
                     scope,
-                    isolations: Mutex::new(isolations),
                 }),
             },
         })
@@ -530,11 +499,6 @@ impl Context {
         self.inner.scope.child_scope_count()
     }
 
-    /// 释放当前 Context 及其全部子 Effect 和 Provider。
-    pub fn dispose(&self) {
-        self.inner.scope.dispose();
-    }
-
     pub(crate) fn ensure_alive(&self) -> Result<(), CoreError> {
         if self.is_disposed() {
             Err(CoreError::ContextDisposed)
@@ -563,8 +527,8 @@ impl EffectContext {
         self.context.get(key)
     }
 
-    pub fn child(&self) -> Result<Context, CoreError> {
-        self.context.child()
+    pub fn extend(&self) -> Result<Context, CoreError> {
+        self.context.extend()
     }
 
     pub fn inject<I, F, Fut>(
@@ -668,8 +632,9 @@ impl EffectContext {
         self.context.inner.scope.cancellation()
     }
 
+    /// 释放当前 Effect 及其全部子资源。
     pub fn dispose(&self) {
-        self.context.dispose();
+        self.context.inner.scope.dispose();
     }
 
     /// 释放并等待本 Effect 树上的受控任务（不上收；无超时）。
