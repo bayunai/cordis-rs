@@ -32,6 +32,9 @@ struct ClockPlugin;
 
 #[async_trait]
 impl Plugin for ClockPlugin {
+    fn key(&self) -> cordis_core::PluginKey {
+        cordis_core::PluginKey::new("example.clock")
+    }
     async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
         ctx.provide(CLOCK, Clock)?;
         Ok(())
@@ -71,9 +74,11 @@ cargo run -p cordis-core --example reactive
 - `Context::extend()`：创建不拥有独立生命周期的派生视图。
 - `isolate` / `isolate_with`：创建仅对派生视图生效的 ServiceKey 隔离标签（不可跨 Runtime）。
 - Context 不可释放；资源由 `Runtime`、`EffectContext` 或 `Fiber` 持有和释放。
-- `Context::plugin` 返回 `Fiber`（`restart` / `replace` / `dispose_wait`）。
-- 具名 Effect + 诊断树（plugin_fibers / inject_fibers / effects）。
-- 事件四模式：Observe / Waterfall / Serial / Parallel。
+- `Context::plugin` 返回 `Fiber`（`restart` / 同 Key `replace` / `dispose_wait`）；跨 Key 用 `Runtime::unmount`。
+- 具名 Effect + 诊断树（plugin_fibers / plugin_registry / inject_fibers / effects）。
+- 事件四模式：Observe / Waterfall / Serial / Parallel；支持 `ListenOptions`（once / prepend / global / filter）。
+- `ConfigKey` + `intercept` / `config`：派生配置覆盖，不影响 Service。
+- Plugin 须声明 `PluginKey`。
 - **受控关闭必须** `Runtime::shutdown()`。
 - `Runtime::diagnostics()` 只暴露 ID、状态与标签，无业务载荷。
 

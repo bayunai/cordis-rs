@@ -1,5 +1,57 @@
 use crate::CoreError;
-use std::{any::TypeId, fmt, future::Future, marker::PhantomData, pin::Pin};
+use std::{any::TypeId, fmt, future::Future, marker::PhantomData, pin::Pin, sync::Arc};
+
+/// 同步事件过滤器：`false` 跳过该监听器，`Err` 中止本次派发。
+pub type ListenFilter<T> = Arc<dyn Fn(&T) -> Result<bool, CoreError> + Send + Sync>;
+
+/// 事件监听选项：`once` / `prepend` / `global` / `filter`。
+#[derive(Clone)]
+pub struct ListenOptions<T: Send + Sync + 'static> {
+    pub(crate) once: bool,
+    pub(crate) prepend: bool,
+    pub(crate) global: bool,
+    pub(crate) filter: Option<ListenFilter<T>>,
+}
+
+impl<T: Send + Sync + 'static> Default for ListenOptions<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T: Send + Sync + 'static> ListenOptions<T> {
+    pub fn new() -> Self {
+        Self {
+            once: false,
+            prepend: false,
+            global: false,
+            filter: None,
+        }
+    }
+
+    pub fn once(mut self) -> Self {
+        self.once = true;
+        self
+    }
+
+    pub fn prepend(mut self) -> Self {
+        self.prepend = true;
+        self
+    }
+
+    pub fn global(mut self) -> Self {
+        self.global = true;
+        self
+    }
+
+    pub fn filter(
+        mut self,
+        filter: impl Fn(&T) -> Result<bool, CoreError> + Send + Sync + 'static,
+    ) -> Self {
+        self.filter = Some(Arc::new(filter));
+        self
+    }
+}
 
 /// Observe 模式事件 Key（同步 `on` / `emit`）。
 pub struct EventKey<T: Send + Sync + 'static> {

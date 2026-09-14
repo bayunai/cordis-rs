@@ -1,9 +1,9 @@
 use crate::{
-    CoreError, ServiceId, ServiceKey, Services,
+    ConfigKey, CoreError, ServiceId, ServiceKey, Services,
     effect::{EffectHandle, EffectScope},
-    event::{EventKey, Next, ParallelKey, SerialKey, Unsubscribe, WaterfallKey},
+    event::{EventKey, ListenOptions, Next, ParallelKey, SerialKey, Unsubscribe, WaterfallKey},
     fiber::{Fiber, FiberInner, FiberState},
-    inject::{InjectionPhase, NodeId, Registry},
+    inject::{InjectionPhase, ListenMeta, NodeId, Registry},
     isolation::IsolationLabel,
     plugin::Plugin,
     service::ErasedService,
@@ -83,6 +83,33 @@ impl Context {
         self.ensure_alive()?;
         label.ensure_runtime(self.inner.registry.runtime_token())?;
         self.extend_with_isolations(HashMap::from([(key.id(), label)]))
+    }
+
+    /// 创建带不可变配置覆盖的派生 Context；父与兄弟节点不变。
+    pub fn intercept<T: Send + Sync + 'static>(
+        &self,
+        key: ConfigKey<T>,
+        value: T,
+    ) -> Result<Self, CoreError> {
+        self.ensure_alive()?;
+        let derived = self.extend()?;
+        derived.inner.registry.set_node_config(
+            derived.inner.id,
+            key.id(),
+            key.type_id(),
+            Arc::new(value),
+        )?;
+        Ok(derived)
+    }
+
+    /// 自当前节点向父解析最近配置覆盖。
+    pub fn config<T: Send + Sync + 'static>(&self, key: ConfigKey<T>) -> Result<Arc<T>, CoreError> {
+        self.ensure_alive()?;
+        let erased = self
+            .inner
+            .registry
+            .resolve_config(self.inner.id, key.id(), key.type_id())?;
+        Arc::downcast::<T>(erased).map_err(|_| CoreError::ConfigTypeMismatch { config: key.id() })
     }
 
     /// 在当前 Context 注册类型化 Service；当前 Scope 释放时自动撤销。
@@ -195,10 +222,12 @@ impl Context {
     /// 挂载插件：返回可重启 / 可替换的 [`Fiber`]。
     pub async fn plugin(&self, plugin: Arc<dyn Plugin>) -> Result<Fiber, CoreError> {
         self.ensure_alive()?;
+        let plugin_key = plugin.key();
         let id = self.inner.registry.allocate_id();
         let dependencies = plugin.inject();
         let inner = Arc::new(FiberInner {
             id,
+            plugin_key,
             node: self.inner.id,
             registry: Arc::downgrade(&self.inner.registry),
             parent_scope: self.inner.scope.clone(),
@@ -212,7 +241,7 @@ impl Context {
             busy: Mutex::new(false),
             mount_ctx: Mutex::new(Some(self.clone())),
         });
-        self.inner.registry.register_plugin_fiber(inner.clone());
+        self.inner.registry.register_plugin_fiber(inner.clone())?;
         let weak = Arc::downgrade(&inner);
         self.inner.scope.on_dispose(move || {
             if let Some(fiber) = weak.upgrade() {
@@ -242,10 +271,25 @@ impl Context {
         T: Send + Sync + 'static,
         F: Fn(&T) -> Result<(), CoreError> + Send + Sync + 'static,
     {
+        self.on_with_options(key, ListenOptions::new(), handler)
+    }
+
+    /// 带 `once` / `prepend` / `global` / `filter` 选项的 Observe 订阅。
+    pub fn on_with_options<T, F>(
+        &self,
+        key: EventKey<T>,
+        options: ListenOptions<T>,
+        handler: F,
+    ) -> Result<Unsubscribe, CoreError>
+    where
+        T: Send + Sync + 'static,
+        F: Fn(&T) -> Result<(), CoreError> + Send + Sync + 'static,
+    {
         self.ensure_alive()?;
         let handler = Arc::new(handler);
         let type_id = key.type_id();
         let event_id = key.id();
+        let meta = listen_meta_from_options(options, event_id);
         let wrapped = Arc::new(move |payload: &(dyn Any + Send + Sync)| {
             let Some(value) = payload.downcast_ref::<T>() else {
                 return Err(CoreError::EventTypeMismatch { event: event_id });
@@ -258,13 +302,9 @@ impl Context {
             type_id,
             wrapped,
             &self.inner.scope,
+            meta,
         )?;
-        let registry = Arc::downgrade(&self.inner.registry);
-        Ok(Unsubscribe::new(move || {
-            if let Some(registry) = registry.upgrade() {
-                registry.unsubscribe_event(event_id, listener_id);
-            }
-        }))
+        Ok(self.unsubscribe_handle(event_id, listener_id))
     }
 
     /// 向当前 Context 谱系派发观察事件；监听器错误向上返回。
@@ -290,10 +330,26 @@ impl Context {
         F: Fn(T, Next<T>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<T, CoreError>> + Send + 'static,
     {
+        self.on_waterfall_with_options(key, ListenOptions::new(), handler)
+    }
+
+    /// 带选项的 Waterfall 订阅。
+    pub fn on_waterfall_with_options<T, F, Fut>(
+        &self,
+        key: WaterfallKey<T>,
+        options: ListenOptions<T>,
+        handler: F,
+    ) -> Result<Unsubscribe, CoreError>
+    where
+        T: Send + Sync + 'static,
+        F: Fn(T, Next<T>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<T, CoreError>> + Send + 'static,
+    {
         self.ensure_alive()?;
         let handler = Arc::new(handler);
         let event_id = key.id();
         let type_id = key.type_id();
+        let meta = listen_meta_from_options(options, event_id);
         let wrapped: crate::inject::WaterfallHandler =
             Arc::new(move |boxed: Box<dyn Any + Send + Sync>, next| {
                 let handler = handler.clone();
@@ -327,6 +383,7 @@ impl Context {
             type_id,
             wrapped,
             &self.inner.scope,
+            meta,
         )?;
         Ok(self.unsubscribe_handle(event_id, listener_id))
     }
@@ -348,6 +405,22 @@ impl Context {
     pub fn on_serial<T, R, F, Fut>(
         &self,
         key: SerialKey<T, R>,
+        handler: F,
+    ) -> Result<Unsubscribe, CoreError>
+    where
+        T: Send + Sync + 'static,
+        R: Send + Sync + 'static,
+        F: Fn(&T) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<Option<R>, CoreError>> + Send + 'static,
+    {
+        self.on_serial_with_options(key, ListenOptions::new(), handler)
+    }
+
+    /// 带选项的 Serial 订阅。
+    pub fn on_serial_with_options<T, R, F, Fut>(
+        &self,
+        key: SerialKey<T, R>,
+        options: ListenOptions<T>,
         handler: F,
     ) -> Result<Unsubscribe, CoreError>
     where
@@ -388,6 +461,7 @@ impl Context {
         }
 
         let event_id = key.id();
+        let meta = listen_meta_from_options(options, event_id);
         let wrapped: Arc<dyn crate::inject::SerialHandlerErased> = Arc::new(SerialAdapter {
             event_id,
             handler: Arc::new(handler),
@@ -400,6 +474,7 @@ impl Context {
             key.answer_type_id(),
             wrapped,
             &self.inner.scope,
+            meta,
         )?;
         Ok(self.unsubscribe_handle(event_id, listener_id))
     }
@@ -421,6 +496,21 @@ impl Context {
     pub fn on_parallel<T, F, Fut>(
         &self,
         key: ParallelKey<T>,
+        handler: F,
+    ) -> Result<Unsubscribe, CoreError>
+    where
+        T: Send + Sync + 'static,
+        F: Fn(&T) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<(), CoreError>> + Send + 'static,
+    {
+        self.on_parallel_with_options(key, ListenOptions::new(), handler)
+    }
+
+    /// 带选项的 Parallel 订阅。
+    pub fn on_parallel_with_options<T, F, Fut>(
+        &self,
+        key: ParallelKey<T>,
+        options: ListenOptions<T>,
         handler: F,
     ) -> Result<Unsubscribe, CoreError>
     where
@@ -453,6 +543,7 @@ impl Context {
         }
 
         let event_id = key.id();
+        let meta = listen_meta_from_options(options, event_id);
         let wrapped: Arc<dyn crate::inject::ParallelHandlerErased> = Arc::new(ParallelAdapter {
             event_id,
             handler: Arc::new(handler),
@@ -464,6 +555,7 @@ impl Context {
             key.type_id(),
             wrapped,
             &self.inner.scope,
+            meta,
         )?;
         Ok(self.unsubscribe_handle(event_id, listener_id))
     }
@@ -508,6 +600,21 @@ impl Context {
     }
 }
 
+fn listen_meta_from_options<T: Send + Sync + 'static>(
+    options: ListenOptions<T>,
+    event_id: &'static str,
+) -> ListenMeta {
+    let filter = options.filter.map(|filter| {
+        Arc::new(move |payload: &(dyn Any + Send + Sync)| {
+            let Some(value) = payload.downcast_ref::<T>() else {
+                return Err(CoreError::EventTypeMismatch { event: event_id });
+            };
+            filter(value)
+        }) as crate::inject::EventFilter
+    });
+    ListenMeta::new(options.once, options.prepend, options.global, filter)
+}
+
 /// `inject()` 或 `effect()` 回调中拥有资源的 Context。
 #[derive(Clone)]
 pub struct EffectContext {
@@ -531,6 +638,18 @@ impl EffectContext {
         self.context.extend()
     }
 
+    pub fn intercept<T: Send + Sync + 'static>(
+        &self,
+        key: ConfigKey<T>,
+        value: T,
+    ) -> Result<Context, CoreError> {
+        self.context.intercept(key, value)
+    }
+
+    pub fn config<T: Send + Sync + 'static>(&self, key: ConfigKey<T>) -> Result<Arc<T>, CoreError> {
+        self.context.config(key)
+    }
+
     pub fn inject<I, F, Fut>(
         &self,
         dependencies: I,
@@ -552,6 +671,19 @@ impl EffectContext {
         self.context.on(key, handler)
     }
 
+    pub fn on_with_options<T, F>(
+        &self,
+        key: EventKey<T>,
+        options: ListenOptions<T>,
+        handler: F,
+    ) -> Result<Unsubscribe, CoreError>
+    where
+        T: Send + Sync + 'static,
+        F: Fn(&T) -> Result<(), CoreError> + Send + Sync + 'static,
+    {
+        self.context.on_with_options(key, options, handler)
+    }
+
     pub fn emit<T: Send + Sync + 'static>(
         &self,
         key: EventKey<T>,
@@ -571,6 +703,21 @@ impl EffectContext {
         Fut: Future<Output = Result<T, CoreError>> + Send + 'static,
     {
         self.context.on_waterfall(key, handler)
+    }
+
+    pub fn on_waterfall_with_options<T, F, Fut>(
+        &self,
+        key: WaterfallKey<T>,
+        options: ListenOptions<T>,
+        handler: F,
+    ) -> Result<Unsubscribe, CoreError>
+    where
+        T: Send + Sync + 'static,
+        F: Fn(T, Next<T>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<T, CoreError>> + Send + 'static,
+    {
+        self.context
+            .on_waterfall_with_options(key, options, handler)
     }
 
     pub async fn waterfall<T: Send + Sync + 'static>(
@@ -595,6 +742,21 @@ impl EffectContext {
         self.context.on_serial(key, handler)
     }
 
+    pub fn on_serial_with_options<T, R, F, Fut>(
+        &self,
+        key: SerialKey<T, R>,
+        options: ListenOptions<T>,
+        handler: F,
+    ) -> Result<Unsubscribe, CoreError>
+    where
+        T: Send + Sync + 'static,
+        R: Send + Sync + 'static,
+        F: Fn(&T) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<Option<R>, CoreError>> + Send + 'static,
+    {
+        self.context.on_serial_with_options(key, options, handler)
+    }
+
     pub async fn serial<T: Send + Sync + 'static, R: Send + Sync + 'static>(
         &self,
         key: SerialKey<T, R>,
@@ -614,6 +776,20 @@ impl EffectContext {
         Fut: Future<Output = Result<(), CoreError>> + Send + 'static,
     {
         self.context.on_parallel(key, handler)
+    }
+
+    pub fn on_parallel_with_options<T, F, Fut>(
+        &self,
+        key: ParallelKey<T>,
+        options: ListenOptions<T>,
+        handler: F,
+    ) -> Result<Unsubscribe, CoreError>
+    where
+        T: Send + Sync + 'static,
+        F: Fn(&T) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<(), CoreError>> + Send + 'static,
+    {
+        self.context.on_parallel_with_options(key, options, handler)
     }
 
     pub async fn parallel<T: Send + Sync + 'static>(

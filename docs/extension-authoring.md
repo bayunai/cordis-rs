@@ -14,6 +14,10 @@ static GREETER: ServiceKey<&'static str> = ServiceKey::new("demo.greeter@1");
 
 #[async_trait]
 impl Plugin for Greeter {
+    fn key(&self) -> cordis_core::PluginKey {
+        cordis_core::PluginKey::new("demo.greeter")
+    }
+
     fn inject(&self) -> Vec<cordis_core::ServiceId> {
         // 可选：插件级依赖；未齐时 Fiber 保持 Pending
         Vec::new()
@@ -57,9 +61,9 @@ async fn main() -> Result<(), CoreError> {
 ## Fiber
 
 - `plugin()` 返回 `Fiber`（非旧 PluginHandle）。
-- `restart()` 保留 Plugin 对象重跑；`replace(new)` 先等旧任务结束再挂新实例。
+- `restart()` 保留 Plugin 对象重跑；`replace(new)` 要求相同 `PluginKey`，先等旧任务结束再挂新实例。
 - `apply` 失败 → `FiberState::Failed`，句柄仍返回；查 `last_error()`。
-- 热更新：宿主校验配置 → 构造新 Plugin → `fiber.replace(new)`。
+- 热更新：同 Key → `fiber.replace(new)`；跨 Key → `Runtime::unmount(old)` 后再 `plugin(new)`。
 
 ## ServiceKey / Event Key
 
@@ -74,4 +78,5 @@ async fn main() -> Result<(), CoreError> {
 ## 禁止事项
 
 - 不要依赖宿主 AppState / HTTP / DB / Redis / 配置文件。
-- 不要实现 Manifest、Loader/HMR、intercept、JSON Schema——属宿主层。
+- 不要实现 Manifest、Loader/HMR、JSON Schema——属宿主层。
+- `intercept` 仅派生配置（`ConfigKey`），不可替代 `provide` / Service。

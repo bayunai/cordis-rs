@@ -7,6 +7,7 @@ pub struct RuntimeSnapshot {
     pub isolations: Vec<IsolationSnapshot>,
     pub providers: Vec<ProviderSnapshot>,
     pub plugin_fibers: Vec<PluginFiberSnapshot>,
+    pub plugin_registry: Vec<PluginRegistrySnapshot>,
     pub inject_fibers: Vec<InjectFiberSnapshot>,
     pub effects: Vec<EffectSnapshot>,
 }
@@ -16,6 +17,7 @@ pub struct ContextSnapshot {
     pub id: u64,
     pub parent: Option<u64>,
     pub isolations: Vec<ContextIsolationSnapshot>,
+    pub config_keys: Vec<&'static str>,
 }
 
 #[derive(Debug, Clone)]
@@ -73,12 +75,27 @@ pub struct InjectFiberSnapshot {
 #[derive(Debug, Clone)]
 pub struct PluginFiberSnapshot {
     pub id: u64,
+    pub plugin_key: &'static str,
     pub node: u64,
     pub state: FiberStateSnapshot,
     pub dependencies: Vec<&'static str>,
     pub missing_dependencies: Vec<&'static str>,
     pub last_error: Option<String>,
     pub root_effect: Option<u64>,
+}
+
+/// Plugin Registry 分组诊断（仅 Key + Fiber id/state）。
+#[derive(Debug, Clone)]
+pub struct PluginRegistrySnapshot {
+    pub plugin_key: &'static str,
+    pub unmounting: bool,
+    pub fibers: Vec<PluginRegistryFiberSnapshot>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PluginRegistryFiberSnapshot {
+    pub id: u64,
+    pub state: FiberStateSnapshot,
 }
 
 #[derive(Debug, Clone)]

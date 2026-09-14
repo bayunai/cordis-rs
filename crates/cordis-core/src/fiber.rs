@@ -1,4 +1,9 @@
-use crate::{Context, CoreError, ServiceId, effect::EffectScope, inject::NodeId, plugin::Plugin};
+use crate::{
+    Context, CoreError, ServiceId,
+    effect::EffectScope,
+    inject::NodeId,
+    plugin::{Plugin, PluginKey},
+};
 use std::sync::{
     Arc, Mutex, Weak,
     atomic::{AtomicBool, Ordering},
@@ -21,6 +26,7 @@ pub struct Fiber {
 
 pub(crate) struct FiberInner {
     pub(crate) id: u64,
+    pub(crate) plugin_key: PluginKey,
     pub(crate) node: NodeId,
     pub(crate) registry: Weak<crate::inject::Registry>,
     pub(crate) parent_scope: EffectScope,
@@ -152,6 +158,13 @@ impl Fiber {
             *busy = true;
         }
         let result = async {
+            let actual = plugin.key();
+            if actual != self.inner.plugin_key {
+                return Err(CoreError::PluginKeyMismatch {
+                    expected: self.inner.plugin_key,
+                    actual,
+                });
+            }
             let effect = self.inner.effect.lock().expect("effect").take();
             if let Some(effect) = effect {
                 effect.dispose_wait().await;
@@ -205,6 +218,7 @@ impl FiberInner {
         let missing = self.missing_dependencies();
         crate::diagnostics::PluginFiberSnapshot {
             id: self.id,
+            plugin_key: self.plugin_key.as_str(),
             node: self.node,
             state,
             dependencies: deps.iter().map(|d| d.as_str()).collect(),
@@ -414,6 +428,9 @@ mod claim_tests {
 
     #[async_trait]
     impl Plugin for NoopPlugin {
+        fn key(&self) -> crate::plugin::PluginKey {
+            crate::plugin::PluginKey::new("test.noop")
+        }
         async fn apply(&self, _ctx: &Context) -> Result<(), CoreError> {
             Ok(())
         }
@@ -422,6 +439,7 @@ mod claim_tests {
     fn stub_fiber() -> Arc<FiberInner> {
         Arc::new(FiberInner {
             id: 1,
+            plugin_key: crate::plugin::PluginKey::new("test.noop"),
             node: 0,
             registry: Weak::new(),
             parent_scope: EffectScope::root(),

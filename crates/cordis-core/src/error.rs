@@ -39,4 +39,17 @@ pub enum CoreError {
     FiberDisposed,
     #[error("Fiber 正在执行生命周期操作")]
     FiberBusy,
+    #[error("Config {config} 当前不可用")]
+    ConfigUnavailable { config: crate::config::ConfigId },
+    #[error("Config {config} 的 Rust 类型不匹配")]
+    ConfigTypeMismatch { config: crate::config::ConfigId },
+    #[error("Config {config} 已绑定其他 Rust 类型")]
+    ConfigKeyTypeConflict { config: crate::config::ConfigId },
+    #[error("插件 {plugin} 正在卸载")]
+    PluginUnmounting { plugin: crate::plugin::PluginKey },
+    #[error("插件 Key 不匹配：期望 {expected}，实际 {actual}")]
+    PluginKeyMismatch {
+        expected: crate::plugin::PluginKey,
+        actual: crate::plugin::PluginKey,
+    },
 }

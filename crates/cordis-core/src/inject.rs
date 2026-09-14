@@ -1,12 +1,15 @@
 use crate::{
     CoreError, ServiceId, Services,
+    config::{ConfigId, ErasedConfig},
     diagnostics::{
         ContextIsolationSnapshot, ContextSnapshot, EffectSnapshot, FiberStateSnapshot,
-        InjectFiberSnapshot, IsolationSnapshot, ProviderSnapshot, RuntimeSnapshot,
+        InjectFiberSnapshot, IsolationSnapshot, PluginRegistryFiberSnapshot,
+        PluginRegistrySnapshot, ProviderSnapshot, RuntimeSnapshot,
     },
     effect::EffectScope,
     fiber::{FiberInner, FiberState},
     isolation::{IsolationLabel, RuntimeToken},
+    plugin::PluginKey,
     service::ErasedService,
 };
 use async_trait::async_trait;
@@ -34,6 +37,8 @@ pub(crate) type InjectCallback = Arc<dyn Fn(Services, EffectScope) -> InjectFutu
 
 type BoxFut<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 type ObserveHandler = Arc<dyn Fn(&(dyn Any + Send + Sync)) -> Result<(), CoreError> + Send + Sync>;
+pub(crate) type EventFilter =
+    Arc<dyn Fn(&(dyn Any + Send + Sync)) -> Result<bool, CoreError> + Send + Sync>;
 type ErasedNext = Box<
     dyn FnOnce(Box<dyn Any + Send + Sync>) -> BoxFut<Result<Box<dyn Any + Send + Sync>, CoreError>>
         + Send,
@@ -46,6 +51,38 @@ pub(crate) type WaterfallHandler = Arc<
         + Send
         + Sync,
 >;
+
+#[derive(Clone)]
+pub(crate) struct ListenMeta {
+    pub once: bool,
+    pub prepend: bool,
+    pub global: bool,
+    pub once_gate: Arc<AtomicBool>,
+    pub filter: Option<EventFilter>,
+}
+
+impl ListenMeta {
+    pub(crate) fn new(
+        once: bool,
+        prepend: bool,
+        global: bool,
+        filter: Option<EventFilter>,
+    ) -> Self {
+        Self {
+            once,
+            prepend,
+            global,
+            once_gate: Arc::new(AtomicBool::new(false)),
+            filter,
+        }
+    }
+}
+
+impl Default for ListenMeta {
+    fn default() -> Self {
+        Self::new(false, false, false, None)
+    }
+}
 
 #[async_trait]
 pub(crate) trait SerialHandlerErased: Send + Sync {
@@ -86,6 +123,7 @@ pub(crate) enum InjectionPhase {
 struct NodeRecord {
     parent: Option<NodeId>,
     isolations: HashMap<ServiceId, u64>,
+    configs: HashMap<ConfigId, ErasedConfig>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -132,6 +170,12 @@ struct EventListener {
     id: ListenerId,
     node: NodeId,
     kind: EventHandlerKind,
+    meta: ListenMeta,
+}
+
+struct PluginGroup {
+    fibers: Vec<Weak<FiberInner>>,
+    unmounting: bool,
 }
 
 struct RegistryState {
@@ -141,8 +185,10 @@ struct RegistryState {
     listeners: HashMap<&'static str, Vec<EventListener>>,
     effects: HashMap<u64, EffectRecord>,
     plugin_fibers: HashMap<u64, Weak<FiberInner>>,
+    plugin_index: HashMap<PluginKey, PluginGroup>,
     isolations_seen: HashMap<u64, ()>,
     service_types: HashMap<ServiceId, TypeId>,
+    config_types: HashMap<ConfigId, TypeId>,
     event_contracts: HashMap<&'static str, EventContract>,
 }
 
@@ -171,8 +217,10 @@ impl Registry {
                 listeners: HashMap::new(),
                 effects: HashMap::new(),
                 plugin_fibers: HashMap::new(),
+                plugin_index: HashMap::new(),
                 isolations_seen: HashMap::new(),
                 service_types: HashMap::new(),
+                config_types: HashMap::new(),
                 event_contracts: HashMap::new(),
             }),
             runtime_token: RuntimeToken::new(),
@@ -193,16 +241,83 @@ impl Registry {
         &self.runtime_token
     }
 
-    pub(crate) fn register_plugin_fiber(self: &Arc<Self>, fiber: Arc<FiberInner>) {
-        if let Ok(mut state) = self.state.lock() {
+    pub(crate) fn register_plugin_fiber(
+        self: &Arc<Self>,
+        fiber: Arc<FiberInner>,
+    ) -> Result<(), CoreError> {
+        let key = fiber.plugin_key;
+        {
+            let mut state = self.state.lock().map_err(|_| CoreError::ContextDisposed)?;
+            if state
+                .plugin_index
+                .get(&key)
+                .is_some_and(|group| group.unmounting)
+            {
+                return Err(CoreError::PluginUnmounting { plugin: key });
+            }
             state.plugin_fibers.insert(fiber.id, Arc::downgrade(&fiber));
+            let group = state
+                .plugin_index
+                .entry(key)
+                .or_insert_with(|| PluginGroup {
+                    fibers: Vec::new(),
+                    unmounting: false,
+                });
+            group.fibers.push(Arc::downgrade(&fiber));
         }
         self.mark_dirty();
+        Ok(())
     }
 
     pub(crate) fn unregister_plugin_fiber(&self, id: u64) {
         if let Ok(mut state) = self.state.lock() {
+            let key = state
+                .plugin_fibers
+                .get(&id)
+                .and_then(Weak::upgrade)
+                .map(|fiber| fiber.plugin_key);
             state.plugin_fibers.remove(&id);
+            if let Some(key) = key
+                && let Some(group) = state.plugin_index.get_mut(&key)
+            {
+                group
+                    .fibers
+                    .retain(|weak| weak.upgrade().is_some_and(|fiber| fiber.id != id));
+                if group.fibers.is_empty() && !group.unmounting {
+                    state.plugin_index.remove(&key);
+                }
+            }
+        }
+    }
+
+    pub(crate) fn begin_plugin_unmount(
+        &self,
+        key: PluginKey,
+    ) -> Result<Vec<Arc<FiberInner>>, CoreError> {
+        let mut state = self.state.lock().map_err(|_| CoreError::ContextDisposed)?;
+        let group = state
+            .plugin_index
+            .entry(key)
+            .or_insert_with(|| PluginGroup {
+                fibers: Vec::new(),
+                unmounting: false,
+            });
+        if group.unmounting {
+            return Err(CoreError::PluginUnmounting { plugin: key });
+        }
+        group.unmounting = true;
+        group.fibers.retain(|weak| weak.strong_count() > 0);
+        Ok(group
+            .fibers
+            .iter()
+            .filter_map(Weak::upgrade)
+            .filter(|fiber| !fiber.disposed.load(Ordering::Acquire))
+            .collect())
+    }
+
+    pub(crate) fn finish_plugin_unmount(&self, key: PluginKey) {
+        if let Ok(mut state) = self.state.lock() {
+            state.plugin_index.remove(&key);
         }
     }
 
@@ -336,7 +451,14 @@ impl Registry {
             state
                 .isolations_seen
                 .extend(isolations.values().copied().map(|id| (id, ())));
-            state.nodes.insert(id, NodeRecord { parent, isolations });
+            state.nodes.insert(
+                id,
+                NodeRecord {
+                    parent,
+                    isolations,
+                    configs: HashMap::new(),
+                },
+            );
         }
     }
 
@@ -382,6 +504,70 @@ impl Registry {
                 }
             }
         }
+    }
+
+    fn lock_config_type(
+        state: &mut RegistryState,
+        key: ConfigId,
+        type_id: TypeId,
+    ) -> Result<(), CoreError> {
+        match state.config_types.entry(key) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(type_id);
+                Ok(())
+            }
+            std::collections::hash_map::Entry::Occupied(entry) => {
+                if *entry.get() == type_id {
+                    Ok(())
+                } else {
+                    Err(CoreError::ConfigKeyTypeConflict { config: key })
+                }
+            }
+        }
+    }
+
+    pub(crate) fn set_node_config(
+        &self,
+        node: NodeId,
+        key: ConfigId,
+        type_id: TypeId,
+        value: Arc<dyn Any + Send + Sync>,
+    ) -> Result<(), CoreError> {
+        let mut state = self.state.lock().map_err(|_| CoreError::ContextDisposed)?;
+        Self::lock_config_type(&mut state, key, type_id)?;
+        let Some(record) = state.nodes.get_mut(&node) else {
+            return Err(CoreError::ContextDisposed);
+        };
+        record.configs.insert(key, ErasedConfig { type_id, value });
+        Ok(())
+    }
+
+    pub(crate) fn resolve_config(
+        &self,
+        node: NodeId,
+        key: ConfigId,
+        type_id: TypeId,
+    ) -> Result<Arc<dyn Any + Send + Sync>, CoreError> {
+        let state = self.state.lock().map_err(|_| CoreError::ContextDisposed)?;
+        if let Some(expected) = state.config_types.get(&key)
+            && *expected != type_id
+        {
+            return Err(CoreError::ConfigTypeMismatch { config: key });
+        }
+        let mut current = Some(node);
+        while let Some(id) = current {
+            let Some(record) = state.nodes.get(&id) else {
+                break;
+            };
+            if let Some(config) = record.configs.get(&key) {
+                if config.type_id != type_id {
+                    return Err(CoreError::ConfigTypeMismatch { config: key });
+                }
+                return Ok(config.value.clone());
+            }
+            current = record.parent;
+        }
+        Err(CoreError::ConfigUnavailable { config: key })
     }
 
     fn lock_event_contract(
@@ -551,6 +737,7 @@ impl Registry {
         type_id: TypeId,
         handler: ObserveHandler,
         owner: &EffectScope,
+        meta: ListenMeta,
     ) -> Result<ListenerId, CoreError> {
         self.subscribe_kind(
             node,
@@ -560,6 +747,7 @@ impl Registry {
             None,
             EventHandlerKind::Observe(handler),
             owner,
+            meta,
         )
     }
 
@@ -570,6 +758,7 @@ impl Registry {
         type_id: TypeId,
         handler: WaterfallHandler,
         owner: &EffectScope,
+        meta: ListenMeta,
     ) -> Result<ListenerId, CoreError> {
         self.subscribe_kind(
             node,
@@ -579,9 +768,11 @@ impl Registry {
             None,
             EventHandlerKind::Waterfall(handler),
             owner,
+            meta,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn subscribe_serial(
         self: &Arc<Self>,
         node: NodeId,
@@ -590,6 +781,7 @@ impl Registry {
         answer: TypeId,
         handler: Arc<dyn SerialHandlerErased>,
         owner: &EffectScope,
+        meta: ListenMeta,
     ) -> Result<ListenerId, CoreError> {
         self.subscribe_kind(
             node,
@@ -599,6 +791,7 @@ impl Registry {
             Some(answer),
             EventHandlerKind::Serial(handler),
             owner,
+            meta,
         )
     }
 
@@ -609,6 +802,7 @@ impl Registry {
         type_id: TypeId,
         handler: Arc<dyn ParallelHandlerErased>,
         owner: &EffectScope,
+        meta: ListenMeta,
     ) -> Result<ListenerId, CoreError> {
         self.subscribe_kind(
             node,
@@ -618,6 +812,7 @@ impl Registry {
             None,
             EventHandlerKind::Parallel(handler),
             owner,
+            meta,
         )
     }
 
@@ -631,6 +826,7 @@ impl Registry {
         answer: Option<TypeId>,
         kind: EventHandlerKind,
         owner: &EffectScope,
+        meta: ListenMeta,
     ) -> Result<ListenerId, CoreError> {
         if owner.is_disposed() {
             return Err(CoreError::ContextDisposed);
@@ -639,11 +835,18 @@ impl Registry {
         {
             let mut state = self.state.lock().map_err(|_| CoreError::ContextDisposed)?;
             Self::lock_event_contract(&mut state, event_id, mode, payload, answer)?;
-            state
-                .listeners
-                .entry(event_id)
-                .or_default()
-                .push(EventListener { id, node, kind });
+            let list = state.listeners.entry(event_id).or_default();
+            let listener = EventListener {
+                id,
+                node,
+                kind,
+                meta,
+            };
+            if listener.meta.prepend {
+                list.insert(0, listener);
+            } else {
+                list.push(listener);
+            }
         }
         let weak = Arc::downgrade(self);
         owner.on_dispose(move || {
@@ -665,6 +868,51 @@ impl Registry {
         }
     }
 
+    fn select_matching_listeners<'a>(
+        state: &'a RegistryState,
+        event_id: &'static str,
+        emitter: NodeId,
+        mode: EventMode,
+    ) -> Result<Vec<&'a EventListener>, CoreError> {
+        let Some(listeners) = state.listeners.get(event_id) else {
+            return Ok(Vec::new());
+        };
+        let mut globals = Vec::new();
+        let mut locals = Vec::new();
+        for listener in listeners {
+            let matches_mode = matches!(
+                (&listener.kind, mode),
+                (EventHandlerKind::Observe(_), EventMode::Observe)
+                    | (EventHandlerKind::Waterfall(_), EventMode::Waterfall)
+                    | (EventHandlerKind::Serial(_), EventMode::Serial)
+                    | (EventHandlerKind::Parallel(_), EventMode::Parallel)
+            );
+            if !matches_mode {
+                return Err(CoreError::EventModeMismatch { event: event_id });
+            }
+            if listener.meta.global {
+                globals.push(listener);
+            } else if is_ancestor_or_self(state, listener.node, emitter) {
+                locals.push(listener);
+            }
+        }
+        globals.extend(locals);
+        Ok(globals)
+    }
+
+    fn apply_filter(
+        filter: &Option<EventFilter>,
+        payload: &(dyn Any + Send + Sync),
+    ) -> Result<bool, CoreError> {
+        match filter {
+            None => Ok(true),
+            Some(filter) => filter(payload).map_err(|error| match error {
+                CoreError::EventListener(_) => error,
+                other => CoreError::EventListener(other.to_string()),
+            }),
+        }
+    }
+
     pub(crate) fn emit_event(
         &self,
         node: NodeId,
@@ -672,25 +920,35 @@ impl Registry {
         type_id: TypeId,
         payload: &(dyn Any + Send + Sync),
     ) -> Result<(), CoreError> {
-        let handlers = {
+        let selected = {
             let mut state = self.state.lock().map_err(|_| CoreError::ContextDisposed)?;
             Self::lock_event_contract(&mut state, event_id, EventMode::Observe, type_id, None)?;
-            let Some(listeners) = state.listeners.get(event_id) else {
-                return Ok(());
-            };
-            let mut selected = Vec::new();
-            for listener in listeners {
-                if !is_ancestor_or_self(&state, listener.node, node) {
+            let matched =
+                Self::select_matching_listeners(&state, event_id, node, EventMode::Observe)?;
+            matched
+                .into_iter()
+                .map(|listener| {
+                    let EventHandlerKind::Observe(handler) = &listener.kind else {
+                        unreachable!();
+                    };
+                    (listener.id, handler.clone(), listener.meta.clone())
+                })
+                .collect::<Vec<_>>()
+        };
+        for (id, handler, meta) in selected {
+            if !Self::apply_filter(&meta.filter, payload)? {
+                continue;
+            }
+            if meta.once {
+                if meta
+                    .once_gate
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_err()
+                {
                     continue;
                 }
-                match &listener.kind {
-                    EventHandlerKind::Observe(handler) => selected.push(handler.clone()),
-                    _ => return Err(CoreError::EventModeMismatch { event: event_id }),
-                }
+                self.unsubscribe_event(event_id, id);
             }
-            selected
-        };
-        for handler in handlers {
             handler(payload).map_err(|error| match error {
                 CoreError::EventListener(_) => error,
                 other => CoreError::EventListener(other.to_string()),
@@ -706,31 +964,47 @@ impl Registry {
         value: T,
     ) -> Result<T, CoreError> {
         let type_id = TypeId::of::<T>();
-        let handlers = {
+        let payload_box: Box<dyn Any + Send + Sync> = Box::new(value);
+        let selected = {
             let mut state = self.state.lock().map_err(|_| CoreError::ContextDisposed)?;
             Self::lock_event_contract(&mut state, event_id, EventMode::Waterfall, type_id, None)?;
-            let Some(listeners) = state.listeners.get(event_id) else {
-                return Ok(value);
-            };
-            let mut selected = Vec::new();
-            for listener in listeners {
-                if !is_ancestor_or_self(&state, listener.node, node) {
+            let matched =
+                Self::select_matching_listeners(&state, event_id, node, EventMode::Waterfall)?;
+            matched
+                .into_iter()
+                .map(|listener| {
+                    let EventHandlerKind::Waterfall(handler) = &listener.kind else {
+                        unreachable!();
+                    };
+                    (listener.id, handler.clone(), listener.meta.clone())
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let mut handlers = Vec::new();
+        for (id, handler, meta) in selected {
+            if !Self::apply_filter(&meta.filter, payload_box.as_ref())? {
+                continue;
+            }
+            if meta.once {
+                if meta
+                    .once_gate
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_err()
+                {
                     continue;
                 }
-                match &listener.kind {
-                    EventHandlerKind::Waterfall(handler) => selected.push(handler.clone()),
-                    _ => return Err(CoreError::EventModeMismatch { event: event_id }),
-                }
+                self.unsubscribe_event(event_id, id);
             }
-            selected
-        };
+            handlers.push(handler);
+        }
 
         let mut next: ErasedNext = Box::new(|boxed| Box::pin(async move { Ok(boxed) }));
         for handler in handlers.into_iter().rev() {
             let prev = next;
             next = Box::new(move |boxed| Box::pin(async move { handler(boxed, prev).await }));
         }
-        let boxed = next(Box::new(value)).await?;
+        let boxed = next(payload_box).await?;
         boxed
             .downcast::<T>()
             .map(|value| *value)
@@ -743,7 +1017,7 @@ impl Registry {
         event_id: &'static str,
         payload: &T,
     ) -> Result<Option<R>, CoreError> {
-        let handlers = {
+        let selected = {
             let mut state = self.state.lock().map_err(|_| CoreError::ContextDisposed)?;
             Self::lock_event_contract(
                 &mut state,
@@ -752,22 +1026,32 @@ impl Registry {
                 TypeId::of::<T>(),
                 Some(TypeId::of::<R>()),
             )?;
-            let Some(listeners) = state.listeners.get(event_id) else {
-                return Ok(None);
-            };
-            let mut selected = Vec::new();
-            for listener in listeners {
-                if !is_ancestor_or_self(&state, listener.node, node) {
+            let matched =
+                Self::select_matching_listeners(&state, event_id, node, EventMode::Serial)?;
+            matched
+                .into_iter()
+                .map(|listener| {
+                    let EventHandlerKind::Serial(handler) = &listener.kind else {
+                        unreachable!();
+                    };
+                    (listener.id, handler.clone(), listener.meta.clone())
+                })
+                .collect::<Vec<_>>()
+        };
+        for (id, handler, meta) in selected {
+            if !Self::apply_filter(&meta.filter, payload)? {
+                continue;
+            }
+            if meta.once {
+                if meta
+                    .once_gate
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_err()
+                {
                     continue;
                 }
-                match &listener.kind {
-                    EventHandlerKind::Serial(handler) => selected.push(handler.clone()),
-                    _ => return Err(CoreError::EventModeMismatch { event: event_id }),
-                }
+                self.unsubscribe_event(event_id, id);
             }
-            selected
-        };
-        for handler in handlers {
             match handler.invoke(payload).await.map_err(|error| match error {
                 CoreError::EventListener(_) => error,
                 other => CoreError::EventListener(other.to_string()),
@@ -791,33 +1075,55 @@ impl Registry {
         type_id: TypeId,
         payload: &(dyn Any + Send + Sync),
     ) -> Result<(), CoreError> {
-        let handlers = {
+        let selected = {
             let mut state = self.state.lock().map_err(|_| CoreError::ContextDisposed)?;
             Self::lock_event_contract(&mut state, event_id, EventMode::Parallel, type_id, None)?;
-            let Some(listeners) = state.listeners.get(event_id) else {
-                return Ok(());
-            };
-            let mut selected = Vec::new();
-            for listener in listeners {
-                if !is_ancestor_or_self(&state, listener.node, node) {
+            let matched =
+                Self::select_matching_listeners(&state, event_id, node, EventMode::Parallel)?;
+            matched
+                .into_iter()
+                .map(|listener| {
+                    let EventHandlerKind::Parallel(handler) = &listener.kind else {
+                        unreachable!();
+                    };
+                    (listener.id, handler.clone(), listener.meta.clone())
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut handlers = Vec::new();
+        let mut filter_errors = Vec::new();
+        for (id, handler, meta) in selected {
+            match Self::apply_filter(&meta.filter, payload) {
+                Ok(false) => continue,
+                Ok(true) => {}
+                Err(CoreError::EventListener(message)) => {
+                    filter_errors.push(message);
                     continue;
                 }
-                match &listener.kind {
-                    EventHandlerKind::Parallel(handler) => selected.push(handler.clone()),
-                    _ => return Err(CoreError::EventModeMismatch { event: event_id }),
+                Err(other) => {
+                    filter_errors.push(other.to_string());
+                    continue;
                 }
             }
-            selected
-        };
+            if meta.once {
+                if meta
+                    .once_gate
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_err()
+                {
+                    continue;
+                }
+                self.unsubscribe_event(event_id, id);
+            }
+            handlers.push(handler);
+        }
         let results = join_all(handlers.iter().map(|handler| handler.invoke(payload))).await;
-        let errors: Vec<String> = results
-            .into_iter()
-            .filter_map(|result| match result {
-                Ok(()) => None,
-                Err(CoreError::EventListener(message)) => Some(message),
-                Err(other) => Some(other.to_string()),
-            })
-            .collect();
+        let mut errors = filter_errors;
+        errors.extend(results.into_iter().filter_map(|result| match result {
+            Ok(()) => None,
+            Err(CoreError::EventListener(message)) => Some(message),
+            Err(other) => Some(other.to_string()),
+        }));
         if errors.is_empty() {
             Ok(())
         } else {
@@ -846,6 +1152,7 @@ impl Registry {
                         label_id: *label_id,
                     })
                     .collect(),
+                config_keys: node.configs.keys().map(|key| key.as_str()).collect(),
             })
             .collect();
         let mut isolations: Vec<IsolationSnapshot> = state
@@ -915,6 +1222,33 @@ impl Registry {
             .values()
             .filter_map(Weak::upgrade)
             .collect::<Vec<_>>();
+        let mut plugin_registry: Vec<PluginRegistrySnapshot> = state
+            .plugin_index
+            .iter()
+            .map(|(key, group)| PluginRegistrySnapshot {
+                plugin_key: key.as_str(),
+                unmounting: group.unmounting,
+                fibers: group
+                    .fibers
+                    .iter()
+                    .filter_map(Weak::upgrade)
+                    .map(|fiber| {
+                        let state = match *fiber.state.lock().expect("state") {
+                            FiberState::Pending => FiberStateSnapshot::Pending,
+                            FiberState::Loading => FiberStateSnapshot::Loading,
+                            FiberState::Active => FiberStateSnapshot::Active,
+                            FiberState::Failed => FiberStateSnapshot::Failed,
+                            FiberState::Disposed => FiberStateSnapshot::Disposed,
+                        };
+                        PluginRegistryFiberSnapshot {
+                            id: fiber.id,
+                            state,
+                        }
+                    })
+                    .collect(),
+            })
+            .collect();
+        plugin_registry.sort_by_key(|item| item.plugin_key);
         drop(state);
         let plugin_fibers = plugin_fiber_arcs
             .iter()
@@ -925,6 +1259,7 @@ impl Registry {
             isolations,
             providers,
             plugin_fibers,
+            plugin_registry,
             inject_fibers,
             effects,
         }

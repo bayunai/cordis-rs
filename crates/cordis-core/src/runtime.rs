@@ -1,6 +1,6 @@
 use crate::{
-    Context, CoreError, context::ContextInner, diagnostics::RuntimeSnapshot, effect::EffectScope,
-    inject::Registry,
+    Context, CoreError, PluginKey, context::ContextInner, diagnostics::RuntimeSnapshot,
+    effect::EffectScope, fiber::Fiber, inject::Registry,
 };
 use std::sync::{
     Arc,
@@ -80,6 +80,18 @@ impl Runtime {
     /// 只读诊断快照：不含 Service 实例或业务数据。
     pub fn diagnostics(&self) -> RuntimeSnapshot {
         self.inner.registry.diagnostics()
+    }
+
+    /// 按 [`PluginKey`] 统一卸载：拒绝并发新挂载，等待该组全部 Fiber `dispose_wait`。
+    pub async fn unmount(&self, key: PluginKey) -> Result<usize, CoreError> {
+        let fibers = self.inner.registry.begin_plugin_unmount(key)?;
+        let count = fibers.len();
+        for fiber in fibers {
+            let mut handle = Fiber { inner: fiber };
+            handle.dispose_wait().await;
+        }
+        self.inner.registry.finish_plugin_unmount(key);
+        Ok(count)
     }
 }
 

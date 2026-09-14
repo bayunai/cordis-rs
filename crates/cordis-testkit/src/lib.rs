@@ -143,6 +143,9 @@ impl TestPlugin {
 
 #[async_trait]
 impl Plugin for TestPlugin {
+    fn key(&self) -> cordis_core::PluginKey {
+        cordis_core::PluginKey::new("testkit.plugin")
+    }
     async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
         let counter = self.dispose_count.clone();
         let effect = ctx.effect()?;

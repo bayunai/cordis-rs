@@ -17,6 +17,9 @@ struct ClockPlugin;
 
 #[async_trait]
 impl Plugin for ClockPlugin {
+    fn key(&self) -> cordis_core::PluginKey {
+        cordis_core::PluginKey::new("example.clock")
+    }
     async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
         ctx.provide(CLOCK, Clock)?;
         ctx.on(TICK, |tick| {

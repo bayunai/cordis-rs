@@ -41,7 +41,8 @@ Context::plugin(Arc<dyn Plugin>)
         └─ 返回 Fiber
                 ├─ dispose / dispose_wait / Drop
                 ├─ restart()：同 Plugin 强制重跑
-                └─ replace(plugin)：dispose_wait 旧任务后再挂新实例
+                └─ replace(plugin)：同 PluginKey；dispose_wait 旧任务后再挂
+                跨 Key：Runtime::unmount(key) 后再 plugin(new)
 ```
 
 Provider 变化时，依赖该 Key 的 Plugin Fiber 自动 `Active → Pending → Active`。配置更新 = 宿主构造新 Plugin + `Fiber::replace`（Core **无** `update(json)`）。
@@ -56,11 +57,28 @@ Provider 变化时，依赖该 Key 的 Plugin Fiber 自动 `Active → Pending �
 
 ## Event
 
-同 ID 锁定 **模式 + TypeId**。Observe / Waterfall / Serial / Parallel 四模式；无 isolate 事件过滤、无 intercept。
+同 ID 锁定 **模式 + TypeId**。Observe / Waterfall / Serial / Parallel 四模式。
+
+监听选项（`*_with_options` / `ListenOptions`）：
+
+- `once`：真正调用前原子注销，并发派发最多执行一次
+- `prepend`：同事件列表内优先于普通监听器；多个 prepend 最新注册优先
+- `global`：Runtime 内同 ID 广播（先于祖先链本地监听器）；无 isolate 事件过滤
+- `filter`：同步 `Fn(&T) -> Result<bool, CoreError>`；`false` 跳过，`Err` 中止（Parallel 计入聚合）
+
+无选项的 `on*` 保持默认行为。配置覆盖见 `intercept`（独立于 Event）。
 
 ## 诊断
 
-`Runtime::diagnostics()` 含：contexts（含 isolation 覆盖）、isolations、providers（isolation/effect_id）、plugin_fibers、inject_fibers、effects。无 Service 值与配置。
+`Runtime::diagnostics()` 含：contexts（isolation 覆盖 + `config_keys` 标识）、isolations、providers（isolation/effect_id）、plugin_fibers（含 `plugin_key`）、plugin_registry（Key + Fiber id/state）、inject_fibers、effects。无 Service / Config 值。
+
+## Config / intercept
+
+`ConfigKey<T>` 独立于 `ServiceKey`。`Context::intercept(key, value)` 创建共享 Scope 的派生节点并写入覆盖；`config(key)` 向父爬最近值。不影响 Provider / inject 生命周期。
+
+## Plugin Registry
+
+`Plugin::key()` 声明稳定身份。Runtime 按 Key 归组 Fiber；`Runtime::unmount(key)` 标记卸载中、拒绝同 Key 新挂载、`dispose_wait` 全部实例后清分组。`Fiber::replace` 仅允许同 Key。
 
 ## 关闭
 

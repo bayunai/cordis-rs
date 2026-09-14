@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use cordis_core::{
-    Context, CoreError, EventKey, FiberState, InjectionState, ParallelKey, Plugin, Runtime,
-    SerialKey, ServiceKey, WaterfallKey,
+    Context, CoreError, EventKey, FiberState, InjectionState, ListenOptions, ParallelKey, Plugin,
+    Runtime, SerialKey, ServiceKey, WaterfallKey,
 };
 use cordis_testkit::{
     EventRecorder, TestPlugin, assert_service_unavailable, wait_injection, wait_until,
@@ -260,6 +260,9 @@ struct FailingPlugin;
 
 #[async_trait]
 impl Plugin for FailingPlugin {
+    fn key(&self) -> cordis_core::PluginKey {
+        cordis_core::PluginKey::new("test.failingplugin")
+    }
     async fn apply(&self, _ctx: &Context) -> Result<(), CoreError> {
         Err(CoreError::PluginApply("boom".into()))
     }
@@ -599,6 +602,9 @@ async fn plugin_remount_does_not_accumulate_child_scopes() {
         }
         #[async_trait]
         impl Plugin for TaskPlugin {
+            fn key(&self) -> cordis_core::PluginKey {
+                cordis_core::PluginKey::new("test.taskplugin")
+            }
             async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
                 let effect = ctx.effect()?;
                 let finished = self.finished.clone();
@@ -641,6 +647,9 @@ async fn plugin_dispose_wait_awaits_owned_tasks() {
 
     #[async_trait]
     impl Plugin for WaitPlugin {
+        fn key(&self) -> cordis_core::PluginKey {
+            cordis_core::PluginKey::new("test.waitplugin")
+        }
         async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
             let effect = ctx.effect()?;
             let finished = self.finished.clone();
@@ -691,6 +700,9 @@ async fn plugin_hot_replace_after_dispose_wait() {
 
     #[async_trait]
     impl Plugin for PluginA {
+        fn key(&self) -> cordis_core::PluginKey {
+            cordis_core::PluginKey::new("test.plugina")
+        }
         async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
             ctx.provide(NUMBER, Number(1))?;
             let effect = ctx.effect()?;
@@ -708,6 +720,9 @@ async fn plugin_hot_replace_after_dispose_wait() {
 
     #[async_trait]
     impl Plugin for PluginB {
+        fn key(&self) -> cordis_core::PluginKey {
+            cordis_core::PluginKey::new("test.pluginb")
+        }
         async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
             ctx.provide(NUMBER, Number(2))?;
             Ok(())
@@ -748,6 +763,9 @@ async fn plugin_apply_races_parent_dispose_returns_no_handle() {
 
     #[async_trait]
     impl Plugin for SlowPlugin {
+        fn key(&self) -> cordis_core::PluginKey {
+            cordis_core::PluginKey::new("test.slowplugin")
+        }
         async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
             ctx.provide(NUMBER, Number(1))?;
             ctx.on(PING, |_| Ok(()))?;
@@ -891,6 +909,9 @@ async fn key_type_conflict_across_plugins() {
     struct OtherPlugin;
     #[async_trait]
     impl Plugin for OtherPlugin {
+        fn key(&self) -> cordis_core::PluginKey {
+            cordis_core::PluginKey::new("test.otherplugin")
+        }
         async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
             ctx.provide(OTHER_NUMBER, Other)?;
             Ok(())
@@ -1010,6 +1031,9 @@ async fn isolation_provider_change_reactivates_plugin_fiber() {
     struct DepPlugin;
     #[async_trait]
     impl Plugin for DepPlugin {
+        fn key(&self) -> cordis_core::PluginKey {
+            cordis_core::PluginKey::new("test.depplugin")
+        }
         fn inject(&self) -> Vec<cordis_core::ServiceId> {
             vec![NUMBER.id()]
         }
@@ -1048,6 +1072,9 @@ async fn fiber_restart_and_replace_wait_for_tasks() {
     }
     #[async_trait]
     impl Plugin for Taskful {
+        fn key(&self) -> cordis_core::PluginKey {
+            cordis_core::PluginKey::new("test.taskful")
+        }
         async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
             ctx.provide(NUMBER, Number(self.value))?;
             let finished = self.finished.clone();
@@ -1111,6 +1138,9 @@ async fn concurrent_mount_and_scheduler_apply_once() {
 
     #[async_trait]
     impl Plugin for GatedPlugin {
+        fn key(&self) -> cordis_core::PluginKey {
+            cordis_core::PluginKey::new("test.gatedplugin")
+        }
         async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
             self.apply_count.fetch_add(1, Ordering::SeqCst);
             if let Some(tx) = self.entered.lock().expect("entered").take() {
@@ -1199,6 +1229,9 @@ async fn provider_revoked_during_loading_does_not_stick_active() {
 
     #[async_trait]
     impl Plugin for GatedDepPlugin {
+        fn key(&self) -> cordis_core::PluginKey {
+            cordis_core::PluginKey::new("test.gateddepplugin")
+        }
         fn inject(&self) -> Vec<cordis_core::ServiceId> {
             vec![NUMBER.id()]
         }
@@ -1259,6 +1292,9 @@ async fn provider_replaced_during_loading_reactivates_with_fresh() {
 
     #[async_trait]
     impl Plugin for GatedDepPlugin {
+        fn key(&self) -> cordis_core::PluginKey {
+            cordis_core::PluginKey::new("test.gateddepplugin")
+        }
         fn inject(&self) -> Vec<cordis_core::ServiceId> {
             vec![NUMBER.id()]
         }
@@ -1320,6 +1356,9 @@ async fn restart_during_parent_dispose_keeps_disposed() {
 
     #[async_trait]
     impl Plugin for SlowDisposePlugin {
+        fn key(&self) -> cordis_core::PluginKey {
+            cordis_core::PluginKey::new("test.slowdisposeplugin")
+        }
         async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
             let finished = self.finished.clone();
             let effect = ctx.effect()?;
@@ -1381,6 +1420,9 @@ async fn replace_during_parent_dispose_keeps_disposed_and_skips_new_plugin() {
 
     #[async_trait]
     impl Plugin for SlowDisposePlugin {
+        fn key(&self) -> cordis_core::PluginKey {
+            cordis_core::PluginKey::new("test.slowdisposeplugin")
+        }
         async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
             let cancelled = self.cancelled.clone();
             let release = self.release.clone();
@@ -1405,6 +1447,10 @@ async fn replace_during_parent_dispose_keeps_disposed_and_skips_new_plugin() {
 
     #[async_trait]
     impl Plugin for ReplacementPlugin {
+        fn key(&self) -> cordis_core::PluginKey {
+            // 同 Key 才能进入 dispose_wait；跨 Key 由专门用例覆盖。
+            cordis_core::PluginKey::new("test.slowdisposeplugin")
+        }
         async fn apply(&self, _ctx: &Context) -> Result<(), CoreError> {
             self.applied.fetch_add(1, Ordering::SeqCst);
             Ok(())
@@ -1436,6 +1482,372 @@ async fn replace_during_parent_dispose_keeps_disposed_and_skips_new_plugin() {
     assert!(fiber.is_disposed());
     assert_eq!(replacement_applied.load(Ordering::SeqCst), 0);
     runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn intercept_overrides_config_without_mutating_parent() {
+    use cordis_core::ConfigKey;
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct Theme(&'static str);
+
+    static THEME: ConfigKey<Theme> = ConfigKey::new("test.theme@1");
+
+    let runtime = runtime();
+    let root = runtime.root();
+    assert!(matches!(
+        root.config(THEME),
+        Err(CoreError::ConfigUnavailable { .. })
+    ));
+
+    let child = root.intercept(THEME, Theme("dark")).unwrap();
+    assert_eq!(child.config(THEME).unwrap().0, "dark");
+    assert!(matches!(
+        root.config(THEME),
+        Err(CoreError::ConfigUnavailable { .. })
+    ));
+
+    let nested = child.intercept(THEME, Theme("oled")).unwrap();
+    assert_eq!(nested.config(THEME).unwrap().0, "oled");
+    assert_eq!(child.config(THEME).unwrap().0, "dark");
+
+    let snap = runtime.diagnostics();
+    assert!(
+        snap.contexts
+            .iter()
+            .any(|ctx| ctx.config_keys.contains(&"test.theme@1"))
+    );
+    assert!(!format!("{snap:?}").contains("oled"));
+}
+
+#[tokio::test]
+async fn intercept_type_conflict_and_plugin_can_read_config() {
+    use cordis_core::ConfigKey;
+
+    #[derive(Debug)]
+    struct Flag(bool);
+    #[derive(Debug)]
+    struct OtherFlag;
+
+    static FLAG: ConfigKey<Flag> = ConfigKey::new("test.flag@1");
+    static FLAG_AS_OTHER: ConfigKey<OtherFlag> = ConfigKey::new("test.flag@1");
+
+    let runtime = runtime();
+    let root = runtime.root();
+    let scoped = root.intercept(FLAG, Flag(true)).unwrap();
+    assert!(matches!(
+        root.intercept(FLAG_AS_OTHER, OtherFlag),
+        Err(CoreError::ConfigKeyTypeConflict { .. })
+    ));
+    assert!(matches!(
+        scoped.config(FLAG_AS_OTHER),
+        Err(CoreError::ConfigTypeMismatch { .. })
+    ));
+
+    struct ConfigReader;
+    #[async_trait]
+    impl Plugin for ConfigReader {
+        fn key(&self) -> cordis_core::PluginKey {
+            cordis_core::PluginKey::new("test.configreader")
+        }
+        async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
+            assert!(ctx.config(FLAG)?.0);
+            Ok(())
+        }
+    }
+    let mut fiber = scoped.plugin(Arc::new(ConfigReader)).await.unwrap();
+    assert_eq!(fiber.state(), FiberState::Active);
+    fiber.dispose();
+}
+
+#[tokio::test]
+async fn plugin_registry_groups_and_unmount_waits() {
+    use cordis_core::PluginKey;
+
+    static KEY: PluginKey = PluginKey::new("test.registry.group");
+    let runtime = runtime();
+    let root = runtime.root();
+    let finished = Arc::new(AtomicUsize::new(0));
+
+    struct SlowPlugin {
+        finished: Arc<AtomicUsize>,
+    }
+    #[async_trait]
+    impl Plugin for SlowPlugin {
+        fn key(&self) -> PluginKey {
+            KEY
+        }
+        async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
+            let finished = self.finished.clone();
+            let effect = ctx.effect()?;
+            effect.spawn(move |cancel| async move {
+                cancel.cancelled().await;
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                finished.fetch_add(1, Ordering::SeqCst);
+            })?;
+            Ok(())
+        }
+    }
+
+    let _a = root
+        .plugin(Arc::new(SlowPlugin {
+            finished: finished.clone(),
+        }))
+        .await
+        .unwrap();
+    let _b = root
+        .plugin(Arc::new(SlowPlugin {
+            finished: finished.clone(),
+        }))
+        .await
+        .unwrap();
+    let snap = runtime.diagnostics();
+    let group = snap
+        .plugin_registry
+        .iter()
+        .find(|item| item.plugin_key == KEY.as_str())
+        .expect("group");
+    assert_eq!(group.fibers.len(), 2);
+
+    let count = runtime.unmount(KEY).await.unwrap();
+    assert_eq!(count, 2);
+    assert_eq!(finished.load(Ordering::SeqCst), 2);
+    assert!(
+        runtime
+            .diagnostics()
+            .plugin_registry
+            .iter()
+            .all(|item| item.plugin_key != KEY.as_str())
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unmount_rejects_concurrent_mount_and_replace_requires_same_key() {
+    use cordis_core::PluginKey;
+
+    static KEY_A: PluginKey = PluginKey::new("test.registry.a");
+    static KEY_B: PluginKey = PluginKey::new("test.registry.b");
+
+    let (gate_tx, gate_rx) = oneshot::channel::<()>();
+    let gate_rx = Arc::new(Mutex::new(Some(gate_rx)));
+
+    struct PluginA {
+        gate: Arc<Mutex<Option<oneshot::Receiver<()>>>>,
+    }
+    struct PluginB;
+    #[async_trait]
+    impl Plugin for PluginA {
+        fn key(&self) -> PluginKey {
+            KEY_A
+        }
+        async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
+            let gate = self.gate.clone();
+            let effect = ctx.effect()?;
+            effect.spawn(move |cancel| async move {
+                cancel.cancelled().await;
+                let rx = {
+                    let mut guard = gate.lock().expect("gate");
+                    guard.take()
+                };
+                if let Some(rx) = rx {
+                    let _ = rx.await;
+                }
+            })?;
+            Ok(())
+        }
+    }
+    #[async_trait]
+    impl Plugin for PluginB {
+        fn key(&self) -> PluginKey {
+            KEY_B
+        }
+        async fn apply(&self, _ctx: &Context) -> Result<(), CoreError> {
+            Ok(())
+        }
+    }
+
+    let runtime = runtime();
+    let root = runtime.root();
+    let mut fiber = root
+        .plugin(Arc::new(PluginA { gate: gate_rx }))
+        .await
+        .unwrap();
+    assert!(matches!(
+        fiber.replace(Arc::new(PluginB)).await,
+        Err(CoreError::PluginKeyMismatch { .. })
+    ));
+
+    let unmount = {
+        let runtime = runtime.clone();
+        tokio::spawn(async move { runtime.unmount(KEY_A).await })
+    };
+    wait_until(|| {
+        runtime
+            .diagnostics()
+            .plugin_registry
+            .iter()
+            .any(|item| item.plugin_key == KEY_A.as_str() && item.unmounting)
+    })
+    .await;
+    let rejected = root
+        .plugin(Arc::new(PluginA {
+            gate: Arc::new(Mutex::new(None)),
+        }))
+        .await;
+    assert!(matches!(rejected, Err(CoreError::PluginUnmounting { .. })));
+    let _ = gate_tx.send(());
+    assert_eq!(unmount.await.unwrap().unwrap(), 1);
+    assert!(fiber.is_disposed());
+}
+
+#[tokio::test]
+async fn plugin_dispose_clears_registry_index() {
+    use cordis_core::PluginKey;
+
+    static KEY: PluginKey = PluginKey::new("test.registry.solo");
+    struct Solo;
+    #[async_trait]
+    impl Plugin for Solo {
+        fn key(&self) -> PluginKey {
+            KEY
+        }
+        async fn apply(&self, _ctx: &Context) -> Result<(), CoreError> {
+            Ok(())
+        }
+    }
+
+    let runtime = runtime();
+    let root = runtime.root();
+    let mut fiber = root.plugin(Arc::new(Solo)).await.unwrap();
+    assert!(
+        runtime
+            .diagnostics()
+            .plugin_registry
+            .iter()
+            .any(|item| item.plugin_key == KEY.as_str() && item.fibers.len() == 1)
+    );
+    fiber.dispose();
+    assert!(
+        runtime
+            .diagnostics()
+            .plugin_registry
+            .iter()
+            .all(|item| item.plugin_key != KEY.as_str())
+    );
+}
+
+#[tokio::test]
+async fn event_filter_skip_and_error() {
+    let runtime = runtime();
+    let root = runtime.root();
+    let hits = Arc::new(AtomicUsize::new(0));
+    let count = hits.clone();
+    root.on_with_options(
+        PING,
+        ListenOptions::<Ping>::new().filter(|ping: &Ping| {
+            if ping.0 == 99 {
+                return Err(CoreError::EventListener("bad".into()));
+            }
+            Ok(ping.0 % 2 == 1)
+        }),
+        move |_| {
+            count.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        },
+    )
+    .unwrap();
+    root.emit(PING, &Ping(1)).unwrap();
+    root.emit(PING, &Ping(2)).unwrap();
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    let err = root.emit(PING, &Ping(99)).unwrap_err();
+    assert!(matches!(err, CoreError::EventListener(_)));
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn event_once_runs_at_most_once_under_concurrent_emit() {
+    let runtime = runtime();
+    let root = runtime.root();
+    let hits = Arc::new(AtomicUsize::new(0));
+    let count = hits.clone();
+    root.on_with_options(PING, ListenOptions::new().once(), move |_| {
+        count.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    })
+    .unwrap();
+    let mut joins = Vec::new();
+    for _ in 0..32 {
+        let root = root.clone();
+        joins.push(tokio::spawn(async move {
+            root.emit(PING, &Ping(1)).unwrap();
+        }));
+    }
+    for join in joins {
+        join.await.unwrap();
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    root.emit(PING, &Ping(2)).unwrap();
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn event_prepend_orders_newest_first_then_normal() {
+    let runtime = runtime();
+    let root = runtime.root();
+    let order = Arc::new(Mutex::new(Vec::new()));
+    let push = |label: &'static str, order: Arc<Mutex<Vec<&'static str>>>| {
+        move |_: &Ping| {
+            order.lock().expect("order").push(label);
+            Ok(())
+        }
+    };
+    root.on(PING, push("normal-a", order.clone())).unwrap();
+    root.on_with_options(
+        PING,
+        ListenOptions::new().prepend(),
+        push("pre-1", order.clone()),
+    )
+    .unwrap();
+    root.on(PING, push("normal-b", order.clone())).unwrap();
+    root.on_with_options(
+        PING,
+        ListenOptions::new().prepend(),
+        push("pre-2", order.clone()),
+    )
+    .unwrap();
+    root.emit(PING, &Ping(1)).unwrap();
+    assert_eq!(
+        *order.lock().expect("order"),
+        vec!["pre-2", "pre-1", "normal-a", "normal-b"]
+    );
+}
+
+#[tokio::test]
+async fn event_global_crosses_sibling_contexts_local_does_not() {
+    let runtime = runtime();
+    let root = runtime.root();
+    let (left, _) = root.isolate(NUMBER).unwrap();
+    let (right, _) = root.isolate(NUMBER).unwrap();
+    let local_hits = Arc::new(AtomicUsize::new(0));
+    let global_hits = Arc::new(AtomicUsize::new(0));
+    let local = local_hits.clone();
+    let global = global_hits.clone();
+    left.on(PING, move |_| {
+        local.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    })
+    .unwrap();
+    left.on_with_options(PING, ListenOptions::new().global(), move |_| {
+        global.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    })
+    .unwrap();
+    right.emit(PING, &Ping(1)).unwrap();
+    assert_eq!(local_hits.load(Ordering::SeqCst), 0);
+    assert_eq!(global_hits.load(Ordering::SeqCst), 1);
+    left.emit(PING, &Ping(2)).unwrap();
+    assert_eq!(local_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(global_hits.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]
