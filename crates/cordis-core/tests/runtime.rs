@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use cordis_core::{
-    Context, CoreError, EventKey, InjectionState, ParallelKey, Plugin, Runtime, SerialKey,
-    ServiceKey, WaterfallKey,
+    Context, CoreError, EventKey, FiberState, InjectionState, ParallelKey, Plugin, Runtime,
+    SerialKey, ServiceKey, WaterfallKey,
 };
 use cordis_testkit::{
     EventRecorder, TestPlugin, assert_service_unavailable, wait_injection, wait_until,
@@ -225,7 +225,7 @@ async fn cyclic_injections_stay_pending_with_missing_deps_only() {
     let snapshot = runtime.diagnostics();
     assert!(
         snapshot
-            .fibers
+            .inject_fibers
             .iter()
             .any(|fiber| !fiber.missing_dependencies.is_empty())
     );
@@ -246,14 +246,12 @@ async fn plugin_mount_provides_and_dispose_clears_resources() {
     let dispose_count = plugin.on_dispose_counter();
     let mut handle = root.plugin(plugin.into_arc()).await.unwrap();
     assert_eq!(root.get(NUMBER).unwrap().0, 9);
-    assert!(!runtime.diagnostics().plugins.is_empty());
 
     handle.dispose();
     handle.dispose();
     assert!(handle.is_disposed());
     assert_eq!(dispose_count.load(Ordering::SeqCst), 1);
     assert_service_unavailable(&root, NUMBER);
-    assert!(runtime.diagnostics().plugins.is_empty());
 }
 
 struct FailingPlugin;
@@ -268,8 +266,13 @@ impl Plugin for FailingPlugin {
 #[tokio::test]
 async fn plugin_apply_error_surfaces() {
     let runtime = runtime();
-    let result = runtime.root().plugin(Arc::new(FailingPlugin)).await;
-    assert!(matches!(result, Err(CoreError::PluginApply(_))));
+    let fiber = runtime
+        .root()
+        .plugin(Arc::new(FailingPlugin))
+        .await
+        .unwrap();
+    assert_eq!(fiber.state(), cordis_core::FiberState::Failed);
+    assert!(fiber.last_error().is_some());
 }
 
 #[tokio::test]
@@ -768,10 +771,9 @@ async fn plugin_apply_races_parent_dispose_returns_no_handle() {
     entered_rx.await.expect("plugin entered apply");
     parent.dispose();
     let _ = gate_tx.send(());
-    let result = mount.await.expect("join");
-    assert!(matches!(result, Err(CoreError::PluginApply(_))));
+    let result = mount.await.expect("join").expect("fiber handle");
+    assert_eq!(result.state(), cordis_core::FiberState::Disposed);
     assert_service_unavailable(&root, NUMBER);
-    assert!(runtime.diagnostics().plugins.is_empty());
 }
 
 #[tokio::test]
@@ -889,8 +891,15 @@ async fn key_type_conflict_across_plugins() {
             Ok(())
         }
     }
-    let result = root.plugin(Arc::new(OtherPlugin)).await;
-    assert!(matches!(result, Err(CoreError::PluginApply(_))));
+    let fiber = root.plugin(Arc::new(OtherPlugin)).await.unwrap();
+    assert_eq!(fiber.state(), cordis_core::FiberState::Failed);
+    assert!(
+        fiber
+            .last_error()
+            .is_some_and(|message| message.contains("类型")
+                || message.contains("PluginApply")
+                || message.contains("绑定"))
+    );
 }
 
 #[tokio::test]
@@ -931,4 +940,496 @@ async fn child_dispose_then_drop_context_parent_shutdown_waits_task() {
         finished.load(Ordering::SeqCst),
         "task should be hoisted to parent and awaited on shutdown"
     );
+}
+
+#[tokio::test]
+async fn isolation_label_shares_service_across_sibling_contexts() {
+    let rt = runtime();
+    let root = rt.root();
+    let room = root.child().unwrap();
+    let label = room.isolate(NUMBER).unwrap();
+    room.provide(NUMBER, Number(11)).unwrap();
+
+    let a = root.child().unwrap();
+    a.isolate_with(NUMBER, label.clone()).unwrap();
+    assert_eq!(a.get(NUMBER).unwrap().0, 11);
+
+    let b = root.child().unwrap();
+    b.isolate_with(NUMBER, label).unwrap();
+    assert_eq!(b.get(NUMBER).unwrap().0, 11);
+
+    let plain = root.child().unwrap();
+    assert_service_unavailable(&plain, NUMBER);
+
+    let other_rt = runtime();
+    let foreign = other_rt.root().isolate(NUMBER).unwrap();
+    assert!(matches!(
+        room.isolate_with(NUMBER, foreign),
+        Err(CoreError::IsolationRuntimeMismatch)
+    ));
+}
+
+#[tokio::test]
+async fn isolation_provider_change_reactivates_plugin_fiber() {
+    let runtime = runtime();
+    let root = runtime.root();
+    let _label = root.isolate(NUMBER).unwrap();
+    let provider = root.effect_named("provider").unwrap();
+    provider.provide(NUMBER, Number(1)).unwrap();
+
+    struct DepPlugin;
+    #[async_trait]
+    impl Plugin for DepPlugin {
+        fn inject(&self) -> Vec<cordis_core::ServiceId> {
+            vec![NUMBER.id()]
+        }
+        async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
+            let _ = ctx.get(NUMBER)?;
+            Ok(())
+        }
+    }
+
+    let mut fiber = root.plugin(Arc::new(DepPlugin)).await.unwrap();
+    assert_eq!(fiber.state(), FiberState::Active);
+
+    provider.dispose();
+    runtime.settle().await;
+    wait_until(|| fiber.state() == FiberState::Pending).await;
+    assert_ne!(fiber.state(), FiberState::Loading);
+
+    let again = root.effect_named("provider2").unwrap();
+    again.provide(NUMBER, Number(2)).unwrap();
+    runtime.settle().await;
+    wait_until(|| fiber.state() == FiberState::Active).await;
+    assert_ne!(fiber.state(), FiberState::Loading);
+    fiber.dispose();
+}
+
+#[tokio::test]
+async fn fiber_restart_and_replace_wait_for_tasks() {
+    let runtime = runtime();
+    let root = runtime.root();
+    let finished = Arc::new(AtomicBool::new(false));
+    let flag = finished.clone();
+
+    struct Taskful {
+        finished: Arc<AtomicBool>,
+        value: usize,
+    }
+    #[async_trait]
+    impl Plugin for Taskful {
+        async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
+            ctx.provide(NUMBER, Number(self.value))?;
+            let finished = self.finished.clone();
+            let effect = ctx.effect()?;
+            effect.spawn(move |cancel| async move {
+                cancel.cancelled().await;
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                finished.store(true, Ordering::SeqCst);
+            })?;
+            Ok(())
+        }
+    }
+
+    let mut fiber = root
+        .plugin(Arc::new(Taskful {
+            finished: flag,
+            value: 1,
+        }))
+        .await
+        .unwrap();
+    assert_eq!(root.get(NUMBER).unwrap().0, 1);
+    assert_eq!(fiber.state(), FiberState::Active);
+
+    fiber.restart().await.unwrap();
+    assert!(finished.load(Ordering::SeqCst));
+    assert_eq!(fiber.state(), FiberState::Active);
+    assert_ne!(fiber.state(), FiberState::Loading);
+
+    let finished2 = Arc::new(AtomicBool::new(false));
+    fiber
+        .replace(Arc::new(Taskful {
+            finished: finished2.clone(),
+            value: 2,
+        }))
+        .await
+        .unwrap();
+    assert_eq!(root.get(NUMBER).unwrap().0, 2);
+    assert_eq!(fiber.state(), FiberState::Active);
+    assert_ne!(fiber.state(), FiberState::Loading);
+    fiber.dispose_wait().await;
+    assert!(finished2.load(Ordering::SeqCst));
+    assert!(fiber.is_disposed());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_mount_and_scheduler_apply_once() {
+    let runtime = runtime();
+    let root = runtime.root();
+    let apply_count = Arc::new(AtomicUsize::new(0));
+    let (entered_tx, entered_rx) = oneshot::channel::<()>();
+    let (gate_tx, gate_rx) = oneshot::channel::<()>();
+    let entered_tx = Arc::new(Mutex::new(Some(entered_tx)));
+    let gate_rx = Arc::new(Mutex::new(Some(gate_rx)));
+    let count = apply_count.clone();
+
+    struct GatedPlugin {
+        apply_count: Arc<AtomicUsize>,
+        entered: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+        gate: Arc<Mutex<Option<oneshot::Receiver<()>>>>,
+    }
+
+    #[async_trait]
+    impl Plugin for GatedPlugin {
+        async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
+            self.apply_count.fetch_add(1, Ordering::SeqCst);
+            if let Some(tx) = self.entered.lock().expect("entered").take() {
+                let _ = tx.send(());
+            }
+            let rx = self.gate.lock().expect("gate").take().expect("gate once");
+            let _ = rx.await;
+            ctx.provide(NUMBER, Number(7))?;
+            let effect = ctx.effect()?;
+            effect.spawn(|_| async {})?;
+            Ok(())
+        }
+    }
+
+    let mount_root = root.clone();
+    let mount = tokio::spawn(async move {
+        mount_root
+            .plugin(Arc::new(GatedPlugin {
+                apply_count: count,
+                entered: entered_tx,
+                gate: gate_rx,
+            }))
+            .await
+    });
+    entered_rx.await.expect("entered apply");
+    // 门控期间勿 settle（recompute 持锁等 apply 会死锁）；yield 让调度器有机会再试 try_activate。
+    for _ in 0..64 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        apply_count.load(Ordering::SeqCst),
+        1,
+        "scheduler must not re-enter apply while Loading"
+    );
+    let _ = gate_tx.send(());
+    let mut fiber = tokio::time::timeout(std::time::Duration::from_secs(2), mount)
+        .await
+        .expect("mount timed out")
+        .expect("join")
+        .expect("fiber");
+    wait_until(|| fiber.state() == FiberState::Active).await;
+    runtime.settle().await;
+    assert_eq!(apply_count.load(Ordering::SeqCst), 1);
+    assert_eq!(root.get(NUMBER).unwrap().0, 7);
+    let snap = runtime.diagnostics();
+    let plugin = snap
+        .plugin_fibers
+        .iter()
+        .find(|item| item.id == fiber.id())
+        .expect("plugin fiber");
+    assert_eq!(plugin.state, cordis_core::FiberStateSnapshot::Active);
+    assert_eq!(
+        snap.effects
+            .iter()
+            .filter(|effect| effect.fiber_id == Some(fiber.id()))
+            .count(),
+        1
+    );
+    assert_eq!(
+        snap.providers
+            .iter()
+            .filter(|provider| provider.service == NUMBER.id().as_str())
+            .count(),
+        1
+    );
+    fiber.dispose_wait().await;
+    runtime.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn provider_revoked_during_loading_does_not_stick_active() {
+    let runtime = runtime();
+    let root = runtime.root();
+    let provider = root.effect_named("provider").unwrap();
+    provider.provide(NUMBER, Number(1)).unwrap();
+
+    let (entered_tx, entered_rx) = oneshot::channel::<()>();
+    let (gate_tx, gate_rx) = oneshot::channel::<()>();
+    let entered_tx = Arc::new(Mutex::new(Some(entered_tx)));
+    let gate_rx = Arc::new(Mutex::new(Some(gate_rx)));
+
+    struct GatedDepPlugin {
+        entered: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+        gate: Arc<Mutex<Option<oneshot::Receiver<()>>>>,
+    }
+
+    #[async_trait]
+    impl Plugin for GatedDepPlugin {
+        fn inject(&self) -> Vec<cordis_core::ServiceId> {
+            vec![NUMBER.id()]
+        }
+        async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
+            let _ = ctx.get(NUMBER)?;
+            if let Some(tx) = self.entered.lock().expect("entered").take() {
+                let _ = tx.send(());
+            }
+            let rx = self.gate.lock().expect("gate").take().expect("gate once");
+            let _ = rx.await;
+            Ok(())
+        }
+    }
+
+    let mount_root = root.clone();
+    let mount = tokio::spawn(async move {
+        mount_root
+            .plugin(Arc::new(GatedDepPlugin {
+                entered: entered_tx,
+                gate: gate_rx,
+            }))
+            .await
+    });
+    entered_rx.await.expect("entered apply");
+    provider.dispose();
+    let _ = gate_tx.send(());
+    let mut fiber = tokio::time::timeout(std::time::Duration::from_secs(2), mount)
+        .await
+        .expect("mount timed out")
+        .expect("join")
+        .expect("fiber");
+    // 不得带着旧 Provider ID 长期 Active；依赖已撤应回到 Pending。
+    wait_until(|| fiber.state() == FiberState::Pending).await;
+    assert!(fiber.missing_dependencies().contains(&NUMBER.id()));
+    fiber.dispose();
+    runtime.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn provider_replaced_during_loading_reactivates_with_fresh() {
+    let runtime = runtime();
+    let root = runtime.root();
+    let provider = root.effect_named("provider").unwrap();
+    provider.provide(NUMBER, Number(1)).unwrap();
+
+    let (entered_tx, entered_rx) = oneshot::channel::<()>();
+    let (gate_tx, gate_rx) = oneshot::channel::<()>();
+    let entered_tx = Arc::new(Mutex::new(Some(entered_tx)));
+    let gate_rx = Arc::new(Mutex::new(Some(gate_rx)));
+    let seen = Arc::new(AtomicUsize::new(0));
+    let seen_apply = seen.clone();
+
+    struct GatedDepPlugin {
+        entered: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+        gate: Arc<Mutex<Option<oneshot::Receiver<()>>>>,
+        seen: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Plugin for GatedDepPlugin {
+        fn inject(&self) -> Vec<cordis_core::ServiceId> {
+            vec![NUMBER.id()]
+        }
+        async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
+            let value = ctx.get(NUMBER)?.0;
+            self.seen.store(value, Ordering::SeqCst);
+            if let Some(tx) = self.entered.lock().expect("entered").take() {
+                let _ = tx.send(());
+            }
+            let gate = self.gate.lock().expect("gate").take();
+            if let Some(rx) = gate {
+                let _ = rx.await;
+            }
+            Ok(())
+        }
+    }
+
+    let mount_root = root.clone();
+    let mount = tokio::spawn(async move {
+        mount_root
+            .plugin(Arc::new(GatedDepPlugin {
+                entered: entered_tx,
+                gate: gate_rx,
+                seen: seen_apply,
+            }))
+            .await
+    });
+    entered_rx.await.expect("entered apply");
+    provider.dispose();
+    let neu = root.effect_named("provider2").unwrap();
+    neu.provide(NUMBER, Number(99)).unwrap();
+    let _ = gate_tx.send(());
+    let mut fiber = tokio::time::timeout(std::time::Duration::from_secs(2), mount)
+        .await
+        .expect("mount timed out")
+        .expect("join")
+        .expect("fiber");
+    // 首次 apply 发现漂移回 Pending 后，调度器应再激活到新 Provider。
+    runtime.settle().await;
+    wait_until(|| fiber.state() == FiberState::Active).await;
+    assert_eq!(root.get(NUMBER).unwrap().0, 99);
+    assert_eq!(seen.load(Ordering::SeqCst), 99);
+    fiber.dispose();
+    runtime.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn restart_during_parent_dispose_keeps_disposed() {
+    let runtime = runtime();
+    let root = runtime.root();
+    let parent = root.child().unwrap();
+    let finished = Arc::new(AtomicBool::new(false));
+    let flag = finished.clone();
+
+    struct SlowDisposePlugin {
+        finished: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl Plugin for SlowDisposePlugin {
+        async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
+            let finished = self.finished.clone();
+            let effect = ctx.effect()?;
+            effect.spawn(move |cancel| async move {
+                cancel.cancelled().await;
+                tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+                finished.store(true, Ordering::SeqCst);
+            })?;
+            Ok(())
+        }
+    }
+
+    let fiber = parent
+        .plugin(Arc::new(SlowDisposePlugin { finished: flag }))
+        .await
+        .unwrap();
+    assert_eq!(fiber.state(), FiberState::Active);
+
+    let fiber_for_restart = fiber;
+    let restart = tokio::spawn(async move {
+        let mut fiber = fiber_for_restart;
+        let result = fiber.restart().await;
+        (fiber, result)
+    });
+    // 给 restart 进入 dispose_wait 的窗口。
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    parent.dispose();
+    let (fiber, result) = restart.await.expect("join");
+    assert!(matches!(result, Err(CoreError::FiberDisposed)));
+    assert_eq!(fiber.state(), FiberState::Disposed);
+    assert!(fiber.is_disposed());
+    let snap = runtime.diagnostics();
+    assert!(
+        snap.plugin_fibers
+            .iter()
+            .all(|item| item.id != fiber.id()
+                || item.state == cordis_core::FiberStateSnapshot::Disposed)
+            || snap.plugin_fibers.iter().all(|item| item.id != fiber.id())
+    );
+    runtime.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn replace_during_parent_dispose_keeps_disposed_and_skips_new_plugin() {
+    let runtime = runtime();
+    let root = runtime.root();
+    let parent = root.child().unwrap();
+    let (cancelled_tx, cancelled_rx) = oneshot::channel::<()>();
+    let (release_tx, release_rx) = oneshot::channel::<()>();
+    let cancelled_tx = Arc::new(Mutex::new(Some(cancelled_tx)));
+    let release_rx = Arc::new(Mutex::new(Some(release_rx)));
+    let replacement_applied = Arc::new(AtomicUsize::new(0));
+
+    struct SlowDisposePlugin {
+        cancelled: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+        release: Arc<Mutex<Option<oneshot::Receiver<()>>>>,
+    }
+
+    #[async_trait]
+    impl Plugin for SlowDisposePlugin {
+        async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
+            let cancelled = self.cancelled.clone();
+            let release = self.release.clone();
+            let effect = ctx.effect()?;
+            effect.spawn(move |cancel| async move {
+                cancel.cancelled().await;
+                if let Some(tx) = cancelled.lock().expect("cancelled").take() {
+                    let _ = tx.send(());
+                }
+                let receiver = release.lock().expect("release").take();
+                if let Some(rx) = receiver {
+                    let _ = rx.await;
+                }
+            })?;
+            Ok(())
+        }
+    }
+
+    struct ReplacementPlugin {
+        applied: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Plugin for ReplacementPlugin {
+        async fn apply(&self, _ctx: &Context) -> Result<(), CoreError> {
+            self.applied.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    let fiber = parent
+        .plugin(Arc::new(SlowDisposePlugin {
+            cancelled: cancelled_tx,
+            release: release_rx,
+        }))
+        .await
+        .unwrap();
+    assert_eq!(fiber.state(), FiberState::Active);
+
+    let applied = replacement_applied.clone();
+    let replace = tokio::spawn(async move {
+        let mut fiber = fiber;
+        let result = fiber.replace(Arc::new(ReplacementPlugin { applied })).await;
+        (fiber, result)
+    });
+    cancelled_rx.await.expect("old effect was cancelled");
+    parent.dispose();
+    let _ = release_tx.send(());
+
+    let (fiber, result) = replace.await.expect("join");
+    assert!(matches!(result, Err(CoreError::FiberDisposed)));
+    assert_eq!(fiber.state(), FiberState::Disposed);
+    assert!(fiber.is_disposed());
+    assert_eq!(replacement_applied.load(Ordering::SeqCst), 0);
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn effect_tree_appears_in_diagnostics_and_clears() {
+    let runtime = runtime();
+    let root = runtime.root();
+    let before = runtime.diagnostics().effects.len();
+    let effect = root.effect_named("named-fx").unwrap();
+    let handle = effect.handle();
+    assert_eq!(handle.name(), "named-fx");
+    assert!(
+        runtime
+            .diagnostics()
+            .effects
+            .iter()
+            .any(|item| item.name == "named-fx" && item.id == handle.id())
+    );
+    effect.provide(NUMBER, Number(1)).unwrap();
+    assert!(
+        runtime
+            .diagnostics()
+            .providers
+            .iter()
+            .any(|provider| provider.effect_id == Some(handle.id()))
+    );
+    effect.dispose();
+    assert_eq!(runtime.diagnostics().effects.len(), before);
+    assert!(runtime.diagnostics().providers.is_empty());
 }

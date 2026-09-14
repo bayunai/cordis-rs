@@ -51,7 +51,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut plugin = root.plugin(Arc::new(ClockPlugin)).await?;
     runtime.settle().await;
-    // 热卸载：await 插件任务后再挂新实例；普通路径也可用同步 dispose()
+    // 热卸载：await 插件任务；或 fiber.replace(新实例)
     plugin.dispose_wait().await;
     runtime.shutdown().await;
     Ok(())
@@ -68,14 +68,12 @@ cargo run -p cordis-core --example reactive
 ## 语义摘要
 
 - `Runtime::new()` 须在 Tokio 中调用；专用调度器处理 dirty 重算。
-- 子 Context 覆盖父 Provider；子 dispose 后回退；Node 随 Scope 从 Registry 移除。
-- 同 Context 同 Key 唯一 Provider；同 Runtime 内 Service/Event ID 全局类型（及事件模式）唯一。
-- 事件四模式：Observe（同步）/ Waterfall / Serial / Parallel（后三者 async）；同 ID 不可混模式。
-- 同步 `dispose`：取消与清理，已归属任务上收到父 Scope；无法入队的任务显式 `abort`。
-- `PluginHandle::dispose_wait`：取消并等待本插件任务（不上收）；**热加载必须用它**，再 `plugin(新实例)`。
-- **受控关闭必须** `Runtime::shutdown()`：Root `dispose_wait` → `settle` → 等待调度器退出。
-- 仅 `drop(Runtime)` 会尽力 abort 调度器，**不**等待业务任务。
-- `Runtime::diagnostics()` 只暴露 ID 与 phase，无伪造循环边。
+- `isolate` / `isolate_with`：按 ServiceKey 共享隔离标签（不可跨 Runtime）。
+- `Context::plugin` 返回 `Fiber`（`restart` / `replace` / `dispose_wait`）。
+- 具名 Effect + 诊断树（plugin_fibers / inject_fibers / effects）。
+- 事件四模式：Observe / Waterfall / Serial / Parallel。
+- **受控关闭必须** `Runtime::shutdown()`。
+- `Runtime::diagnostics()` 只暴露 ID、状态与标签，无业务载荷。
 
 ## 开发验证
 

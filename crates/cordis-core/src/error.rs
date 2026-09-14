@@ -33,4 +33,10 @@ pub enum CoreError {
     },
     #[error("插件挂载失败: {0}")]
     PluginApply(String),
+    #[error("IsolationLabel 不属于当前 Runtime")]
+    IsolationRuntimeMismatch,
+    #[error("Fiber 已释放")]
+    FiberDisposed,
+    #[error("Fiber 正在执行生命周期操作")]
+    FiberBusy,
 }

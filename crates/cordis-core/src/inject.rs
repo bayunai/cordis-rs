@@ -1,9 +1,12 @@
 use crate::{
     CoreError, ServiceId, Services,
     diagnostics::{
-        ContextSnapshot, FiberSnapshot, InjectionPhaseSnapshot, ProviderSnapshot, RuntimeSnapshot,
+        ContextIsolationSnapshot, ContextSnapshot, EffectSnapshot, FiberStateSnapshot,
+        InjectFiberSnapshot, IsolationSnapshot, ProviderSnapshot, RuntimeSnapshot,
     },
     effect::EffectScope,
+    fiber::{FiberInner, FiberState},
+    isolation::{IsolationLabel, RuntimeToken},
     service::ErasedService,
 };
 use async_trait::async_trait;
@@ -14,7 +17,7 @@ use std::{
     future::Future,
     pin::Pin,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, Weak,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
@@ -24,7 +27,6 @@ use tokio_util::sync::CancellationToken;
 
 pub(crate) type NodeId = u64;
 pub(crate) type InjectionId = u64;
-pub(crate) type PluginId = u64;
 pub(crate) type ListenerId = u64;
 
 type InjectFuture = Pin<Box<dyn Future<Output = Result<(), CoreError>> + Send>>;
@@ -83,11 +85,29 @@ pub(crate) enum InjectionPhase {
 
 struct NodeRecord {
     parent: Option<NodeId>,
+    isolations: HashMap<ServiceId, u64>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) enum ProviderKey {
+    Local { node: NodeId, service: ServiceId },
+    Isolated { isolation: u64, service: ServiceId },
 }
 
 struct ProviderRecord {
     id: u64,
     value: ErasedService,
+    effect_id: Option<u64>,
+    node: Option<NodeId>,
+    isolation: Option<u64>,
+}
+
+struct EffectRecord {
+    name: String,
+    parent: Option<u64>,
+    node: Option<NodeId>,
+    fiber_id: Option<u64>,
+    scope: EffectScope,
 }
 
 struct InjectionRecord {
@@ -114,23 +134,21 @@ struct EventListener {
     kind: EventHandlerKind,
 }
 
-struct PluginRecord {
-    id: PluginId,
-    node: NodeId,
-}
-
 struct RegistryState {
     nodes: HashMap<NodeId, NodeRecord>,
-    providers: HashMap<(NodeId, ServiceId), ProviderRecord>,
+    providers: HashMap<ProviderKey, ProviderRecord>,
     injections: HashMap<InjectionId, InjectionRecord>,
     listeners: HashMap<&'static str, Vec<EventListener>>,
-    plugins: HashMap<PluginId, PluginRecord>,
+    effects: HashMap<u64, EffectRecord>,
+    plugin_fibers: HashMap<u64, Weak<FiberInner>>,
+    isolations_seen: HashMap<u64, ()>,
     service_types: HashMap<ServiceId, TypeId>,
     event_contracts: HashMap<&'static str, EventContract>,
 }
 
 pub(crate) struct Registry {
     state: Mutex<RegistryState>,
+    runtime_token: RuntimeToken,
     next_id: AtomicU64,
     dirty: AtomicBool,
     recomputing: AtomicBool,
@@ -151,10 +169,13 @@ impl Registry {
                 providers: HashMap::new(),
                 injections: HashMap::new(),
                 listeners: HashMap::new(),
-                plugins: HashMap::new(),
+                effects: HashMap::new(),
+                plugin_fibers: HashMap::new(),
+                isolations_seen: HashMap::new(),
                 service_types: HashMap::new(),
                 event_contracts: HashMap::new(),
             }),
+            runtime_token: RuntimeToken::new(),
             next_id: AtomicU64::new(1),
             dirty: AtomicBool::new(false),
             recomputing: AtomicBool::new(false),
@@ -166,6 +187,84 @@ impl Registry {
             scheduler_cancel: CancellationToken::new(),
             scheduler_task: Mutex::new(None),
         })
+    }
+
+    pub(crate) fn runtime_token(&self) -> &RuntimeToken {
+        &self.runtime_token
+    }
+
+    pub(crate) fn register_plugin_fiber(self: &Arc<Self>, fiber: Arc<FiberInner>) {
+        if let Ok(mut state) = self.state.lock() {
+            state.plugin_fibers.insert(fiber.id, Arc::downgrade(&fiber));
+        }
+        self.mark_dirty();
+    }
+
+    pub(crate) fn unregister_plugin_fiber(&self, id: u64) {
+        if let Ok(mut state) = self.state.lock() {
+            state.plugin_fibers.remove(&id);
+        }
+    }
+
+    pub(crate) fn allocate_isolation_label(&self) -> IsolationLabel {
+        let label = self.runtime_token.allocate_label();
+        if let Ok(mut state) = self.state.lock() {
+            state.isolations_seen.insert(label.id(), ());
+        }
+        label
+    }
+
+    pub(crate) fn set_node_isolation(&self, node: NodeId, key: ServiceId, label_id: u64) {
+        if let Ok(mut state) = self.state.lock() {
+            state.isolations_seen.insert(label_id, ());
+            if let Some(record) = state.nodes.get_mut(&node) {
+                record.isolations.insert(key, label_id);
+            }
+        }
+    }
+
+    pub(crate) fn mark_dirty_public(self: &Arc<Self>) {
+        self.mark_dirty();
+    }
+
+    pub(crate) fn resolve_with_id(
+        &self,
+        node: NodeId,
+        key: ServiceId,
+    ) -> Option<(u64, ErasedService)> {
+        let state = self.state.lock().ok()?;
+        resolve_provider(&state, node, key).map(|provider| (provider.id, provider.value.clone()))
+    }
+
+    pub(crate) fn register_effect(
+        self: &Arc<Self>,
+        id: u64,
+        name: String,
+        parent: Option<u64>,
+        node: Option<NodeId>,
+        fiber_id: Option<u64>,
+        scope: &EffectScope,
+    ) {
+        if let Ok(mut state) = self.state.lock() {
+            state.effects.insert(
+                id,
+                EffectRecord {
+                    name,
+                    parent,
+                    node,
+                    fiber_id,
+                    scope: scope.clone(),
+                },
+            );
+        }
+        let weak = Arc::downgrade(self);
+        scope.on_dispose(move || {
+            if let Some(registry) = weak.upgrade()
+                && let Ok(mut state) = registry.state.lock()
+            {
+                state.effects.remove(&id);
+            }
+        });
     }
 
     /// 启动唯一的响应式重算调度器；必须在 Tokio Runtime 内调用一次。
@@ -238,7 +337,13 @@ impl Registry {
 
     pub(crate) fn add_node(self: &Arc<Self>, id: NodeId, parent: Option<NodeId>) {
         if let Ok(mut state) = self.state.lock() {
-            state.nodes.insert(id, NodeRecord { parent });
+            state.nodes.insert(
+                id,
+                NodeRecord {
+                    parent,
+                    isolations: HashMap::new(),
+                },
+            );
         }
     }
 
@@ -254,12 +359,15 @@ impl Registry {
     fn remove_node(&self, id: NodeId) {
         if let Ok(mut state) = self.state.lock() {
             state.nodes.remove(&id);
-            state.providers.retain(|(node, _), _| *node != id);
-            state.plugins.retain(|_, plugin| plugin.node != id);
+            state.providers.retain(|key, _| match key {
+                ProviderKey::Local { node, .. } => *node != id,
+                ProviderKey::Isolated { .. } => true,
+            });
             for listeners in state.listeners.values_mut() {
                 listeners.retain(|listener| listener.node != id);
             }
             state.listeners.retain(|_, listeners| !listeners.is_empty());
+            state.effects.retain(|_, effect| effect.node != Some(id));
         }
     }
 
@@ -329,7 +437,14 @@ impl Registry {
         {
             let mut state = self.state.lock().map_err(|_| CoreError::ContextDisposed)?;
             Self::lock_service_type(&mut state, key, value.type_id)?;
-            let slot = (node, key);
+            let isolation = lookup_isolation(&state, node, key);
+            let slot = match isolation {
+                Some(iso) => ProviderKey::Isolated {
+                    isolation: iso,
+                    service: key,
+                },
+                None => ProviderKey::Local { node, service: key },
+            };
             if state.providers.contains_key(&slot) {
                 return Err(CoreError::ServiceConflict { service: key });
             }
@@ -338,6 +453,9 @@ impl Registry {
                 ProviderRecord {
                     id: provider_id,
                     value,
+                    effect_id: Some(owner.id()),
+                    node: Some(node),
+                    isolation,
                 },
             );
         }
@@ -431,30 +549,6 @@ impl Registry {
             .lock()
             .ok()
             .and_then(|state| state.injections.get(&id).map(|item| item.phase))
-    }
-
-    pub(crate) fn register_plugin(
-        self: &Arc<Self>,
-        node: NodeId,
-        owner: &EffectScope,
-    ) -> Result<PluginId, CoreError> {
-        if owner.is_disposed() {
-            return Err(CoreError::ContextDisposed);
-        }
-        let id = self.allocate_id();
-        {
-            let mut state = self.state.lock().map_err(|_| CoreError::ContextDisposed)?;
-            state.plugins.insert(id, PluginRecord { id, node });
-        }
-        let weak = Arc::downgrade(self);
-        owner.on_dispose(move || {
-            if let Some(registry) = weak.upgrade()
-                && let Ok(mut state) = registry.state.lock()
-            {
-                state.plugins.remove(&id);
-            }
-        });
-        Ok(id)
     }
 
     pub(crate) fn subscribe_observe(
@@ -751,18 +845,39 @@ impl Registry {
             .map(|(id, node)| ContextSnapshot {
                 id: *id,
                 parent: node.parent,
+                isolations: node
+                    .isolations
+                    .iter()
+                    .map(|(service, label_id)| ContextIsolationSnapshot {
+                        service: service.as_str(),
+                        label_id: *label_id,
+                    })
+                    .collect(),
             })
             .collect();
+        let mut isolations: Vec<IsolationSnapshot> = state
+            .isolations_seen
+            .keys()
+            .copied()
+            .map(|id| IsolationSnapshot { id })
+            .collect();
+        isolations.sort_by_key(|item| item.id);
         let providers = state
             .providers
             .iter()
-            .map(|((node, service), provider)| ProviderSnapshot {
-                node: *node,
-                service: service.as_str(),
+            .map(|(_key, provider)| ProviderSnapshot {
+                node: provider.node,
+                isolation: provider.isolation,
+                service: match _key {
+                    ProviderKey::Local { service, .. } | ProviderKey::Isolated { service, .. } => {
+                        service.as_str()
+                    }
+                },
                 provider_id: provider.id,
+                effect_id: provider.effect_id,
             })
             .collect();
-        let fibers = state
+        let inject_fibers = state
             .injections
             .iter()
             .map(|(id, injection)| {
@@ -772,10 +887,10 @@ impl Registry {
                     .filter(|key| resolve_provider(&state, injection.node, **key).is_none())
                     .map(|key| key.as_str())
                     .collect::<Vec<_>>();
-                FiberSnapshot {
+                InjectFiberSnapshot {
                     id: *id,
                     node: injection.node,
-                    phase: InjectionPhaseSnapshot::from(injection.phase),
+                    phase: FiberStateSnapshot::from(injection.phase),
                     dependencies: injection
                         .dependencies
                         .iter()
@@ -786,19 +901,39 @@ impl Registry {
                 }
             })
             .collect();
-        let plugins = state
-            .plugins
-            .values()
-            .map(|plugin| crate::diagnostics::PluginSnapshot {
-                id: plugin.id,
-                node: plugin.node,
+        let effects = state
+            .effects
+            .iter()
+            .map(|(id, effect)| EffectSnapshot {
+                id: *id,
+                name: effect.name.clone(),
+                parent: effect.parent,
+                node: effect.node,
+                fiber_id: effect.fiber_id,
+                cancelled: effect.scope.is_cancelled(),
+                disposed: effect.scope.is_disposed(),
+                child_count: effect.scope.child_scope_count(),
+                task_count: effect.scope.task_count(),
+                cleanup_count: effect.scope.cleanup_count(),
             })
+            .collect();
+        let plugin_fiber_arcs = state
+            .plugin_fibers
+            .values()
+            .filter_map(Weak::upgrade)
+            .collect::<Vec<_>>();
+        drop(state);
+        let plugin_fibers = plugin_fiber_arcs
+            .iter()
+            .map(|fiber| fiber.snapshot())
             .collect();
         RuntimeSnapshot {
             contexts,
+            isolations,
             providers,
-            fibers,
-            plugins,
+            plugin_fibers,
+            inject_fibers,
+            effects,
         }
     }
 
@@ -848,11 +983,15 @@ impl Registry {
             }
             loop {
                 let ready = self.take_ready();
-                if ready.is_empty() {
+                let ready_plugins = self.take_ready_plugin_fibers();
+                if ready.is_empty() && ready_plugins.is_empty() {
                     break;
                 }
                 for injection in ready {
                     self.run_injection(injection).await;
+                }
+                for fiber in ready_plugins {
+                    self.run_plugin_fiber(fiber).await;
                 }
             }
         }
@@ -982,6 +1121,68 @@ impl Registry {
             providers,
         ))
     }
+
+    fn take_ready_plugin_fibers(&self) -> Vec<Arc<FiberInner>> {
+        let fibers = {
+            let Ok(state) = self.state.lock() else {
+                return Vec::new();
+            };
+            state
+                .plugin_fibers
+                .values()
+                .filter_map(Weak::upgrade)
+                .filter(|fiber| !fiber.disposed.load(Ordering::Acquire))
+                .collect::<Vec<_>>()
+        };
+
+        let mut ready = Vec::new();
+        for fiber in fibers {
+            if fiber.disposed.load(Ordering::Acquire) {
+                continue;
+            }
+            if fiber.busy.lock().map(|guard| *guard).unwrap_or(true) {
+                continue;
+            }
+            let deps = fiber.dependencies.lock().expect("deps").clone();
+            let resolved = fiber.resolved_providers.lock().expect("providers").clone();
+            let providers = {
+                let Ok(state) = self.state.lock() else {
+                    continue;
+                };
+                provider_ids(&state, fiber.node, &deps)
+            };
+            let state = *fiber.state.lock().expect("state");
+            if state == FiberState::Active && resolved != providers {
+                fiber.unload_to_pending();
+            }
+            let state = *fiber.state.lock().expect("state");
+            let deps_ready = providers.len() == deps.len();
+            if state == FiberState::Pending && deps_ready {
+                ready.push(fiber);
+            }
+        }
+        ready
+    }
+
+    async fn run_plugin_fiber(self: &Arc<Self>, fiber: Arc<FiberInner>) {
+        // Failed is stored on the fiber; Pending Ok is intentional when deps race.
+        let _ = fiber.try_activate().await;
+    }
+}
+
+fn lookup_isolation(state: &RegistryState, start: NodeId, key: ServiceId) -> Option<u64> {
+    let mut node = Some(start);
+    while let Some(current) = node {
+        if let Some(label) = state
+            .nodes
+            .get(&current)
+            .and_then(|record| record.isolations.get(&key).copied())
+        {
+            return Some(label);
+        }
+        node = state.nodes.get(&current).and_then(|item| item.parent);
+    }
+    None
 }
 
 fn resolve_provider(
@@ -989,9 +1190,18 @@ fn resolve_provider(
     start: NodeId,
     key: ServiceId,
 ) -> Option<&ProviderRecord> {
+    if let Some(iso) = lookup_isolation(state, start, key) {
+        return state.providers.get(&ProviderKey::Isolated {
+            isolation: iso,
+            service: key,
+        });
+    }
     let mut node = Some(start);
     while let Some(current) = node {
-        if let Some(provider) = state.providers.get(&(current, key)) {
+        if let Some(provider) = state.providers.get(&ProviderKey::Local {
+            node: current,
+            service: key,
+        }) {
             return Some(provider);
         }
         node = state.nodes.get(&current).and_then(|item| item.parent);

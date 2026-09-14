@@ -1,15 +1,18 @@
 use crate::{
     CoreError, ServiceId, ServiceKey, Services,
-    effect::EffectScope,
+    effect::{EffectHandle, EffectScope},
     event::{EventKey, Next, ParallelKey, SerialKey, Unsubscribe, WaterfallKey},
+    fiber::{Fiber, FiberInner, FiberState},
     inject::{InjectionPhase, NodeId, Registry},
-    plugin::{Plugin, PluginHandle},
+    isolation::IsolationLabel,
+    plugin::Plugin,
     service::ErasedService,
 };
 use std::{
     any::Any,
+    collections::HashMap,
     future::Future,
-    sync::{Arc, Weak},
+    sync::{Arc, Mutex, Weak},
 };
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -18,6 +21,7 @@ pub(crate) struct ContextInner {
     pub(crate) id: NodeId,
     pub(crate) registry: Arc<Registry>,
     pub(crate) scope: EffectScope,
+    pub(crate) isolations: Mutex<HashMap<ServiceId, IsolationLabel>>,
 }
 
 /// 通用的层级 Service Context。
@@ -31,16 +35,71 @@ impl Context {
     pub fn child(&self) -> Result<Self, CoreError> {
         self.ensure_alive()?;
         let id = self.inner.registry.allocate_id();
-        let scope = self.inner.scope.child();
+        let scope = self.inner.scope.child_named("context");
         self.inner.registry.add_node(id, Some(self.inner.id));
+        let isolations = self
+            .inner
+            .isolations
+            .lock()
+            .map_err(|_| CoreError::ContextDisposed)?
+            .clone();
+        for (key, label) in &isolations {
+            self.inner.registry.set_node_isolation(id, *key, label.id());
+        }
         self.inner.registry.bind_node_lifecycle(id, &scope);
+        self.inner.registry.register_effect(
+            scope.id(),
+            scope.name().to_string(),
+            scope.parent_id(),
+            Some(id),
+            None,
+            &scope,
+        );
         Ok(Self {
             inner: Arc::new(ContextInner {
                 id,
                 registry: self.inner.registry.clone(),
                 scope,
+                isolations: Mutex::new(isolations),
             }),
         })
+    }
+
+    /// 在当前 Context 为指定 Service 建立新隔离标签。
+    pub fn isolate<T: Send + Sync + 'static>(
+        &self,
+        key: ServiceKey<T>,
+    ) -> Result<IsolationLabel, CoreError> {
+        self.ensure_alive()?;
+        let label = self.inner.registry.allocate_isolation_label();
+        self.inner
+            .registry
+            .set_node_isolation(self.inner.id, key.id(), label.id());
+        self.inner
+            .isolations
+            .lock()
+            .map_err(|_| CoreError::ContextDisposed)?
+            .insert(key.id(), label.clone());
+        Ok(label)
+    }
+
+    /// 加入既有隔离标签；跨 Runtime 标签报错。
+    pub fn isolate_with<T: Send + Sync + 'static>(
+        &self,
+        key: ServiceKey<T>,
+        label: IsolationLabel,
+    ) -> Result<(), CoreError> {
+        self.ensure_alive()?;
+        label.ensure_runtime(self.inner.registry.runtime_token())?;
+        self.inner
+            .registry
+            .set_node_isolation(self.inner.id, key.id(), label.id());
+        self.inner
+            .isolations
+            .lock()
+            .map_err(|_| CoreError::ContextDisposed)?
+            .insert(key.id(), label);
+        Ok(())
     }
 
     /// 在当前 Context 注册类型化 Service；当前 Scope 释放时自动撤销。
@@ -90,12 +149,27 @@ impl Context {
         let parent = self.inner.scope.clone();
         let template = self.clone();
         let callback = Arc::new(move |services: Services, child: EffectScope| {
+            let isolations = template
+                .inner
+                .isolations
+                .lock()
+                .map(|guard| guard.clone())
+                .unwrap_or_default();
+            template.inner.registry.register_effect(
+                child.id(),
+                child.name().to_string(),
+                child.parent_id(),
+                Some(template.inner.id),
+                None,
+                &child,
+            );
             let context = EffectContext {
                 context: Context {
                     inner: Arc::new(ContextInner {
                         id: template.inner.id,
                         registry: template.inner.registry.clone(),
                         scope: child,
+                        isolations: Mutex::new(isolations),
                     }),
                 },
             };
@@ -114,45 +188,83 @@ impl Context {
         })
     }
 
-    /// 创建一个与当前 Context 一同释放的普通 Effect。
+    /// 创建一个与当前 Context 一同释放的普通 Effect（默认名 `"effect"`）。
     pub fn effect(&self) -> Result<EffectContext, CoreError> {
+        self.effect_named("effect")
+    }
+
+    /// 创建具名 Effect。
+    pub fn effect_named(&self, name: &'static str) -> Result<EffectContext, CoreError> {
         self.ensure_alive()?;
+        let scope = self.inner.scope.child_named(name);
+        let isolations = self
+            .inner
+            .isolations
+            .lock()
+            .map_err(|_| CoreError::ContextDisposed)?
+            .clone();
+        self.inner.registry.register_effect(
+            scope.id(),
+            scope.name().to_string(),
+            scope.parent_id(),
+            Some(self.inner.id),
+            None,
+            &scope,
+        );
         Ok(EffectContext {
             context: Context {
                 inner: Arc::new(ContextInner {
                     id: self.inner.id,
                     registry: self.inner.registry.clone(),
-                    scope: self.inner.scope.child(),
+                    scope,
+                    isolations: Mutex::new(isolations),
                 }),
             },
         })
     }
 
-    /// 挂载插件：在子 Effect 中调用 `apply`，资源随 [`PluginHandle`] 释放。
-    pub async fn plugin(&self, plugin: Arc<dyn Plugin>) -> Result<PluginHandle, CoreError> {
+    /// 挂载插件：返回可重启 / 可替换的 [`Fiber`]。
+    pub async fn plugin(&self, plugin: Arc<dyn Plugin>) -> Result<Fiber, CoreError> {
         self.ensure_alive()?;
-        let effect = self.effect()?;
-        let _plugin_id = self
-            .inner
-            .registry
-            .register_plugin(self.inner.id, &effect.context.inner.scope)?;
-        let scope = effect.context.inner.scope.clone();
-        match plugin.apply(&effect.context).await {
-            Ok(()) => {
-                if scope.is_disposed() || self.is_disposed() {
+        let id = self.inner.registry.allocate_id();
+        let dependencies = plugin.inject();
+        let inner = Arc::new(FiberInner {
+            id,
+            node: self.inner.id,
+            registry: Arc::downgrade(&self.inner.registry),
+            parent_scope: self.inner.scope.clone(),
+            plugin: Mutex::new(plugin),
+            dependencies: Mutex::new(dependencies),
+            effect: Mutex::new(None),
+            state: Mutex::new(FiberState::Pending),
+            last_error: Mutex::new(None),
+            resolved_providers: Mutex::new(Vec::new()),
+            disposed: std::sync::atomic::AtomicBool::new(false),
+            busy: Mutex::new(false),
+            mount_ctx: Mutex::new(Some(self.clone())),
+        });
+        self.inner.registry.register_plugin_fiber(inner.clone());
+        let weak = Arc::downgrade(&inner);
+        self.inner.scope.on_dispose(move || {
+            if let Some(fiber) = weak.upgrade() {
+                fiber
+                    .disposed
+                    .store(true, std::sync::atomic::Ordering::Release);
+                if let Ok(mut state) = fiber.state.lock() {
+                    *state = FiberState::Disposed;
+                }
+                if let Ok(mut effect) = fiber.effect.lock()
+                    && let Some(scope) = effect.take()
+                {
                     scope.dispose();
-                    Err(CoreError::PluginApply(
-                        "plugin scope was disposed during apply".into(),
-                    ))
-                } else {
-                    Ok(PluginHandle::from_scope(scope))
+                }
+                if let Some(registry) = fiber.registry.upgrade() {
+                    registry.unregister_plugin_fiber(fiber.id);
                 }
             }
-            Err(error) => {
-                effect.dispose();
-                Err(CoreError::PluginApply(error.to_string()))
-            }
-        }
+        });
+        let _ = inner.try_activate().await;
+        Ok(Fiber { inner })
     }
 
     /// 订阅类型化事件；订阅归属当前 EffectScope。
@@ -581,6 +693,11 @@ impl EffectContext {
 
     pub fn as_context(&self) -> &Context {
         &self.context
+    }
+
+    /// 当前 Effect 的具名诊断句柄。
+    pub fn handle(&self) -> EffectHandle {
+        EffectHandle::from_scope(self.context.inner.scope.clone())
     }
 
     /// 当前 EffectScope 下仍登记的直接子 Scope 数量（诊断/测试用）。

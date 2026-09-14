@@ -45,7 +45,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("after plugin: {:?}", handle.state());
 
     root.emit(TICK, &Tick(1))?;
-    plugin.dispose();
+    plugin.dispose_wait().await;
     runtime.settle().await;
     runtime.shutdown().await;
     Ok(())

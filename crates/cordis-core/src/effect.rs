@@ -1,10 +1,12 @@
 use std::sync::{
     Arc, Mutex, Weak,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+
+static NEXT_EFFECT_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Default)]
 struct Resources {
@@ -14,6 +16,8 @@ struct Resources {
 }
 
 struct EffectScopeInner {
+    id: u64,
+    name: String,
     cancellation: CancellationToken,
     disposed: AtomicBool,
     parent: Mutex<Option<Weak<EffectScopeInner>>>,
@@ -28,12 +32,14 @@ pub(crate) struct EffectScope {
 
 impl EffectScope {
     pub(crate) fn root() -> Self {
-        Self::new(CancellationToken::new())
+        Self::new("root", CancellationToken::new())
     }
 
-    fn new(cancellation: CancellationToken) -> Self {
+    fn new(name: impl Into<String>, cancellation: CancellationToken) -> Self {
         Self {
             inner: Arc::new(EffectScopeInner {
+                id: NEXT_EFFECT_ID.fetch_add(1, Ordering::Relaxed),
+                name: name.into(),
                 cancellation,
                 disposed: AtomicBool::new(false),
                 parent: Mutex::new(None),
@@ -43,7 +49,11 @@ impl EffectScope {
     }
 
     pub(crate) fn child(&self) -> Self {
-        let child = Self::new(self.inner.cancellation.child_token());
+        self.child_named("effect")
+    }
+
+    pub(crate) fn child_named(&self, name: impl Into<String>) -> Self {
+        let child = Self::new(name, self.inner.cancellation.child_token());
         if let Ok(mut parent) = child.inner.parent.lock() {
             *parent = Some(Arc::downgrade(&self.inner));
         }
@@ -60,8 +70,29 @@ impl EffectScope {
         child
     }
 
+    pub(crate) fn id(&self) -> u64 {
+        self.inner.id
+    }
+
+    pub(crate) fn name(&self) -> &str {
+        &self.inner.name
+    }
+
+    pub(crate) fn parent_id(&self) -> Option<u64> {
+        self.inner
+            .parent
+            .lock()
+            .ok()
+            .and_then(|slot| slot.as_ref().and_then(Weak::upgrade))
+            .map(|parent| parent.id)
+    }
+
     pub(crate) fn is_disposed(&self) -> bool {
         self.inner.disposed.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.inner.cancellation.is_cancelled()
     }
 
     pub(crate) fn cancellation(&self) -> CancellationToken {
@@ -73,6 +104,22 @@ impl EffectScope {
             .resources
             .lock()
             .map(|resources| resources.children.len())
+            .unwrap_or(0)
+    }
+
+    pub(crate) fn task_count(&self) -> usize {
+        self.inner
+            .resources
+            .lock()
+            .map(|resources| resources.tasks.len())
+            .unwrap_or(0)
+    }
+
+    pub(crate) fn cleanup_count(&self) -> usize {
+        self.inner
+            .resources
+            .lock()
+            .map(|resources| resources.cleanups.len())
             .unwrap_or(0)
     }
 
@@ -91,7 +138,6 @@ impl EffectScope {
 
     pub(crate) fn push_task(&self, task: JoinHandle<()>) {
         let Ok(mut resources) = self.inner.resources.lock() else {
-            // 未归属 Scope 的任务必须显式 abort，禁止依赖 JoinHandle Drop 语义。
             task.abort();
             return;
         };
@@ -103,14 +149,10 @@ impl EffectScope {
         resources.tasks.push(task);
     }
 
-    /// 同步释放：取消令牌、子 Scope 与 cleanup；已归属任务上收到父 Scope（Root 留给 shutdown）。
     pub(crate) fn dispose(&self) {
         let _ = self.dispose_with(TaskPolicy::HoistToParent);
     }
 
-    /// 释放并等待本 Scope 树上的受控任务退出（不上收；无超时）。
-    ///
-    /// 用于插件热卸载：在挂载替换实例前确保旧任务已结束。
     pub(crate) async fn dispose_wait(&self) {
         let tasks = self.dispose_with(TaskPolicy::AwaitLocal);
         for task in tasks {
@@ -132,7 +174,6 @@ impl EffectScope {
         let cleanups = std::mem::take(&mut resources.cleanups);
         drop(resources);
 
-        // 子 Scope 同步 dispose，将其任务上收到本 Scope。
         for child in children.into_iter().rev() {
             child.dispose();
         }
@@ -206,9 +247,7 @@ impl EffectScope {
 
 #[derive(Clone, Copy)]
 enum TaskPolicy {
-    /// 同步 dispose / Drop：任务上收到父 Scope。
     HoistToParent,
-    /// dispose_wait：任务留在本地供 await。
     AwaitLocal,
 }
 
@@ -227,13 +266,11 @@ impl Drop for EffectScopeInner {
                 for cleanup in cleanups.into_iter().rev() {
                     cleanup();
                 }
-                // 最后兜底：无法上交给父/Root 的任务显式 abort。
                 EffectScope::abort_tasks(tasks);
             }
         } else if let Ok(mut resources) = self.resources.lock() {
             let tasks = std::mem::take(&mut resources.tasks);
             drop(resources);
-            // 已 dispose：优先上收到仍存活的父 Scope，避免误 abort。
             let parent = self
                 .parent
                 .lock()
@@ -249,5 +286,56 @@ impl Drop for EffectScopeInner {
                 EffectScope::abort_tasks(tasks);
             }
         }
+    }
+}
+
+/// 具名 Effect 的公开句柄（诊断与生命周期观察）。
+#[derive(Clone)]
+pub struct EffectHandle {
+    scope: EffectScope,
+}
+
+#[allow(dead_code)]
+impl EffectHandle {
+    #[allow(dead_code)]
+    pub(crate) fn from_scope(scope: EffectScope) -> Self {
+        Self { scope }
+    }
+
+    pub fn id(&self) -> u64 {
+        self.scope.id()
+    }
+
+    pub fn name(&self) -> &str {
+        self.scope.name()
+    }
+
+    pub fn parent_id(&self) -> Option<u64> {
+        self.scope.parent_id()
+    }
+
+    pub fn is_disposed(&self) -> bool {
+        self.scope.is_disposed()
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.scope.is_cancelled()
+    }
+
+    pub fn child_count(&self) -> usize {
+        self.scope.child_scope_count()
+    }
+
+    pub fn task_count(&self) -> usize {
+        self.scope.task_count()
+    }
+
+    pub fn cleanup_count(&self) -> usize {
+        self.scope.cleanup_count()
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn scope(&self) -> &EffectScope {
+        &self.scope
     }
 }

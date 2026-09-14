@@ -40,6 +40,7 @@ impl Runtime {
                         id: root_id,
                         registry,
                         scope: root_scope,
+                        isolations: std::sync::Mutex::new(std::collections::HashMap::new()),
                     }),
                 },
                 shutdown_completed: AtomicBool::new(false),
