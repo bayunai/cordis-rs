@@ -14,6 +14,9 @@
         --ok: #3ecf8e;
         --warn: #e6a23c;
         --off: #6b7280;
+        --accent: #5b8def;
+        --provider: #c084fc;
+        --effect: #38bdf8;
       }
       * { box-sizing: border-box; }
       body {
@@ -53,7 +56,7 @@
         margin-bottom: 10px;
       }
       .pill.Active { color: var(--ok); }
-      .pill.Pending { color: var(--warn); }
+      .pill.Pending, .pill.Loading, .pill.Unloading { color: var(--warn); }
       .pill.off, .pill.Disposed, .pill.Failed { color: var(--off); }
       .row { display: flex; flex-wrap: wrap; gap: 8px; }
       button, select, input, textarea {
@@ -91,6 +94,175 @@
       @media (max-width: 800px) {
         .cols { grid-template-columns: 1fr; }
       }
+
+      /* —— Dify 风格节点连线视图 —— */
+      .graph-section { margin-top: 20px; }
+      .graph-meta {
+        color: var(--muted);
+        font-size: 0.85rem;
+        margin-bottom: 12px;
+      }
+      .flow-wrap {
+        position: relative;
+        width: 100%;
+        height: 420px;
+        overflow: auto;
+        border-radius: 10px;
+        border: 1px solid var(--line);
+        background:
+          radial-gradient(circle at 1px 1px, #243044 1px, transparent 0) 0 0 / 20px 20px,
+          #0b1018;
+      }
+      .flow-canvas {
+        position: relative;
+        width: 1080px;
+        height: 400px;
+        margin: 0 auto;
+      }
+      .flow-svg {
+        position: absolute;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+        pointer-events: none;
+        overflow: visible;
+      }
+      .flow-svg path.edge {
+        fill: none;
+        stroke-width: 2.2;
+        stroke: #64748b;
+      }
+      .flow-svg path.edge.provide { stroke: #c084fc; }
+      .flow-svg path.edge.inject { stroke: #3ecf8e; }
+      .flow-svg path.edge.contain { stroke: #5b8def; stroke-dasharray: 5 4; opacity: 0.7; }
+      .flow-svg path.edge.error {
+        stroke: #f87171;
+        stroke-dasharray: 6 5;
+        stroke-width: 2.4;
+      }
+      .flow-svg path.edge.dim { opacity: 0.25; }
+      .flow-svg marker path { fill: currentColor; }
+      .fn {
+        position: absolute;
+        width: 168px;
+        border-radius: 12px;
+        border: 1.5px solid var(--line);
+        background: linear-gradient(180deg, #1c2738 0%, #151e2c 100%);
+        box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+        color: var(--text);
+        cursor: default;
+        user-select: none;
+        transition: border-color 0.15s, box-shadow 0.15s, transform 0.15s;
+      }
+      .fn:hover {
+        transform: translateY(-1px);
+        box-shadow: 0 12px 28px rgba(0, 0, 0, 0.45);
+        z-index: 3;
+      }
+      .fn .hd {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+        padding: 8px 10px 6px;
+        border-bottom: 1px solid #243044;
+        font-size: 0.72rem;
+        color: var(--muted);
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+      }
+      .fn .bd {
+        padding: 8px 10px 10px;
+      }
+      .fn .title {
+        font-size: 0.95rem;
+        font-weight: 650;
+        margin: 0 0 4px;
+      }
+      .fn .sub {
+        margin: 0;
+        font-size: 0.72rem;
+        color: var(--muted);
+        word-break: break-all;
+      }
+      .fn .ports {
+        display: flex;
+        justify-content: space-between;
+        padding: 0 6px 8px;
+      }
+      .fn .port {
+        width: 10px;
+        height: 10px;
+        border-radius: 50%;
+        border: 2px solid #94a3b8;
+        background: #0b1018;
+      }
+      .fn .port.in { border-color: #3ecf8e; }
+      .fn .port.out { border-color: #c084fc; }
+      .fn.context { border-color: #5b8def; width: 150px; }
+      .fn.fiber.Active { border-color: #3ecf8e; }
+      .fn.fiber.Pending, .fn.fiber.Loading, .fn.fiber.Unloading { border-color: #e6a23c; }
+      .fn.fiber.Failed, .fn.fiber.error { border-color: #f87171; box-shadow: 0 0 0 1px rgba(248,113,113,0.35); }
+      .fn.fiber.off { border-color: #475569; opacity: 0.55; }
+      .fn.provider { border-color: #c084fc; width: 156px; }
+      .fn.provider.missing {
+        border-color: #f87171;
+        border-style: dashed;
+        background: linear-gradient(180deg, #2a1616 0%, #1a1010 100%);
+      }
+      .fn .badge {
+        font-size: 0.68rem;
+        padding: 1px 6px;
+        border-radius: 999px;
+        background: #243044;
+      }
+      .fn .badge.ok { color: #3ecf8e; }
+      .fn .badge.warn { color: #e6a23c; }
+      .fn .badge.err { color: #f87171; }
+      .fn .badge.off { color: #94a3b8; }
+      .flow-tip {
+        position: fixed;
+        z-index: 50;
+        max-width: 320px;
+        padding: 10px 12px;
+        border-radius: 10px;
+        border: 1px solid #3b4d66;
+        background: #0f1724ee;
+        color: var(--text);
+        font-size: 0.78rem;
+        line-height: 1.45;
+        pointer-events: none;
+        box-shadow: 0 12px 32px rgba(0,0,0,0.45);
+        display: none;
+      }
+      .flow-tip strong { display: block; margin-bottom: 4px; font-size: 0.85rem; }
+      .flow-tip code {
+        font-size: 0.72rem;
+        color: #c4d0e0;
+        word-break: break-all;
+      }
+      .legend {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px;
+        margin-top: 12px;
+        color: var(--muted);
+        font-size: 0.78rem;
+      }
+      .legend span::before {
+        content: "";
+        display: inline-block;
+        width: 14px;
+        height: 3px;
+        border-radius: 2px;
+        margin-right: 6px;
+        vertical-align: 3px;
+        background: #64748b;
+      }
+      .legend .l-contain::before { background: #5b8def; }
+      .legend .l-provide::before { background: #c084fc; }
+      .legend .l-inject::before { background: #3ecf8e; }
+      .legend .l-error::before { background: #f87171; }
     </style>
   </head>
   <body>
@@ -98,6 +270,7 @@
       <h1>DB → Logger → HTTP 插件栈</h1>
       <p class="sub">
         自由装卸三个插件；HTTP Active 后可随意发请求，调用会经 Logger 异步写入 DB。
+        三者挂在同一固定 <code>stack</code> 派生视图下。
       </p>
 
       <div class="grid">
@@ -159,16 +332,375 @@
           <pre id="db-logs">（空）</pre>
         </section>
       </div>
+
+      <section class="card graph-section">
+        <h2>运行时节点视图</h2>
+        <p class="graph-meta" id="graph-meta">加载中…</p>
+        <div class="flow-wrap">
+          <div class="flow-canvas" id="graph-flow">
+            <svg class="flow-svg" id="graph-svg">
+              <defs>
+                <marker id="arrow-inject" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+                  <path d="M 0 0 L 10 5 L 0 10 z" fill="#3ecf8e"></path>
+                </marker>
+                <marker id="arrow-provide" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+                  <path d="M 0 0 L 10 5 L 0 10 z" fill="#c084fc"></path>
+                </marker>
+                <marker id="arrow-error" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+                  <path d="M 0 0 L 10 5 L 0 10 z" fill="#f87171"></path>
+                </marker>
+                <marker id="arrow-contain" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+                  <path d="M 0 0 L 10 5 L 0 10 z" fill="#5b8def"></path>
+                </marker>
+              </defs>
+            </svg>
+          </div>
+        </div>
+        <div class="flow-tip" id="graph-tip"></div>
+        <div class="legend">
+          <span class="l-contain">stack 包含</span>
+          <span class="l-provide">provide</span>
+          <span class="l-inject">inject</span>
+          <span class="l-error">缺失 / 错误</span>
+        </div>
+      </section>
     </main>
     <script>
       const busEl = document.getElementById("bus");
       const dbEl = document.getElementById("db-logs");
       const responseEl = document.getElementById("response");
+      const graphMeta = document.getElementById("graph-meta");
+      const graphFlow = document.getElementById("graph-flow");
+      const graphSvg = document.getElementById("graph-svg");
+      const graphTip = document.getElementById("graph-tip");
+
+      const LAYOUT = {
+        stack: { x: 36, y: 150, w: 150, h: 88 },
+        DB: { fiber: { x: 260, y: 48, w: 168, h: 96 }, provider: { x: 266, y: 230, w: 156, h: 86 } },
+        Logger: { fiber: { x: 520, y: 48, w: 168, h: 96 }, provider: { x: 526, y: 230, w: 156, h: 86 } },
+        HTTP: { fiber: { x: 780, y: 48, w: 168, h: 96 }, provider: { x: 786, y: 230, w: 156, h: 86 } },
+      };
 
       function setPill(id, state) {
         const el = document.getElementById(id);
         el.textContent = state || "off";
         el.className = "pill " + (state || "off");
+      }
+
+      function esc(s) {
+        return String(s)
+          .replace(/&/g, "&amp;")
+          .replace(/</g, "&lt;")
+          .replace(/>/g, "&gt;")
+          .replace(/"/g, "&quot;");
+      }
+
+      function shortSvc(name) {
+        const parts = String(name).split(".");
+        return parts[parts.length - 1] || name;
+      }
+
+      function badgeClass(state, error) {
+        if (error) return "err";
+        if (state === "Active") return "ok";
+        if (state === "Pending" || state === "Loading" || state === "Unloading") return "warn";
+        if (state === "Failed") return "err";
+        return "off";
+      }
+
+      function portPoint(box, side) {
+        if (side === "left") return { x: box.x, y: box.y + box.h / 2 };
+        if (side === "right") return { x: box.x + box.w, y: box.y + box.h / 2 };
+        if (side === "top") return { x: box.x + box.w / 2, y: box.y };
+        return { x: box.x + box.w / 2, y: box.y + box.h };
+      }
+
+      function curve(from, to) {
+        const dx = Math.max(40, Math.abs(to.x - from.x) * 0.45);
+        const c1x = from.x + (to.x >= from.x ? dx : -dx);
+        const c2x = to.x - (to.x >= from.x ? dx : -dx);
+        return `M ${from.x} ${from.y} C ${c1x} ${from.y}, ${c2x} ${to.y}, ${to.x} ${to.y}`;
+      }
+
+      function findFiber(graph, label) {
+        return (graph.fibers || []).find((f) => f.label === label);
+      }
+
+      function findProvider(graph, serviceOrSuffix) {
+        const list = graph.providers || [];
+        return (
+          list.find((p) => p.service === serviceOrSuffix) ||
+          list.find(
+            (p) =>
+              p.service.endsWith(serviceOrSuffix) ||
+              shortSvc(p.service) === shortSvc(serviceOrSuffix)
+          )
+        );
+      }
+
+      function tipLines(title, rows) {
+        return `<strong>${esc(title)}</strong>${rows
+          .filter(Boolean)
+          .map((r) => `<div><code>${esc(r)}</code></div>`)
+          .join("")}`;
+      }
+
+      function makeNode(opts) {
+        const el = document.createElement("div");
+        el.className = `fn ${opts.kind} ${opts.state || ""} ${opts.error ? "error" : ""} ${opts.missing ? "missing" : ""}`;
+        el.style.left = opts.box.x + "px";
+        el.style.top = opts.box.y + "px";
+        el.style.width = opts.box.w + "px";
+        el.dataset.id = opts.id;
+        el.innerHTML = `
+          <div class="hd">
+            <span>${esc(opts.kindLabel)}</span>
+            <span class="badge ${badgeClass(opts.state, opts.error || opts.missing)}">${esc(opts.badge)}</span>
+          </div>
+          <div class="bd">
+            <div class="title">${esc(opts.title)}</div>
+            <p class="sub">${esc(opts.subtitle || "")}</p>
+          </div>
+          <div class="ports">
+            <span class="port in"></span>
+            <span class="port out"></span>
+          </div>`;
+        el.addEventListener("mousemove", (ev) => {
+          graphTip.style.display = "block";
+          graphTip.innerHTML = opts.tipHtml;
+          const pad = 14;
+          let x = ev.clientX + pad;
+          let y = ev.clientY + pad;
+          const rect = graphTip.getBoundingClientRect();
+          if (x + rect.width > window.innerWidth - 8) x = ev.clientX - rect.width - pad;
+          if (y + rect.height > window.innerHeight - 8) y = ev.clientY - rect.height - pad;
+          graphTip.style.left = x + "px";
+          graphTip.style.top = y + "px";
+        });
+        el.addEventListener("mouseleave", () => {
+          graphTip.style.display = "none";
+        });
+        return el;
+      }
+
+      function addEdge(paths, fromBox, fromSide, toBox, toSide, kind) {
+        const a = portPoint(fromBox, fromSide);
+        const b = portPoint(toBox, toSide);
+        const marker =
+          kind === "error"
+            ? "url(#arrow-error)"
+            : kind === "provide"
+              ? "url(#arrow-provide)"
+              : kind === "contain"
+                ? "url(#arrow-contain)"
+                : "url(#arrow-inject)";
+        paths.push(
+          `<path class="edge ${kind}" d="${curve(a, b)}" marker-end="${marker}"></path>`
+        );
+      }
+
+      function matchDep(list, hint) {
+        return (list || []).find(
+          (d) => d === hint || shortSvc(d) === shortSvc(hint) || d.endsWith(hint)
+        );
+      }
+
+      function renderGraph(graph) {
+        [...graphFlow.querySelectorAll(".fn")].forEach((n) => n.remove());
+        const defs = graphSvg.querySelector("defs");
+        graphSvg.innerHTML = "";
+        if (defs) graphSvg.appendChild(defs);
+
+        if (!graph) {
+          graphMeta.textContent = "无诊断数据";
+          return;
+        }
+
+        const db = findFiber(graph, "DB");
+        const logger = findFiber(graph, "Logger");
+        const http = findFiber(graph, "HTTP");
+        const mounted = [db, logger, http].filter(Boolean);
+        graphMeta.textContent = `${graph.view} · fibers=${mounted.length} · providers=${(graph.providers || []).length} · 悬停节点查看详情`;
+
+        const nodes = [];
+        const paths = [];
+        const boxes = {};
+
+        const stackBox = LAYOUT.stack;
+        boxes.stack = stackBox;
+        nodes.push(
+          makeNode({
+            id: "stack",
+            kind: "context",
+            kindLabel: "Context",
+            title: "stack",
+            subtitle: "root.extend() 固定视图",
+            state: "Active",
+            badge: "view",
+            box: stackBox,
+            tipHtml: tipLines("stack Context", [
+              "由 Runtime.root().extend() 创建一次",
+              "DB / Logger / HTTP 的 Fiber 都挂在此视图",
+              `context_depth ≈ ${graph.stack_depth}`,
+            ]),
+          })
+        );
+
+        const slots = [
+          { label: "DB", fiber: db, expected: "demo.stack.db@1" },
+          { label: "Logger", fiber: logger, expected: "demo.stack.logger@1" },
+          { label: "HTTP", fiber: http, expected: "demo.stack.http@1" },
+        ];
+
+        for (const slot of slots) {
+          const lay = LAYOUT[slot.label];
+          const fiberBox = lay.fiber;
+          const providerBox = lay.provider;
+          const f = slot.fiber;
+          const missing = f ? f.missing_dependencies || [] : [];
+          const hasError = !!(f && (f.state === "Failed" || missing.length || f.last_error));
+          const state = f ? f.state : "off";
+          const fiberId = `fiber-${slot.label}`;
+          boxes[fiberId] = fiberBox;
+
+          nodes.push(
+            makeNode({
+              id: fiberId,
+              kind: "fiber",
+              kindLabel: "Fiber",
+              title: slot.label,
+              subtitle: f ? f.plugin : "未挂载",
+              state,
+              error: hasError,
+              badge: f ? f.state : "off",
+              box: fiberBox,
+              tipHtml: tipLines(`${slot.label} Fiber`, [
+                f ? `id=#${f.id}` : "未挂载",
+                f ? `plugin=${f.plugin}` : null,
+                f ? `state=${f.state}` : null,
+                f && f.root_effect != null ? `root_effect=#${f.root_effect}` : null,
+                f && f.dependencies?.length
+                  ? `inject=${f.dependencies.join(", ")}`
+                  : "inject=(none)",
+                missing.length ? `missing=${missing.join(", ")}` : null,
+                f && f.provides?.length ? `provides=${f.provides.join(", ")}` : null,
+                f && f.last_error ? `error=${f.last_error}` : null,
+              ]),
+            })
+          );
+
+          if (f) addEdge(paths, stackBox, "right", fiberBox, "left", "contain");
+
+          let provider = null;
+          if (f) {
+            for (const svc of f.provides || []) {
+              provider = findProvider(graph, svc);
+              if (provider) break;
+            }
+            if (!provider) provider = findProvider(graph, slot.expected);
+          }
+
+          const providerId = `provider-${slot.label}`;
+          if (provider) {
+            boxes[providerId] = providerBox;
+            nodes.push(
+              makeNode({
+                id: providerId,
+                kind: "provider",
+                kindLabel: "Provider",
+                title: shortSvc(provider.service),
+                subtitle: provider.service,
+                state: "Active",
+                badge: `#${provider.provider_id}`,
+                box: providerBox,
+                tipHtml: tipLines("Provider", [
+                  `service=${provider.service}`,
+                  `provider_id=#${provider.provider_id}`,
+                  provider.effect_id != null ? `effect_id=#${provider.effect_id}` : null,
+                  `context_depth=${provider.context_depth}`,
+                  provider.owner_fiber != null ? `owner_fiber=#${provider.owner_fiber}` : null,
+                  provider.owner_plugin ? `owner_plugin=${provider.owner_plugin}` : null,
+                ]),
+              })
+            );
+            addEdge(paths, fiberBox, "bottom", providerBox, "top", "provide");
+          } else if (f) {
+            boxes[providerId] = providerBox;
+            const activeMissing = f.state === "Active";
+            nodes.push(
+              makeNode({
+                id: providerId,
+                kind: "provider",
+                kindLabel: "Provider",
+                title: shortSvc(slot.expected),
+                subtitle: activeMissing ? "尚未 provide" : "等待 Active",
+                state: "off",
+                missing: activeMissing,
+                badge: activeMissing ? "missing" : "waiting",
+                box: providerBox,
+                tipHtml: tipLines("Provider（空）", [
+                  `期望 service = ${slot.expected}`,
+                  "Fiber 尚未 provide，或 Effect 已释放",
+                ]),
+              })
+            );
+            if (activeMissing) addEdge(paths, fiberBox, "bottom", providerBox, "top", "error");
+          }
+        }
+
+        function injectEdge(fromLabel, toLabel, depHint) {
+          const consumer = findFiber(graph, toLabel);
+          if (!consumer) return;
+          const dep = matchDep(consumer.dependencies, depHint) || depHint;
+          const missing = !!matchDep(consumer.missing_dependencies, depHint);
+          const provider = findProvider(graph, dep);
+          const fromFiber = findFiber(graph, fromLabel);
+          const providerBox = LAYOUT[fromLabel].provider;
+          const toBox = LAYOUT[toLabel].fiber;
+
+          if (provider && fromFiber && !missing) {
+            addEdge(paths, providerBox, "right", toBox, "left", "inject");
+            return;
+          }
+
+          const ghostId = `ghost-${fromLabel}-${toLabel}`;
+          if (!boxes[ghostId]) {
+            const ghostBox = { ...LAYOUT[fromLabel].provider };
+            // if real provider node already occupies same spot and is missing-style, reuse
+            boxes[ghostId] = ghostBox;
+            const occupied = nodes.some((n) => n.dataset.id === `provider-${fromLabel}`);
+            if (!occupied || missing) {
+              if (!occupied) {
+                nodes.push(
+                  makeNode({
+                    id: ghostId,
+                    kind: "provider",
+                    kindLabel: "Provider",
+                    title: shortSvc(dep),
+                    subtitle: "缺失",
+                    missing: true,
+                    error: true,
+                    badge: "missing",
+                    box: ghostBox,
+                    tipHtml: tipLines("缺失的 Provider", [
+                      `consumer=${toLabel}`,
+                      `需要=${dep}`,
+                      "上游未挂载、未 Active，或已被卸载",
+                    ]),
+                  })
+                );
+              }
+            }
+          }
+          const fromBox = boxes[`provider-${fromLabel}`] || boxes[ghostId] || LAYOUT[fromLabel].provider;
+          addEdge(paths, fromBox, "right", toBox, "left", "error");
+        }
+
+        injectEdge("DB", "Logger", "demo.stack.db@1");
+        injectEdge("Logger", "HTTP", "demo.stack.logger@1");
+
+        for (const n of nodes) graphFlow.appendChild(n);
+        graphSvg.insertAdjacentHTML("beforeend", paths.join(""));
       }
 
       async function api(path, body) {
@@ -187,9 +719,9 @@
         setPill("st-db", s.plugins.db);
         setPill("st-logger", s.plugins.logger);
         setPill("st-http", s.plugins.http);
-        dbEl.textContent = (s.db_logs && s.db_logs.length)
-          ? s.db_logs.join("\n")
-          : "（空）";
+        dbEl.textContent =
+          s.db_logs && s.db_logs.length ? s.db_logs.join("\n") : "（空）";
+        renderGraph(s.graph);
       }
 
       document.querySelectorAll("[data-plugin]").forEach((card) => {
@@ -211,7 +743,9 @@
       document.getElementById("mount-all").onclick = async () => {
         try {
           for (const plugin of ["db", "logger", "http"]) {
-            try { await api("/api/mount", { plugin }); } catch (_) {}
+            try {
+              await api("/api/mount", { plugin });
+            } catch (_) {}
           }
           await refresh();
         } catch (e) {
@@ -235,8 +769,7 @@
             url: document.getElementById("url").value,
             body: document.getElementById("body").value,
           });
-          responseEl.textContent =
-            "status " + data.status + "\n\n" + data.body;
+          responseEl.textContent = "status " + data.status + "\n\n" + data.body;
           await refresh();
         } catch (e) {
           responseEl.textContent = "错误: " + e.message;

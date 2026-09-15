@@ -20,7 +20,7 @@ use axum::{
     },
     routing::{get, post},
 };
-use cordis_core::{Fiber, FiberStateSnapshot, Plugin, PluginKey, Runtime};
+use cordis_core::{Context, Fiber, FiberStateSnapshot, Plugin, PluginKey, Runtime};
 use db::{DbPlugin, LogTx};
 use futures_util::stream::{Stream, unfold};
 use http_client::HttpPlugin;
@@ -32,6 +32,8 @@ use tokio::sync::{Mutex as AsyncMutex, broadcast};
 
 struct AppState {
     runtime: Runtime,
+    /// 固定派生视图：三个插件 Fiber 都挂在同一语义下。
+    stack: Context,
     db: AsyncMutex<Option<Fiber>>,
     logger: AsyncMutex<Option<Fiber>>,
     http: AsyncMutex<Option<Fiber>>,
@@ -61,6 +63,7 @@ struct StateJson {
     plugins: PluginsJson,
     db_logs: Vec<String>,
     registry: Vec<GroupJson>,
+    graph: GraphJson,
 }
 
 #[derive(Serialize)]
@@ -83,6 +86,52 @@ struct FiberJson {
 }
 
 #[derive(Serialize)]
+struct GraphJson {
+    /// 插件栈所在视图说明。
+    view: String,
+    stack_depth: usize,
+    fibers: Vec<GraphFiberJson>,
+    providers: Vec<GraphProviderJson>,
+    effects: Vec<GraphEffectJson>,
+}
+
+#[derive(Serialize)]
+struct GraphFiberJson {
+    id: u64,
+    plugin: String,
+    label: String,
+    state: String,
+    dependencies: Vec<String>,
+    missing_dependencies: Vec<String>,
+    root_effect: Option<u64>,
+    provides: Vec<String>,
+    last_error: Option<String>,
+}
+
+#[derive(Serialize)]
+struct GraphProviderJson {
+    provider_id: u64,
+    service: String,
+    effect_id: Option<u64>,
+    context_depth: usize,
+    owner_fiber: Option<u64>,
+    owner_plugin: Option<String>,
+}
+
+#[derive(Serialize)]
+struct GraphEffectJson {
+    id: u64,
+    name: String,
+    parent: Option<u64>,
+    fiber_id: Option<u64>,
+    disposed: bool,
+    cancelled: bool,
+    task_count: usize,
+    cleanup_count: usize,
+    child_count: usize,
+}
+
+#[derive(Serialize)]
 struct RequestJson {
     status: u16,
     body: String,
@@ -99,6 +148,18 @@ fn snapshot_name(state: FiberStateSnapshot) -> &'static str {
     }
 }
 
+fn plugin_label(key: &str) -> &'static str {
+    if key == KEY_DB.as_str() {
+        "DB"
+    } else if key == KEY_LOGGER.as_str() {
+        "Logger"
+    } else if key == KEY_HTTP.as_str() {
+        "HTTP"
+    } else {
+        "Plugin"
+    }
+}
+
 fn plugin_state(runtime: &Runtime, key: &PluginKey) -> String {
     runtime
         .diagnostics()
@@ -110,10 +171,112 @@ fn plugin_state(runtime: &Runtime, key: &PluginKey) -> String {
         .unwrap_or_else(|| "off".into())
 }
 
+fn build_graph(runtime: &Runtime) -> GraphJson {
+    let snap = runtime.diagnostics();
+    let stack_depth = snap
+        .providers
+        .iter()
+        .map(|p| p.context_depth)
+        .max()
+        .or_else(|| {
+            snap.plugin_fibers
+                .iter()
+                .map(|f| f.context_depth)
+                .max()
+        })
+        .unwrap_or(1);
+
+    let fibers: Vec<GraphFiberJson> = snap
+        .plugin_fibers
+        .iter()
+        .map(|f| {
+            let provides = snap
+                .providers
+                .iter()
+                .filter(|p| {
+                    p.effect_id
+                        .zip(f.root_effect)
+                        .is_some_and(|(pe, re)| pe == re)
+                        || snap.effects.iter().any(|e| {
+                            e.fiber_id == Some(f.id)
+                                && p.effect_id == Some(e.id)
+                        })
+                })
+                .map(|p| p.service.to_string())
+                .collect();
+            GraphFiberJson {
+                id: f.id,
+                plugin: f.plugin_key.to_string(),
+                label: plugin_label(f.plugin_key).into(),
+                state: snapshot_name(f.state).into(),
+                dependencies: f.dependencies.iter().map(|s| (*s).to_string()).collect(),
+                missing_dependencies: f
+                    .missing_dependencies
+                    .iter()
+                    .map(|s| (*s).to_string())
+                    .collect(),
+                root_effect: f.root_effect,
+                provides,
+                last_error: f.last_error.clone(),
+            }
+        })
+        .collect();
+
+    let providers: Vec<GraphProviderJson> = snap
+        .providers
+        .iter()
+        .map(|p| {
+            let owner_fiber = p.effect_id.and_then(|eid| {
+                snap.effects
+                    .iter()
+                    .find(|e| e.id == eid)
+                    .and_then(|e| e.fiber_id)
+            });
+            let owner_plugin = owner_fiber.and_then(|fid| {
+                snap.plugin_fibers
+                    .iter()
+                    .find(|f| f.id == fid)
+                    .map(|f| f.plugin_key.to_string())
+            });
+            GraphProviderJson {
+                provider_id: p.provider_id,
+                service: p.service.to_string(),
+                effect_id: p.effect_id,
+                context_depth: p.context_depth,
+                owner_fiber,
+                owner_plugin,
+            }
+        })
+        .collect();
+
+    let effects: Vec<GraphEffectJson> = snap
+        .effects
+        .iter()
+        .map(|e| GraphEffectJson {
+            id: e.id,
+            name: e.name.clone(),
+            parent: e.parent,
+            fiber_id: e.fiber_id,
+            disposed: e.disposed,
+            cancelled: e.cancelled,
+            task_count: e.task_count,
+            cleanup_count: e.cleanup_count,
+            child_count: e.child_count,
+        })
+        .collect();
+
+    GraphJson {
+        view: "Runtime → Root → stack(extend) → Fibers".into(),
+        stack_depth,
+        fibers,
+        providers,
+        effects,
+    }
+}
+
 fn build_state(app: &AppState) -> StateJson {
     let db_logs = app
-        .runtime
-        .root()
+        .stack
         .get(DB)
         .map(|db| db.recent(80))
         .unwrap_or_default();
@@ -142,6 +305,7 @@ fn build_state(app: &AppState) -> StateJson {
         },
         db_logs,
         registry,
+        graph: build_graph(&app.runtime),
     }
 }
 
@@ -178,14 +342,14 @@ async fn api_mount(
     State(app): State<Arc<AppState>>,
     Json(body): Json<PluginBody>,
 ) -> Result<Json<StateJson>, (StatusCode, Json<ErrJson>)> {
-    let root = app.runtime.root();
+    let stack = app.stack.clone();
     match body.plugin.as_str() {
         "db" => {
             let mut slot = app.db.lock().await;
             if slot.is_some() {
                 return Err(err(StatusCode::BAD_REQUEST, "db already mounted"));
             }
-            let fiber = root
+            let fiber = stack
                 .plugin(Arc::new(DbPlugin {
                     bus: app.bus.clone(),
                 }) as Arc<dyn Plugin>)
@@ -198,7 +362,7 @@ async fn api_mount(
             if slot.is_some() {
                 return Err(err(StatusCode::BAD_REQUEST, "logger already mounted"));
             }
-            let fiber = root
+            let fiber = stack
                 .plugin(Arc::new(LoggerPlugin {
                     bus: app.bus.clone(),
                 }) as Arc<dyn Plugin>)
@@ -211,7 +375,7 @@ async fn api_mount(
             if slot.is_some() {
                 return Err(err(StatusCode::BAD_REQUEST, "http already mounted"));
             }
-            let fiber = root
+            let fiber = stack
                 .plugin(Arc::new(HttpPlugin {
                     bus: app.bus.clone(),
                 }) as Arc<dyn Plugin>)
@@ -265,7 +429,7 @@ async fn api_request(
     State(app): State<Arc<AppState>>,
     Json(body): Json<RequestBody>,
 ) -> Result<Json<RequestJson>, (StatusCode, Json<ErrJson>)> {
-    let http = app.runtime.root().get(HTTP).map_err(|_| {
+    let http = app.stack.get(HTTP).map_err(|_| {
         err(
             StatusCode::BAD_REQUEST,
             "HTTP 插件未 Active（请先挂载 DB → Logger → HTTP）",
@@ -292,7 +456,7 @@ async fn api_clear_db(
     State(app): State<Arc<AppState>>,
     Json(_body): Json<serde_json::Value>,
 ) -> Result<Json<StateJson>, (StatusCode, Json<ErrJson>)> {
-    match app.runtime.root().get(DB) {
+    match app.stack.get(DB) {
         Ok(db) => {
             db.clear();
             let _ = app.bus.send("sys: db logs cleared".into());
@@ -306,8 +470,11 @@ async fn api_clear_db(
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (bus, _) = broadcast::channel(256);
     let runtime = Runtime::new()?;
+    // 仅创建一次固定插件栈视图；三次挂载都落在同一 Context 语义下。
+    let stack = runtime.root().extend()?;
     let app = Arc::new(AppState {
         runtime,
+        stack,
         db: AsyncMutex::new(None),
         logger: AsyncMutex::new(None),
         http: AsyncMutex::new(None),
