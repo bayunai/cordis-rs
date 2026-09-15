@@ -2,10 +2,7 @@
 //!
 //! 执行已选中的监听器；事件不控制、不回滚 Core 生命周期。
 
-use crate::{
-    CoreError,
-    registry::{NodeId, Registry},
-};
+use crate::{Context, CoreError, registry::Registry};
 use futures_util::future::join_all;
 use std::{
     any::{Any, TypeId},
@@ -17,7 +14,7 @@ use super::listener::{ErasedNext, EventHandlerKind, EventMode};
 impl Registry {
     pub(crate) fn emit_event(
         &self,
-        node: NodeId,
+        context: &Context,
         event_id: &'static str,
         type_id: TypeId,
         payload: &(dyn Any + Send + Sync),
@@ -26,7 +23,7 @@ impl Registry {
             let mut state = self.state.lock().map_err(|_| CoreError::ContextDisposed)?;
             Self::lock_event_contract(&mut state, event_id, EventMode::Observe, type_id, None)?;
             let matched =
-                Self::select_matching_listeners(&state, event_id, node, EventMode::Observe)?;
+                Self::select_matching_listeners(&state, event_id, context, EventMode::Observe)?;
             matched
                 .into_iter()
                 .map(|listener| {
@@ -61,7 +58,7 @@ impl Registry {
 
     pub(crate) async fn waterfall_event<T: Send + Sync + 'static>(
         self: &Arc<Self>,
-        node: NodeId,
+        context: Context,
         event_id: &'static str,
         value: T,
     ) -> Result<T, CoreError> {
@@ -71,7 +68,7 @@ impl Registry {
             let mut state = self.state.lock().map_err(|_| CoreError::ContextDisposed)?;
             Self::lock_event_contract(&mut state, event_id, EventMode::Waterfall, type_id, None)?;
             let matched =
-                Self::select_matching_listeners(&state, event_id, node, EventMode::Waterfall)?;
+                Self::select_matching_listeners(&state, event_id, &context, EventMode::Waterfall)?;
             matched
                 .into_iter()
                 .map(|listener| {
@@ -116,7 +113,7 @@ impl Registry {
 
     pub(crate) async fn serial_event<T: Send + Sync + 'static, R: Send + Sync + 'static>(
         &self,
-        node: NodeId,
+        context: &Context,
         event_id: &'static str,
         payload: &T,
     ) -> Result<Option<R>, CoreError> {
@@ -130,7 +127,7 @@ impl Registry {
                 Some(TypeId::of::<R>()),
             )?;
             let matched =
-                Self::select_matching_listeners(&state, event_id, node, EventMode::Serial)?;
+                Self::select_matching_listeners(&state, event_id, context, EventMode::Serial)?;
             matched
                 .into_iter()
                 .map(|listener| {
@@ -173,7 +170,7 @@ impl Registry {
 
     pub(crate) async fn parallel_event(
         &self,
-        node: NodeId,
+        context: &Context,
         event_id: &'static str,
         type_id: TypeId,
         payload: &(dyn Any + Send + Sync),
@@ -182,7 +179,7 @@ impl Registry {
             let mut state = self.state.lock().map_err(|_| CoreError::ContextDisposed)?;
             Self::lock_event_contract(&mut state, event_id, EventMode::Parallel, type_id, None)?;
             let matched =
-                Self::select_matching_listeners(&state, event_id, node, EventMode::Parallel)?;
+                Self::select_matching_listeners(&state, event_id, context, EventMode::Parallel)?;
             matched
                 .into_iter()
                 .map(|listener| {

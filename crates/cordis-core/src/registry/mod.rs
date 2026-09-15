@@ -4,24 +4,20 @@
 //! `injection` 响应式注入收敛，`scheduler` 后台重算调度。
 
 pub(crate) mod injection;
-pub(crate) mod node;
 pub(crate) mod provider;
 pub(crate) mod scheduler;
 
 pub(crate) use injection::InjectionPhase;
 pub(crate) use provider::ProviderKey;
 
-pub(crate) type NodeId = u64;
 pub(crate) type InjectionId = u64;
 pub(crate) type ListenerId = u64;
 
 use crate::{
-    ServiceId,
-    config::ConfigId,
+    ConfigId, Context, ServiceId,
     diagnostics::{
-        ContextIsolationSnapshot, ContextSnapshot, EffectSnapshot, FiberStateSnapshot,
-        InjectFiberSnapshot, IsolationSnapshot, PluginRegistryFiberSnapshot,
-        PluginRegistrySnapshot, ProviderSnapshot, RuntimeSnapshot,
+        EffectSnapshot, FiberStateSnapshot, InjectFiberSnapshot, IsolationSnapshot,
+        PluginRegistryFiberSnapshot, PluginRegistrySnapshot, ProviderSnapshot, RuntimeSnapshot,
     },
     event::listener::{EventContract, EventListener},
     fiber::{FiberInner, FiberState, FiberStateChange},
@@ -29,14 +25,13 @@ use crate::{
     plugin::{PluginKey, group::PluginGroup},
     registry::{
         injection::InjectionRecord,
-        node::NodeRecord,
         provider::{EffectRecord, ProviderRecord},
     },
     service::resolver::resolve_provider,
 };
 use std::{
     any::TypeId,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{
         Arc, Mutex, Weak,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -47,14 +42,12 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 pub(crate) struct RegistryState {
-    pub(crate) nodes: HashMap<NodeId, NodeRecord>,
     pub(crate) providers: HashMap<ProviderKey, ProviderRecord>,
     pub(crate) injections: HashMap<InjectionId, InjectionRecord>,
     pub(crate) listeners: HashMap<&'static str, Vec<EventListener>>,
     pub(crate) effects: HashMap<u64, EffectRecord>,
     pub(crate) plugin_fibers: HashMap<u64, Weak<FiberInner>>,
     pub(crate) plugin_index: HashMap<PluginKey, PluginGroup>,
-    pub(crate) isolations_seen: HashMap<u64, ()>,
     pub(crate) service_types: HashMap<ServiceId, TypeId>,
     pub(crate) config_types: HashMap<ConfigId, TypeId>,
     pub(crate) event_contracts: HashMap<&'static str, EventContract>,
@@ -82,14 +75,12 @@ impl Registry {
         let (fiber_state_events, _) = broadcast::channel(1024);
         Arc::new(Self {
             state: Mutex::new(RegistryState {
-                nodes: HashMap::new(),
                 providers: HashMap::new(),
                 injections: HashMap::new(),
                 listeners: HashMap::new(),
                 effects: HashMap::new(),
                 plugin_fibers: HashMap::new(),
                 plugin_index: HashMap::new(),
-                isolations_seen: HashMap::new(),
                 service_types: HashMap::new(),
                 config_types: HashMap::new(),
                 event_contracts: HashMap::new(),
@@ -122,31 +113,61 @@ impl Registry {
         self.next_id.fetch_add(1, Ordering::Relaxed)
     }
 
+    pub(crate) fn allocate_isolation_label(&self) -> crate::IsolationLabel {
+        self.runtime_token.allocate_label()
+    }
+
+    /// 配置类型属于 Runtime 合同，而非任一 Context 视图。
+    pub(crate) fn lock_config_type(
+        &self,
+        key: crate::config::ConfigId,
+        type_id: TypeId,
+    ) -> Result<(), crate::CoreError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| crate::CoreError::ContextDisposed)?;
+        match state.config_types.entry(key) {
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(type_id);
+                Ok(())
+            }
+            std::collections::hash_map::Entry::Occupied(slot) if *slot.get() == type_id => Ok(()),
+            std::collections::hash_map::Entry::Occupied(_) => {
+                Err(crate::CoreError::ConfigKeyTypeConflict { config: key })
+            }
+        }
+    }
+
+    pub(crate) fn check_config_type(
+        &self,
+        key: ConfigId,
+        type_id: TypeId,
+    ) -> Result<(), crate::CoreError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| crate::CoreError::ContextDisposed)?;
+        if state
+            .config_types
+            .get(&key)
+            .is_some_and(|expected| *expected != type_id)
+        {
+            return Err(crate::CoreError::ConfigTypeMismatch { config: key });
+        }
+        Ok(())
+    }
+
     pub(crate) fn diagnostics(&self) -> RuntimeSnapshot {
         let Ok(state) = self.state.lock() else {
             return RuntimeSnapshot::default();
         };
-        let contexts = state
-            .nodes
-            .iter()
-            .map(|(id, node)| ContextSnapshot {
-                id: *id,
-                parent: node.parent,
-                isolations: node
-                    .isolations
-                    .iter()
-                    .map(|(service, label_id)| ContextIsolationSnapshot {
-                        service: service.as_str(),
-                        label_id: *label_id,
-                    })
-                    .collect(),
-                config_keys: node.configs.keys().map(|key| key.as_str()).collect(),
-            })
-            .collect();
         let mut isolations: Vec<IsolationSnapshot> = state
-            .isolations_seen
-            .keys()
-            .copied()
+            .providers
+            .values()
+            .filter_map(|provider| provider.isolation)
+            .collect::<HashSet<_>>()
+            .into_iter()
             .map(|id| IsolationSnapshot { id })
             .collect();
         isolations.sort_by_key(|item| item.id);
@@ -154,7 +175,7 @@ impl Registry {
             .providers
             .iter()
             .map(|(_key, provider)| ProviderSnapshot {
-                node: provider.node,
+                context_depth: provider.context.context_depth(),
                 isolation: provider.isolation,
                 service: match _key {
                     ProviderKey::Local { service, .. } | ProviderKey::Isolated { service, .. } => {
@@ -172,12 +193,12 @@ impl Registry {
                 let missing = injection
                     .dependencies
                     .iter()
-                    .filter(|key| resolve_provider(&state, injection.node, **key).is_none())
+                    .filter(|key| resolve_provider(&state, &injection.context, **key).is_none())
                     .map(|key| key.as_str())
                     .collect::<Vec<_>>();
                 InjectFiberSnapshot {
                     id: *id,
-                    node: injection.node,
+                    context_depth: injection.context.context_depth(),
                     phase: FiberStateSnapshot::from(injection.phase),
                     dependencies: injection
                         .dependencies
@@ -196,7 +217,7 @@ impl Registry {
                 id: *id,
                 name: effect.name.clone(),
                 parent: effect.parent,
-                node: effect.node,
+                context_depth: effect.context.as_ref().map(Context::context_depth),
                 fiber_id: effect.fiber_id,
                 cancelled: effect.scope.is_cancelled(),
                 disposed: effect.scope.is_disposed(),
@@ -244,7 +265,6 @@ impl Registry {
             .map(|fiber| fiber.snapshot())
             .collect();
         RuntimeSnapshot {
-            contexts,
             isolations,
             providers,
             plugin_fibers,

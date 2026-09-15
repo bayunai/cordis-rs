@@ -157,23 +157,18 @@ impl Runtime {
     pub fn new() -> Result<Self, CoreError> {
         let registry = Registry::new();
         registry.start_scheduler()?;
-        let root_id = registry.allocate_id();
         let handle = tokio::runtime::Handle::current();
         let root_scope = EffectScope::root(handle.clone());
-        registry.add_node(
-            root_id,
-            None,
-            std::collections::HashMap::new(),
-            std::collections::HashMap::new(),
-        )?;
-        registry.bind_node_lifecycle(root_id, &root_scope);
         Ok(Self {
             inner: Arc::new(RuntimeInner {
                 registry: registry.clone(),
                 root: Context {
                     inner: Arc::new(ContextInner {
-                        id: root_id,
-                        registry,
+                        identity: Arc::new(()),
+                        parent: None,
+                        isolations: std::collections::HashMap::new(),
+                        configs: std::collections::HashMap::new(),
+                        registry: Arc::downgrade(&registry),
                         scope: root_scope,
                     }),
                 },

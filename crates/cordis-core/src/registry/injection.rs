@@ -3,11 +3,11 @@
 //! 跟踪依赖、回调与注入相位，并在 provider 变化时重算；不负责插件生命周期。
 
 use crate::{
-    CoreError, ServiceId, Services,
+    Context, CoreError, ServiceId, Services,
     callback_context::{LifecycleFrame, USER_LIFECYCLE_CALLBACK},
     effect::EffectScope,
     error::format_panic_message,
-    registry::{InjectionId, NodeId, Registry},
+    registry::{InjectionId, Registry},
     service::resolver::{provider_ids, resolve_provider},
 };
 use futures_util::FutureExt;
@@ -31,7 +31,7 @@ pub(crate) enum InjectionPhase {
 }
 
 pub(crate) struct InjectionRecord {
-    pub(crate) node: NodeId,
+    pub(crate) context: Context,
     pub(crate) parent_scope: EffectScope,
     pub(crate) dependencies: Vec<ServiceId>,
     pub(crate) callback: InjectCallback,
@@ -51,7 +51,7 @@ pub(crate) struct InjectionSnapshot {
     pub(crate) services: Services,
     pub(crate) parent: EffectScope,
     pub(crate) providers: Vec<u64>,
-    pub(crate) node: NodeId,
+    pub(crate) context: Context,
     pub(crate) deps: Vec<ServiceId>,
 }
 
@@ -81,7 +81,7 @@ async fn invoke_callback(
 impl Registry {
     pub(crate) fn register_injection(
         self: &Arc<Self>,
-        node: NodeId,
+        context: Context,
         parent_scope: EffectScope,
         dependencies: Vec<ServiceId>,
         callback: InjectCallback,
@@ -98,7 +98,7 @@ impl Registry {
             state.injections.insert(
                 id,
                 InjectionRecord {
-                    node,
+                    context,
                     parent_scope: parent_scope.clone(),
                     dependencies,
                     callback,
@@ -160,7 +160,7 @@ impl Registry {
                         injection.parent_scope.is_disposed(),
                         injection.phase,
                         injection.resolved_providers.clone(),
-                        provider_ids(&state, injection.node, &injection.dependencies),
+                        provider_ids(&state, &injection.context, &injection.dependencies),
                     )
                 })
                 .collect::<Vec<_>>();
@@ -196,7 +196,8 @@ impl Registry {
                     if injection.parent_scope.is_disposed() {
                         return None;
                     }
-                    let providers = provider_ids(&state, injection.node, &injection.dependencies);
+                    let providers =
+                        provider_ids(&state, &injection.context, &injection.dependencies);
                     let ready = providers.len() == injection.dependencies.len();
                     match injection.phase {
                         InjectionPhase::Pending if ready => Some(*id),
@@ -227,7 +228,7 @@ impl Registry {
                 child.dispose();
                 return;
             };
-            provider_ids(&state, snapshot.node, &snapshot.deps)
+            provider_ids(&state, &snapshot.context, &snapshot.deps)
         };
         let mut failed = None;
         if let Ok(mut state) = self.state.lock() {
@@ -276,7 +277,7 @@ impl Registry {
         let mut values = HashMap::new();
         let mut providers = Vec::with_capacity(injection.dependencies.len());
         for key in &injection.dependencies {
-            let provider = resolve_provider(&state, injection.node, *key)?;
+            let provider = resolve_provider(&state, &injection.context, *key)?;
             values.insert(*key, provider.value.clone());
             providers.push(provider.id);
         }
@@ -285,7 +286,7 @@ impl Registry {
             services: Services { values },
             parent: injection.parent_scope.clone(),
             providers,
-            node: injection.node,
+            context: injection.context.clone(),
             deps: injection.dependencies.clone(),
         })
     }

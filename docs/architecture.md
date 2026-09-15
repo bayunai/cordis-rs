@@ -43,7 +43,7 @@ bootstrap.toml
 ## Isolation
 
 - `IsolationLabel` 由 Runtime 分配，跨 Runtime 使用 → `IsolationRuntimeMismatch`。
-- `Context::extend()` 创建派生 Context 节点，不创建 Scope；父 Context 不会被修改。
+- `Context::extend()` 创建不可变派生 Context 视图，不创建 Registry 节点或 Scope；父 Context 不会被修改，最后一个引用释放后视图自然回收。
 - `Context::isolate(key)` 返回 `(派生 Context, 新标签)`；`isolate_with(key, label)` 返回加入既有标签的派生 Context。
 - 解析：若当前 Context 谱系对该 Key 有隔离覆盖，则只看同 label 的 Provider；否则走父子 Local 覆盖。
 - 隔离**只影响声明的 Key**；其他 Service 仍按父子链解析。
@@ -108,11 +108,11 @@ Context::plugin(Arc<dyn Plugin>)
 
 ## 诊断
 
-`Runtime::diagnostics()` 含：contexts（isolation 覆盖 + `config_keys` 标识）、isolations、providers（isolation/effect_id）、plugin_fibers（含 `plugin_key`）、plugin_registry（Key + Fiber id/state）、inject_fibers、effects。无 Service / Config 值。
+`Runtime::diagnostics()` 含：isolations、providers、plugin_fibers（含 `plugin_key`）、plugin_registry（Key + Fiber id/state）、inject_fibers、effects。普通 Context 是不可枚举的短生命周期视图，不进入诊断；无 Service / Config 值。
 
 ## Config / intercept
 
-`ConfigKey<T>` 独立于 `ServiceKey`。`Context::intercept(key, value)` 创建共享 Scope 的派生节点并写入覆盖；`config(key)` 向父爬最近值。不影响 Provider / inject 生命周期。
+`ConfigKey<T>` 独立于 `ServiceKey`。`Context::intercept(key, value)` 创建共享 Scope 的派生视图并写入覆盖；`config(key)` 向父链查找最近值。不影响 Provider / inject 生命周期。
 
 ## Plugin Registry
 

@@ -55,7 +55,7 @@ async fn main() -> Result<(), CoreError> {
 
 ## Context 与资源生命周期
 
-- `Context::extend()`、`isolate()` 返回的都是派生视图，没有 `dispose()`。
+- `Context::extend()`、`isolate()` 返回的都是不可变派生视图，不登记 Runtime 节点，也没有 `dispose()`；无引用后自动回收。
 - 需要可卸载的 Provider、订阅或任务时，先通过 `ctx.effect()` 获取 `EffectContext`，再在其上 `extend()` 或创建资源。
 - 资源只由 `EffectContext`、`Fiber` 或 `Runtime::shutdown()` 释放；不要把 Context 句柄当作资源所有者。
 

@@ -7,7 +7,6 @@ use crate::registry::InjectionPhase;
 /// 非敏感运行时诊断快照。
 #[derive(Debug, Clone, Default)]
 pub struct RuntimeSnapshot {
-    pub contexts: Vec<ContextSnapshot>,
     pub isolations: Vec<IsolationSnapshot>,
     pub providers: Vec<ProviderSnapshot>,
     pub plugin_fibers: Vec<PluginFiberSnapshot>,
@@ -17,27 +16,13 @@ pub struct RuntimeSnapshot {
 }
 
 #[derive(Debug, Clone)]
-pub struct ContextSnapshot {
-    pub id: u64,
-    pub parent: Option<u64>,
-    pub isolations: Vec<ContextIsolationSnapshot>,
-    pub config_keys: Vec<&'static str>,
-}
-
-#[derive(Debug, Clone)]
-pub struct ContextIsolationSnapshot {
-    pub service: &'static str,
-    pub label_id: u64,
-}
-
-#[derive(Debug, Clone)]
 pub struct IsolationSnapshot {
     pub id: u64,
 }
 
 #[derive(Debug, Clone)]
 pub struct ProviderSnapshot {
-    pub node: Option<u64>,
+    pub context_depth: usize,
     pub isolation: Option<u64>,
     pub service: &'static str,
     pub provider_id: u64,
@@ -69,7 +54,7 @@ impl From<InjectionPhase> for FiberStateSnapshot {
 #[derive(Debug, Clone)]
 pub struct InjectFiberSnapshot {
     pub id: u64,
-    pub node: u64,
+    pub context_depth: usize,
     pub phase: FiberStateSnapshot,
     pub dependencies: Vec<&'static str>,
     pub missing_dependencies: Vec<&'static str>,
@@ -81,7 +66,7 @@ pub struct InjectFiberSnapshot {
 pub struct PluginFiberSnapshot {
     pub id: u64,
     pub plugin_key: &'static str,
-    pub node: u64,
+    pub context_depth: usize,
     pub state: FiberStateSnapshot,
     pub dependencies: Vec<&'static str>,
     pub missing_dependencies: Vec<&'static str>,
@@ -108,7 +93,7 @@ pub struct EffectSnapshot {
     pub id: u64,
     pub name: String,
     pub parent: Option<u64>,
-    pub node: Option<u64>,
+    pub context_depth: Option<usize>,
     pub fiber_id: Option<u64>,
     pub cancelled: bool,
     pub disposed: bool,

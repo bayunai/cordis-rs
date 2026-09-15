@@ -19,7 +19,6 @@ use crate::{
     Context, ServiceId,
     effect::EffectScope,
     plugin::{Plugin, PluginKey},
-    registry::NodeId,
 };
 use std::sync::{
     Arc, Mutex, Weak,
@@ -36,7 +35,7 @@ pub struct Fiber {
 pub(crate) struct FiberInner {
     pub(crate) id: u64,
     pub(crate) plugin_key: PluginKey,
-    pub(crate) node: NodeId,
+    pub(crate) context: Context,
     pub(crate) registry: Weak<crate::registry::Registry>,
     pub(crate) parent_scope: EffectScope,
     pub(crate) plugin: Mutex<Arc<dyn Plugin>>,
@@ -50,7 +49,6 @@ pub(crate) struct FiberInner {
     pub(crate) disposed: AtomicBool,
     pub(crate) busy: Mutex<bool>,
     pub(crate) lifecycle: Mutex<Option<Arc<LifecycleCompletion>>>,
-    pub(crate) mount_ctx: Mutex<Option<Context>>,
     pub(crate) handoff: Mutex<HandleHandoff>,
 }
 
@@ -87,7 +85,7 @@ impl FiberInner {
         };
         let deps = self.dependencies.lock().expect("deps").clone();
         deps.into_iter()
-            .filter(|key| registry.resolve(self.node, *key).is_none())
+            .filter(|key| registry.resolve(&self.context, *key).is_none())
             .collect()
     }
 
@@ -105,7 +103,7 @@ impl FiberInner {
         crate::diagnostics::PluginFiberSnapshot {
             id: self.id,
             plugin_key: self.plugin_key.as_str(),
-            node: self.node,
+            context_depth: self.context.context_depth(),
             state,
             dependencies: deps.iter().map(|d| d.as_str()).collect(),
             missing_dependencies: missing.iter().map(|d| d.as_str()).collect(),
@@ -153,12 +151,18 @@ mod claim_tests {
             .build()
             .expect("test runtime");
         let handle = runtime.handle().clone();
+        let core = {
+            let _entered = runtime.enter();
+            crate::Runtime::new().expect("core runtime")
+        };
+        let context = core.root();
         // Keep the runtime alive for the scope handle duration of this test.
         std::mem::forget(runtime);
+        std::mem::forget(core);
         Arc::new(FiberInner {
             id: 1,
             plugin_key: crate::plugin::PluginKey::new("test.noop"),
-            node: 0,
+            context,
             registry: Weak::new(),
             parent_scope: EffectScope::root(handle),
             plugin: Mutex::new(Arc::new(NoopPlugin)),
@@ -171,7 +175,6 @@ mod claim_tests {
             disposed: AtomicBool::new(false),
             busy: Mutex::new(false),
             lifecycle: Mutex::new(None),
-            mount_ctx: Mutex::new(None),
             handoff: Mutex::new(HandleHandoff::Preparing),
         })
     }

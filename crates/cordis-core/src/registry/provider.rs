@@ -1,18 +1,16 @@
-//! Provider 记录的注册与撤销。
-//!
-//! 管理本地与隔离键上的服务实例，以及 Effect 诊断记录；解析路径见 `service/resolver`。
+//! Provider 的注册与撤销。
 
 use crate::{
-    CoreError, ServiceId,
+    Context, CoreError, ServiceId,
     effect::EffectScope,
-    registry::{NodeId, Registry, RegistryState},
-    service::{ErasedService, resolver::lookup_isolation},
+    registry::{Registry, RegistryState},
+    service::ErasedService,
 };
 use std::{any::TypeId, sync::Arc};
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(crate) enum ProviderKey {
-    Local { node: NodeId, service: ServiceId },
+    Local { context: usize, service: ServiceId },
     Isolated { isolation: u64, service: ServiceId },
 }
 
@@ -20,14 +18,14 @@ pub(crate) struct ProviderRecord {
     pub(crate) id: u64,
     pub(crate) value: ErasedService,
     pub(crate) effect_id: Option<u64>,
-    pub(crate) node: Option<NodeId>,
+    pub(crate) context: Context,
     pub(crate) isolation: Option<u64>,
 }
 
 pub(crate) struct EffectRecord {
     pub(crate) name: String,
     pub(crate) parent: Option<u64>,
-    pub(crate) node: Option<NodeId>,
+    pub(crate) context: Option<Context>,
     pub(crate) fiber_id: Option<u64>,
     pub(crate) scope: EffectScope,
 }
@@ -35,11 +33,11 @@ pub(crate) struct EffectRecord {
 impl Registry {
     pub(crate) fn resolve_with_id(
         &self,
-        node: NodeId,
+        context: &Context,
         key: ServiceId,
     ) -> Option<(u64, ErasedService)> {
         let state = self.state.lock().ok()?;
-        crate::service::resolver::resolve_provider(&state, node, key)
+        crate::service::resolver::resolve_provider(&state, context, key)
             .map(|provider| (provider.id, provider.value.clone()))
     }
 
@@ -48,7 +46,7 @@ impl Registry {
         id: u64,
         name: String,
         parent: Option<u64>,
-        node: Option<NodeId>,
+        context: Option<Context>,
         fiber_id: Option<u64>,
         scope: &EffectScope,
     ) {
@@ -58,7 +56,7 @@ impl Registry {
                 EffectRecord {
                     name,
                     parent,
-                    node,
+                    context,
                     fiber_id,
                     scope: scope.clone(),
                 },
@@ -84,19 +82,16 @@ impl Registry {
                 entry.insert(type_id);
                 Ok(())
             }
-            std::collections::hash_map::Entry::Occupied(entry) => {
-                if *entry.get() == type_id {
-                    Ok(())
-                } else {
-                    Err(CoreError::ServiceKeyTypeConflict { service: key })
-                }
+            std::collections::hash_map::Entry::Occupied(entry) if *entry.get() == type_id => Ok(()),
+            std::collections::hash_map::Entry::Occupied(_) => {
+                Err(CoreError::ServiceKeyTypeConflict { service: key })
             }
         }
     }
 
     pub(crate) fn provide(
         self: &Arc<Self>,
-        node: NodeId,
+        context: Context,
         key: ServiceId,
         value: ErasedService,
         owner: EffectScope,
@@ -108,13 +103,16 @@ impl Registry {
         {
             let mut state = self.state.lock().map_err(|_| CoreError::ContextDisposed)?;
             Self::lock_service_type(&mut state, key, value.type_id)?;
-            let isolation = lookup_isolation(&state, node, key);
+            let isolation = context.nearest_isolation(key).map(|label| label.id());
             let slot = match isolation {
-                Some(iso) => ProviderKey::Isolated {
-                    isolation: iso,
+                Some(isolation) => ProviderKey::Isolated {
+                    isolation,
                     service: key,
                 },
-                None => ProviderKey::Local { node, service: key },
+                None => ProviderKey::Local {
+                    context: context.identity(),
+                    service: key,
+                },
             };
             if state.providers.contains_key(&slot) {
                 return Err(CoreError::ServiceConflict { service: key });
@@ -125,7 +123,7 @@ impl Registry {
                     id: provider_id,
                     value,
                     effect_id: Some(owner.id()),
-                    node: Some(node),
+                    context,
                     isolation,
                 },
             );
@@ -155,9 +153,9 @@ impl Registry {
         }
     }
 
-    pub(crate) fn resolve(&self, node: NodeId, key: ServiceId) -> Option<ErasedService> {
+    pub(crate) fn resolve(&self, context: &Context, key: ServiceId) -> Option<ErasedService> {
         let state = self.state.lock().ok()?;
-        crate::service::resolver::resolve_provider(&state, node, key)
+        crate::service::resolver::resolve_provider(&state, context, key)
             .map(|provider| provider.value.clone())
     }
 }

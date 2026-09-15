@@ -3,9 +3,9 @@
 //! 负责注册、合约锁定与匹配选择；实际并行/串行/瀑布派发见 `dispatch`。
 
 use crate::{
-    CoreError,
+    Context, CoreError,
     effect::EffectScope,
-    registry::{ListenerId, NodeId, Registry, RegistryState},
+    registry::{ListenerId, Registry, RegistryState},
 };
 use async_trait::async_trait;
 use std::{
@@ -101,7 +101,7 @@ pub(crate) enum EventHandlerKind {
 
 pub(crate) struct EventListener {
     pub(crate) id: ListenerId,
-    pub(crate) node: NodeId,
+    pub(crate) context: Context,
     pub(crate) kind: EventHandlerKind,
     pub(crate) meta: ListenMeta,
 }
@@ -109,7 +109,7 @@ pub(crate) struct EventListener {
 impl Registry {
     pub(crate) fn subscribe_observe(
         self: &Arc<Self>,
-        node: NodeId,
+        context: Context,
         event_id: &'static str,
         type_id: TypeId,
         handler: ObserveHandler,
@@ -117,7 +117,7 @@ impl Registry {
         meta: ListenMeta,
     ) -> Result<ListenerId, CoreError> {
         self.subscribe_kind(
-            node,
+            context,
             event_id,
             EventMode::Observe,
             type_id,
@@ -130,7 +130,7 @@ impl Registry {
 
     pub(crate) fn subscribe_waterfall(
         self: &Arc<Self>,
-        node: NodeId,
+        context: Context,
         event_id: &'static str,
         type_id: TypeId,
         handler: WaterfallHandler,
@@ -138,7 +138,7 @@ impl Registry {
         meta: ListenMeta,
     ) -> Result<ListenerId, CoreError> {
         self.subscribe_kind(
-            node,
+            context,
             event_id,
             EventMode::Waterfall,
             type_id,
@@ -152,7 +152,7 @@ impl Registry {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn subscribe_serial(
         self: &Arc<Self>,
-        node: NodeId,
+        context: Context,
         event_id: &'static str,
         payload: TypeId,
         answer: TypeId,
@@ -161,7 +161,7 @@ impl Registry {
         meta: ListenMeta,
     ) -> Result<ListenerId, CoreError> {
         self.subscribe_kind(
-            node,
+            context,
             event_id,
             EventMode::Serial,
             payload,
@@ -174,7 +174,7 @@ impl Registry {
 
     pub(crate) fn subscribe_parallel(
         self: &Arc<Self>,
-        node: NodeId,
+        context: Context,
         event_id: &'static str,
         type_id: TypeId,
         handler: Arc<dyn ParallelHandlerErased>,
@@ -182,7 +182,7 @@ impl Registry {
         meta: ListenMeta,
     ) -> Result<ListenerId, CoreError> {
         self.subscribe_kind(
-            node,
+            context,
             event_id,
             EventMode::Parallel,
             type_id,
@@ -196,7 +196,7 @@ impl Registry {
     #[allow(clippy::too_many_arguments)]
     fn subscribe_kind(
         self: &Arc<Self>,
-        node: NodeId,
+        context: Context,
         event_id: &'static str,
         mode: EventMode,
         payload: TypeId,
@@ -215,7 +215,7 @@ impl Registry {
             let list = state.listeners.entry(event_id).or_default();
             let listener = EventListener {
                 id,
-                node,
+                context,
                 kind,
                 meta,
             };
@@ -248,7 +248,7 @@ impl Registry {
     pub(crate) fn select_matching_listeners<'a>(
         state: &'a RegistryState,
         event_id: &'static str,
-        emitter: NodeId,
+        emitter: &Context,
         mode: EventMode,
     ) -> Result<Vec<&'a EventListener>, CoreError> {
         let Some(listeners) = state.listeners.get(event_id) else {
@@ -269,7 +269,7 @@ impl Registry {
             }
             if listener.meta.global {
                 globals.push(listener);
-            } else if is_ancestor_or_self(state, listener.node, emitter) {
+            } else if emitter.is_descendant_of(&listener.context) {
                 locals.push(listener);
             }
         }
@@ -321,15 +321,4 @@ impl Registry {
             }
         }
     }
-}
-
-fn is_ancestor_or_self(state: &RegistryState, maybe_ancestor: NodeId, node: NodeId) -> bool {
-    let mut current = Some(node);
-    while let Some(id) = current {
-        if id == maybe_ancestor {
-            return true;
-        }
-        current = state.nodes.get(&id).and_then(|item| item.parent);
-    }
-    false
 }

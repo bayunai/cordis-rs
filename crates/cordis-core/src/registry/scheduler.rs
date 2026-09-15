@@ -249,7 +249,7 @@ impl Registry {
                 let Ok(state) = self.state.lock() else {
                     continue;
                 };
-                provider_ids(&state, fiber.node, &deps)
+                provider_ids(&state, &fiber.context, &deps)
             };
             let state = *fiber.state.lock().expect("state");
             if state == FiberState::Active && resolved != providers {

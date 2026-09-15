@@ -74,7 +74,7 @@ cargo run -p cordis-core --example reactive
 ## 语义摘要
 
 - `Runtime::new()` 须在 Tokio 中调用；专用调度器处理 dirty 重算。
-- `Context::extend()`：创建不拥有独立生命周期的派生视图。
+- `Context::extend()`：创建不拥有独立生命周期、也不登记 Runtime 节点的不可变派生视图；无引用后自动回收。
 - `isolate` / `isolate_with`：创建仅对派生视图生效的 ServiceKey 隔离标签（不可跨 Runtime）。
 - Context 不可释放；资源由 `Runtime`、`EffectContext` 或 `Fiber` 持有和释放。Fiber 在重启、替换或依赖变更时会先进入 `Unloading`，旧任务退出后才重新激活。
 - `Context::plugin` 返回 `Fiber`（`restart` / 同 Key `replace` / `dispose_wait`）；跨 Key 用 `Runtime::unmount`。

@@ -20,9 +20,9 @@ mod service;
 pub use config::{ConfigId, ConfigKey};
 pub use context::{Context, EffectContext, InjectionHandle, InjectionState};
 pub use diagnostics::{
-    ContextIsolationSnapshot, ContextSnapshot, EffectSnapshot, FiberStateSnapshot,
-    InjectFiberSnapshot, IsolationSnapshot, PluginFiberSnapshot, PluginRegistryFiberSnapshot,
-    PluginRegistrySnapshot, ProviderSnapshot, RuntimeSnapshot,
+    EffectSnapshot, FiberStateSnapshot, InjectFiberSnapshot, IsolationSnapshot,
+    PluginFiberSnapshot, PluginRegistryFiberSnapshot, PluginRegistrySnapshot, ProviderSnapshot,
+    RuntimeSnapshot,
 };
 pub use effect::EffectHandle;
 pub use error::CoreError;

@@ -19,7 +19,7 @@ use crate::{
     fiber::{Fiber, FiberInner, FiberState},
     isolation::IsolationLabel,
     plugin::{Plugin, read_metadata},
-    registry::{NodeId, Registry},
+    registry::Registry,
     service::ErasedService,
 };
 use std::{
@@ -30,8 +30,14 @@ use std::{
 };
 
 pub(crate) struct ContextInner {
-    pub(crate) id: NodeId,
-    pub(crate) registry: Arc<Registry>,
+    /// 视图身份与资源 Scope 分离；同一视图换入 Effect Scope 时仍占用同一 Service 槽位。
+    pub(crate) identity: Arc<()>,
+    /// 父视图只存在于 `Context` 的 Arc 链中；不写入 Registry。
+    pub(crate) parent: Option<Context>,
+    pub(crate) isolations: HashMap<ServiceId, IsolationLabel>,
+    pub(crate) configs: HashMap<crate::config::ConfigId, crate::config::ErasedConfig>,
+    /// Registry 反向持有资源记录时不能形成 Context ↔ Registry 环。
+    pub(crate) registry: std::sync::Weak<Registry>,
     pub(crate) scope: EffectScope,
 }
 
@@ -55,22 +61,12 @@ impl Context {
         configs: HashMap<crate::config::ConfigId, crate::config::ErasedConfig>,
     ) -> Result<Self, CoreError> {
         self.ensure_alive()?;
-        let id = self.inner.registry.allocate_id();
-        self.inner.registry.add_node(
-            id,
-            Some(self.inner.id),
-            isolations
-                .into_iter()
-                .map(|(key, label)| (key, label.id()))
-                .collect(),
-            configs,
-        )?;
-        self.inner
-            .registry
-            .bind_node_lifecycle(id, &self.inner.scope);
         Ok(Self {
             inner: Arc::new(ContextInner {
-                id,
+                identity: Arc::new(()),
+                parent: Some(self.clone()),
+                isolations,
+                configs,
                 registry: self.inner.registry.clone(),
                 scope: self.inner.scope.clone(),
             }),
@@ -83,7 +79,7 @@ impl Context {
         key: ServiceKey<T>,
     ) -> Result<(Self, IsolationLabel), CoreError> {
         self.ensure_alive()?;
-        let label = self.inner.registry.allocate_isolation_label();
+        let label = self.registry()?.allocate_isolation_label();
         let view = self.extend_with(HashMap::from([(key.id(), label.clone())]), HashMap::new())?;
         Ok((view, label))
     }
@@ -95,7 +91,7 @@ impl Context {
         label: IsolationLabel,
     ) -> Result<Self, CoreError> {
         self.ensure_alive()?;
-        label.ensure_runtime(self.inner.registry.runtime_token())?;
+        label.ensure_runtime(self.registry()?.runtime_token())?;
         self.extend_with(HashMap::from([(key.id(), label)]), HashMap::new())
     }
 
@@ -106,6 +102,7 @@ impl Context {
         value: T,
     ) -> Result<Self, CoreError> {
         self.ensure_alive()?;
+        self.registry()?.lock_config_type(key.id(), key.type_id())?;
         self.extend_with(
             HashMap::new(),
             HashMap::from([(
@@ -121,10 +118,9 @@ impl Context {
     /// 自当前节点向父解析最近配置覆盖。
     pub fn config<T: Send + Sync + 'static>(&self, key: ConfigKey<T>) -> Result<Arc<T>, CoreError> {
         self.ensure_alive()?;
-        let erased = self
-            .inner
-            .registry
-            .resolve_config(self.inner.id, key.id(), key.type_id())?;
+        self.registry()?
+            .check_config_type(key.id(), key.type_id())?;
+        let erased = self.resolve_config(key.id(), key.type_id())?;
         Arc::downcast::<T>(erased).map_err(|_| CoreError::ConfigTypeMismatch { config: key.id() })
     }
 
@@ -135,8 +131,8 @@ impl Context {
         service: T,
     ) -> Result<(), CoreError> {
         self.ensure_alive()?;
-        self.inner.registry.provide(
-            self.inner.id,
+        self.registry()?.provide(
+            self.clone(),
             key.id(),
             ErasedService {
                 type_id: key.type_id(),
@@ -149,7 +145,7 @@ impl Context {
     /// 立即取得当前 Context 或其祖先可见的 Service。
     pub fn get<T: Send + Sync + 'static>(&self, key: ServiceKey<T>) -> Result<Arc<T>, CoreError> {
         self.ensure_alive()?;
-        let Some(service) = self.inner.registry.resolve(self.inner.id, key.id()) else {
+        let Some(service) = self.registry()?.resolve(self, key.id()) else {
             return Err(CoreError::ServiceUnavailable { service: key.id() });
         };
         if service.type_id != key.type_id() {
@@ -175,18 +171,22 @@ impl Context {
         let parent = self.inner.scope.clone();
         let template = self.clone();
         let callback = Arc::new(move |services: Services, child: EffectScope| {
-            template.inner.registry.register_effect(
+            let registry = template.registry().expect("live injection context");
+            registry.register_effect(
                 child.id(),
                 child.name().to_string(),
                 child.parent_id(),
-                Some(template.inner.id),
+                Some(template.clone()),
                 None,
                 &child,
             );
             let context = EffectContext {
                 context: Context {
                     inner: Arc::new(ContextInner {
-                        id: template.inner.id,
+                        parent: template.inner.parent.clone(),
+                        identity: template.inner.identity.clone(),
+                        isolations: template.inner.isolations.clone(),
+                        configs: template.inner.configs.clone(),
                         registry: template.inner.registry.clone(),
                         scope: child,
                     }),
@@ -195,15 +195,12 @@ impl Context {
             Box::pin(callback(services, context))
                 as std::pin::Pin<Box<dyn Future<Output = Result<(), CoreError>> + Send>>
         });
-        let id = self.inner.registry.register_injection(
-            self.inner.id,
-            parent,
-            dependencies,
-            callback,
-        )?;
+        let id =
+            self.registry()?
+                .register_injection(self.clone(), parent, dependencies, callback)?;
         Ok(InjectionHandle {
             id,
-            registry: Arc::downgrade(&self.inner.registry),
+            registry: self.inner.registry.clone(),
         })
     }
 
@@ -216,18 +213,21 @@ impl Context {
     pub fn effect_named(&self, name: &'static str) -> Result<EffectContext, CoreError> {
         self.ensure_alive()?;
         let scope = self.inner.scope.child_named(name);
-        self.inner.registry.register_effect(
+        self.registry()?.register_effect(
             scope.id(),
             scope.name().to_string(),
             scope.parent_id(),
-            Some(self.inner.id),
+            Some(self.clone()),
             None,
             &scope,
         );
         Ok(EffectContext {
             context: Context {
                 inner: Arc::new(ContextInner {
-                    id: self.inner.id,
+                    parent: self.inner.parent.clone(),
+                    identity: self.inner.identity.clone(),
+                    isolations: self.inner.isolations.clone(),
+                    configs: self.inner.configs.clone(),
                     registry: self.inner.registry.clone(),
                     scope,
                 }),
@@ -242,13 +242,14 @@ impl Context {
         self.ensure_alive()?;
         let metadata = read_metadata(plugin.as_ref())?;
         let plugin_key = metadata.key;
-        let id = self.inner.registry.allocate_id();
+        let registry = self.registry()?;
+        let id = registry.allocate_id();
         let dependencies = metadata.dependencies;
         let inner = Arc::new(FiberInner {
             id,
             plugin_key,
-            node: self.inner.id,
-            registry: Arc::downgrade(&self.inner.registry),
+            context: self.clone(),
+            registry: self.inner.registry.clone(),
             parent_scope: self.inner.scope.clone(),
             plugin: Mutex::new(plugin),
             dependencies: Mutex::new(dependencies),
@@ -260,7 +261,6 @@ impl Context {
             disposed: std::sync::atomic::AtomicBool::new(false),
             busy: Mutex::new(false),
             lifecycle: Mutex::new(None),
-            mount_ctx: Mutex::new(Some(self.clone())),
             handoff: Mutex::new(crate::fiber::HandleHandoff::Preparing),
         });
         // 先挂父释放钩子，再以 Preparing 状态登记到分组。登记会先拒绝同 Key
@@ -272,7 +272,7 @@ impl Context {
                 fiber.dispose_now();
             }
         });
-        self.inner.registry.register_plugin_fiber(inner.clone())?;
+        registry.register_plugin_fiber(inner.clone())?;
         inner.publish_initial_state();
         let completion = match inner.start_lifecycle(crate::fiber::LifecycleOp::Activate {
             initial_mount: true,
@@ -332,8 +332,8 @@ impl Context {
             };
             handler(value)
         });
-        let listener_id = self.inner.registry.subscribe_observe(
-            self.inner.id,
+        let listener_id = self.registry()?.subscribe_observe(
+            self.clone(),
             event_id,
             type_id,
             wrapped,
@@ -350,9 +350,8 @@ impl Context {
         payload: &T,
     ) -> Result<(), CoreError> {
         self.ensure_alive()?;
-        self.inner
-            .registry
-            .emit_event(self.inner.id, key.id(), key.type_id(), payload)
+        self.registry()?
+            .emit_event(self, key.id(), key.type_id(), payload)
     }
 
     /// 订阅 Waterfall；须 `next.call(...)` 委托下游，否则短路。
@@ -413,8 +412,8 @@ impl Context {
                         >,
                     >
             });
-        let listener_id = self.inner.registry.subscribe_waterfall(
-            self.inner.id,
+        let listener_id = self.registry()?.subscribe_waterfall(
+            self.clone(),
             event_id,
             type_id,
             wrapped,
@@ -431,9 +430,8 @@ impl Context {
         value: T,
     ) -> Result<T, CoreError> {
         self.ensure_alive()?;
-        self.inner
-            .registry
-            .waterfall_event(self.inner.id, key.id(), value)
+        self.registry()?
+            .waterfall_event(self.clone(), key.id(), value)
             .await
     }
 
@@ -503,8 +501,8 @@ impl Context {
             handler: Arc::new(handler),
             _marker: std::marker::PhantomData,
         });
-        let listener_id = self.inner.registry.subscribe_serial(
-            self.inner.id,
+        let listener_id = self.registry()?.subscribe_serial(
+            self.clone(),
             event_id,
             key.payload_type_id(),
             key.answer_type_id(),
@@ -522,10 +520,7 @@ impl Context {
         payload: &T,
     ) -> Result<Option<R>, CoreError> {
         self.ensure_alive()?;
-        self.inner
-            .registry
-            .serial_event(self.inner.id, key.id(), payload)
-            .await
+        self.registry()?.serial_event(self, key.id(), payload).await
     }
 
     /// 订阅 Parallel。
@@ -585,8 +580,8 @@ impl Context {
             handler: Arc::new(handler),
             _marker: std::marker::PhantomData,
         });
-        let listener_id = self.inner.registry.subscribe_parallel(
-            self.inner.id,
+        let listener_id = self.registry()?.subscribe_parallel(
+            self.clone(),
             event_id,
             key.type_id(),
             wrapped,
@@ -603,14 +598,13 @@ impl Context {
         payload: &T,
     ) -> Result<(), CoreError> {
         self.ensure_alive()?;
-        self.inner
-            .registry
-            .parallel_event(self.inner.id, key.id(), key.type_id(), payload)
+        self.registry()?
+            .parallel_event(self, key.id(), key.type_id(), payload)
             .await
     }
 
     fn unsubscribe_handle(&self, event_id: &'static str, listener_id: u64) -> Unsubscribe {
-        let registry = Arc::downgrade(&self.inner.registry);
+        let registry = self.inner.registry.clone();
         Unsubscribe::new(move || {
             if let Some(registry) = registry.upgrade() {
                 registry.unsubscribe_event(event_id, listener_id);
@@ -628,11 +622,89 @@ impl Context {
     }
 
     pub(crate) fn ensure_alive(&self) -> Result<(), CoreError> {
-        if self.is_disposed() {
+        if self.is_disposed() || self.inner.registry.upgrade().is_none() {
             Err(CoreError::ContextDisposed)
         } else {
             Ok(())
         }
+    }
+
+    pub(crate) fn registry(&self) -> Result<Arc<Registry>, CoreError> {
+        self.inner
+            .registry
+            .upgrade()
+            .ok_or(CoreError::ContextDisposed)
+    }
+
+    pub(crate) fn identity(&self) -> usize {
+        Arc::as_ptr(&self.inner.identity) as usize
+    }
+
+    pub(crate) fn is_descendant_of(&self, ancestor: &Context) -> bool {
+        let mut current = Some(self.clone());
+        while let Some(view) = current {
+            if view.identity() == ancestor.identity() {
+                return true;
+            }
+            current = view.inner.parent.clone();
+        }
+        false
+    }
+
+    pub(crate) fn parent(&self) -> Option<Context> {
+        self.inner.parent.clone()
+    }
+
+    pub(crate) fn with_scope(&self, scope: EffectScope) -> Context {
+        Context {
+            inner: Arc::new(ContextInner {
+                identity: self.inner.identity.clone(),
+                parent: self.inner.parent.clone(),
+                isolations: self.inner.isolations.clone(),
+                configs: self.inner.configs.clone(),
+                registry: self.inner.registry.clone(),
+                scope,
+            }),
+        }
+    }
+
+    pub(crate) fn context_depth(&self) -> usize {
+        let mut depth = 0;
+        let mut current = self.inner.parent.clone();
+        while let Some(view) = current {
+            depth += 1;
+            current = view.inner.parent.clone();
+        }
+        depth
+    }
+
+    pub(crate) fn nearest_isolation(&self, key: ServiceId) -> Option<IsolationLabel> {
+        let mut current = Some(self.clone());
+        while let Some(view) = current {
+            if let Some(label) = view.inner.isolations.get(&key) {
+                return Some(label.clone());
+            }
+            current = view.inner.parent.clone();
+        }
+        None
+    }
+
+    fn resolve_config(
+        &self,
+        key: crate::config::ConfigId,
+        type_id: std::any::TypeId,
+    ) -> Result<Arc<dyn Any + Send + Sync>, CoreError> {
+        let mut current = Some(self.clone());
+        while let Some(view) = current {
+            if let Some(config) = view.inner.configs.get(&key) {
+                if config.type_id != type_id {
+                    return Err(CoreError::ConfigTypeMismatch { config: key });
+                }
+                return Ok(config.value.clone());
+            }
+            current = view.inner.parent.clone();
+        }
+        Err(CoreError::ConfigUnavailable { config: key })
     }
 }
 

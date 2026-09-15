@@ -43,18 +43,15 @@ async fn cross_context_isolation() {
 }
 
 #[tokio::test]
-async fn effect_dispose_removes_extended_nodes_from_diagnostics() {
+async fn effect_dispose_removes_resources_registered_from_extended_view() {
     let runtime = runtime();
     let root = runtime.root();
-    let before = runtime.diagnostics().contexts.len();
     let owner = root.effect().unwrap();
     let child = owner.extend().unwrap();
     child.provide(NUMBER, Number(1)).unwrap();
     child.on(PING, |_| Ok(())).unwrap();
-    assert_eq!(runtime.diagnostics().contexts.len(), before + 1);
     assert!(!runtime.diagnostics().providers.is_empty());
     owner.dispose();
-    assert_eq!(runtime.diagnostics().contexts.len(), before);
     assert!(runtime.diagnostics().providers.is_empty());
     root.emit(PING, &Ping(1)).unwrap();
 }
@@ -138,13 +135,8 @@ async fn intercept_overrides_config_without_mutating_parent() {
     assert_eq!(nested.config(THEME).unwrap().0, "oled");
     assert_eq!(child.config(THEME).unwrap().0, "dark");
 
-    let snap = runtime.diagnostics();
-    assert!(
-        snap.contexts
-            .iter()
-            .any(|ctx| ctx.config_keys.contains(&"test.theme@1"))
-    );
-    assert!(!format!("{snap:?}").contains("oled"));
+    // 纯派生 Context 不进入 Runtime diagnostics，也不暴露配置载荷。
+    assert!(!format!("{:?}", runtime.diagnostics()).contains("oled"));
 }
 
 #[tokio::test]
@@ -162,19 +154,16 @@ async fn intercept_type_conflict_and_plugin_can_read_config() {
     let runtime = runtime();
     let root = runtime.root();
     let scoped = root.intercept(FLAG, Flag(true)).unwrap();
-    let context_count = runtime.diagnostics().contexts.len();
     assert!(matches!(
         root.intercept(FLAG_AS_OTHER, OtherFlag),
         Err(CoreError::ConfigKeyTypeConflict { .. })
     ));
-    assert_eq!(runtime.diagnostics().contexts.len(), context_count);
     for _ in 0..3 {
         assert!(matches!(
             root.intercept(FLAG_AS_OTHER, OtherFlag),
             Err(CoreError::ConfigKeyTypeConflict { .. })
         ));
     }
-    assert_eq!(runtime.diagnostics().contexts.len(), context_count);
     assert!(matches!(
         scoped.config(FLAG_AS_OTHER),
         Err(CoreError::ConfigTypeMismatch { .. })
@@ -194,4 +183,28 @@ async fn intercept_type_conflict_and_plugin_can_read_config() {
     let mut fiber = scoped.plugin(Arc::new(ConfigReader)).await.unwrap();
     assert_eq!(fiber.state(), FiberState::Active);
     fiber.dispose();
+}
+
+#[tokio::test]
+async fn discarded_root_views_do_not_create_runtime_resources() {
+    use cordis_core::ConfigKey;
+
+    #[derive(Debug)]
+    struct Flag;
+    static FLAG: ConfigKey<Flag> = ConfigKey::new("test.discarded-view@1");
+
+    let runtime = runtime();
+    let root = runtime.root();
+    let before = runtime.diagnostics();
+    for _ in 0..1_000 {
+        let view = root.extend().unwrap();
+        let (view, label) = view.isolate(NUMBER).unwrap();
+        let _ = view.isolate_with(NUMBER, label).unwrap();
+        let _ = root.intercept(FLAG, Flag).unwrap();
+    }
+    let after = runtime.diagnostics();
+    assert_eq!(after.providers.len(), before.providers.len());
+    assert_eq!(after.effects.len(), before.effects.len());
+    assert_eq!(after.plugin_fibers.len(), before.plugin_fibers.len());
+    assert_eq!(after.inject_fibers.len(), before.inject_fibers.len());
 }

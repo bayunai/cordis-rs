@@ -23,7 +23,6 @@ pub enum FiberState {
 pub struct FiberStateChange {
     pub fiber_id: u64,
     pub plugin_key: PluginKey,
-    pub node: u64,
     pub previous: Option<FiberState>,
     pub current: FiberState,
 }
@@ -40,7 +39,6 @@ impl FiberInner {
             registry.publish_fiber_state(FiberStateChange {
                 fiber_id: self.id,
                 plugin_key: self.plugin_key,
-                node: self.node,
                 previous: None,
                 current: FiberState::Pending,
             });
@@ -55,7 +53,6 @@ impl FiberInner {
             registry.publish_fiber_state(FiberStateChange {
                 fiber_id: self.id,
                 plugin_key: self.plugin_key,
-                node: self.node,
                 previous: Some(previous),
                 current,
             });

@@ -70,7 +70,7 @@ impl FiberInner {
     ) -> Option<Vec<u64>> {
         let mut providers = Vec::with_capacity(deps.len());
         for key in deps {
-            let service = registry.resolve_with_id(self.node, *key)?;
+            let service = registry.resolve_with_id(&self.context, *key)?;
             providers.push(service.0);
         }
         Some(providers)
@@ -211,27 +211,12 @@ impl FiberInner {
             Ok(scope) => scope,
             Err(error) => return Err(error),
         };
-        let mount = match self.mount_ctx.lock().expect("mount").clone() {
-            Some(ctx) => ctx,
-            None => {
-                self.abandon_loading_to_pending(Some(&effect_scope), false);
-                *self.last_error.lock().expect("error") = Some("mount context missing".into());
-                let _ = self.transition_if_alive(FiberState::Failed);
-                return Err(CoreError::ContextDisposed);
-            }
-        };
-        let apply_ctx = Context {
-            inner: Arc::new(crate::context::ContextInner {
-                id: mount.inner.id,
-                registry: mount.inner.registry.clone(),
-                scope: effect_scope.clone(),
-            }),
-        };
+        let apply_ctx = self.context.with_scope(effect_scope.clone());
         registry.register_effect(
             effect_scope.id(),
             effect_scope.name().to_string(),
             effect_scope.parent_id(),
-            Some(mount.inner.id),
+            Some(self.context.clone()),
             Some(self.id),
             &effect_scope,
         );
@@ -340,11 +325,17 @@ mod initial_mount_revoke_tests {
             .build()
             .expect("runtime");
         let handle = runtime.handle().clone();
+        let core = {
+            let _entered = runtime.enter();
+            crate::Runtime::new().expect("core runtime")
+        };
+        let context = core.root();
         std::mem::forget(runtime);
+        std::mem::forget(core);
         Arc::new(FiberInner {
             id: 1,
             plugin_key: PluginKey::new("test.unit-abandon-before-apply"),
-            node: 0,
+            context,
             registry: Weak::new(),
             parent_scope: crate::effect::EffectScope::root(handle),
             plugin: Mutex::new(Arc::new(CountingPlugin { applies })),
@@ -357,7 +348,6 @@ mod initial_mount_revoke_tests {
             disposed: AtomicBool::new(false),
             busy: Mutex::new(false),
             lifecycle: Mutex::new(None),
-            mount_ctx: Mutex::new(None),
             handoff: Mutex::new(HandleHandoff::Abandoned),
         })
     }
