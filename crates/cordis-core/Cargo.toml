@@ -14,9 +14,25 @@ tokio = { workspace = true, features = ["macros", "rt", "sync"] }
 tokio-util.workspace = true
 
 [dev-dependencies]
+axum.workspace = true
 cordis-testkit.workspace = true
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
+reqwest.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time", "net"] }
 
 [[example]]
 name = "reactive"
 path = "../../examples/reactive.rs"
+
+[[example]]
+name = "plugin_hotplug"
+path = "../../examples/plugin_hotplug.rs"
+
+[[example]]
+name = "plugin_web"
+path = "../../examples/plugin_web.rs"
+
+[[example]]
+name = "plugin_stack"
+path = "../../examples/plugin_stack/main.rs"

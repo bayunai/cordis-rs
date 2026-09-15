@@ -42,16 +42,16 @@ pub(crate) struct FiberInner {
     pub(crate) effect: Mutex<Option<EffectScope>>,
     /// 激活中尚未提交的临时 Plugin Scope。
     pub(crate) pending_effect: Mutex<Option<EffectScope>>,
-    /// `dispose_now` 后仍可用于 `dispose_wait` 的 Scope 克隆。
+    /// 在途 Effect 释放：unload / dispose 登记后可见，直至 DisposeCompletion 结束。
     pub(crate) pending_wait: Mutex<Option<EffectScope>>,
+    /// 本轮 Fiber 释放的最终结果；供延迟 `dispose_wait` 读取同一错误。
+    pub(crate) dispose_result: Mutex<Option<Result<(), crate::CoreError>>>,
     pub(crate) state: Mutex<FiberState>,
     pub(crate) last_error: Mutex<Option<String>>,
     pub(crate) resolved_providers: Mutex<Vec<u64>>,
     pub(crate) disposed: AtomicBool,
     pub(crate) busy: Mutex<bool>,
     pub(crate) lifecycle: Mutex<Option<Arc<LifecycleCompletion>>>,
-    /// 首次挂载调用方取消 wait 时置位。
-    pub(crate) caller_cancelled: AtomicBool,
     pub(crate) mount_ctx: Mutex<Option<Context>>,
 }
 
@@ -159,13 +159,13 @@ mod claim_tests {
             effect: Mutex::new(None),
             pending_effect: Mutex::new(None),
             pending_wait: Mutex::new(None),
+            dispose_result: Mutex::new(None),
             state: Mutex::new(FiberState::Pending),
             last_error: Mutex::new(None),
             resolved_providers: Mutex::new(Vec::new()),
             disposed: AtomicBool::new(false),
             busy: Mutex::new(false),
             lifecycle: Mutex::new(None),
-            caller_cancelled: AtomicBool::new(false),
             mount_ctx: Mutex::new(None),
         })
     }

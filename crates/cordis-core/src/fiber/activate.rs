@@ -110,7 +110,14 @@ impl FiberInner {
     }
 
     fn should_revoke_initial_mount(&self, initial_mount: bool) -> bool {
-        initial_mount && self.caller_cancelled.load(Ordering::Acquire)
+        if !initial_mount {
+            return false;
+        }
+        self.lifecycle
+            .lock()
+            .ok()
+            .and_then(|slot| slot.as_ref().map(|c| c.abandon_handle_requested()))
+            .unwrap_or(false)
     }
 
     /// 协调器内激活主体；`initial_mount` 时尊重调用方取消撤销。
@@ -249,5 +256,78 @@ impl FiberInner {
             Err(CoreError::FiberBusy) => Ok(()),
             Err(error) => Err(error),
         }
+    }
+}
+
+#[cfg(test)]
+mod initial_mount_revoke_tests {
+    use crate::{
+        Context, CoreError,
+        fiber::{FiberInner, FiberState, coordinator::LifecycleCompletion},
+        plugin::{Plugin, PluginKey},
+    };
+    use async_trait::async_trait;
+    use std::sync::{
+        Arc, Mutex, Weak,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
+
+    struct CountingPlugin {
+        applies: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Plugin for CountingPlugin {
+        fn key(&self) -> PluginKey {
+            PluginKey::new("test.unit-abandon-before-apply")
+        }
+        async fn apply(&self, _ctx: &Context) -> Result<(), CoreError> {
+            self.applies.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    fn fiber_with_abandon(applies: Arc<AtomicUsize>) -> Arc<FiberInner> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let handle = runtime.handle().clone();
+        std::mem::forget(runtime);
+        let completion = LifecycleCompletion::new();
+        completion.request_abandon_handle();
+        Arc::new(FiberInner {
+            id: 1,
+            plugin_key: PluginKey::new("test.unit-abandon-before-apply"),
+            node: 0,
+            registry: Weak::new(),
+            parent_scope: crate::effect::EffectScope::root(handle),
+            plugin: Mutex::new(Arc::new(CountingPlugin { applies })),
+            dependencies: Mutex::new(Vec::new()),
+            effect: Mutex::new(None),
+            pending_effect: Mutex::new(None),
+            pending_wait: Mutex::new(None),
+            dispose_result: Mutex::new(None),
+            state: Mutex::new(FiberState::Pending),
+            last_error: Mutex::new(None),
+            resolved_providers: Mutex::new(Vec::new()),
+            disposed: AtomicBool::new(false),
+            busy: Mutex::new(false),
+            lifecycle: Mutex::new(Some(completion)),
+            mount_ctx: Mutex::new(None),
+        })
+    }
+
+    #[tokio::test]
+    async fn abandon_before_apply_revokes_without_invoking_apply() {
+        let applies = Arc::new(AtomicUsize::new(0));
+        let fiber = fiber_with_abandon(applies.clone());
+        let error = fiber
+            .activate_with_policy(true)
+            .await
+            .expect_err("should revoke");
+        assert!(matches!(error, CoreError::FiberDisposed));
+        assert_eq!(applies.load(Ordering::SeqCst), 0);
+        assert!(fiber.disposed.load(Ordering::Acquire));
     }
 }

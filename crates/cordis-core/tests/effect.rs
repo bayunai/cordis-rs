@@ -931,3 +931,67 @@ async fn async_disposer_shutdown_fails_fast_without_blocking_coordinator() {
     }
     assert!(runtime.scheduler_stopped());
 }
+
+// P1-4: 期望子 AwaitLocal（dispose_wait）进行中时，父 dispose_wait 不得先结束。
+// 现状：子 detach 后父可能在子 async disposer 完成前返回。
+#[tokio::test]
+#[ignore = "P1: AwaitLocal child detach races parent dispose_wait"]
+async fn p1_parent_dispose_wait_awaits_await_local_child_async_disposer() {
+    let runtime = runtime();
+    let root = runtime.root();
+    let parent = root.effect().unwrap();
+    let child = parent.extend().unwrap().effect().unwrap();
+    let (entered_tx, entered_rx) = oneshot::channel::<()>();
+    let (release_tx, release_rx) = oneshot::channel::<()>();
+    let entered_tx = Arc::new(Mutex::new(Some(entered_tx)));
+    let release_rx = Arc::new(Mutex::new(Some(release_rx)));
+    let async_done = Arc::new(AtomicBool::new(false));
+    let flag = async_done.clone();
+
+    child
+        .on_dispose_async(move || {
+            let entered_tx = entered_tx.clone();
+            let release_rx = release_rx.clone();
+            let flag = flag.clone();
+            async move {
+                if let Some(tx) = entered_tx.lock().expect("entered").take() {
+                    let _ = tx.send(());
+                }
+                let receiver = release_rx.lock().expect("release").take();
+                if let Some(rx) = receiver {
+                    let _ = rx.await;
+                }
+                flag.store(true, Ordering::SeqCst);
+                Ok(())
+            }
+        })
+        .unwrap();
+
+    let child_task = tokio::spawn(async move { child.dispose_wait().await });
+    entered_rx.await.expect("child disposer entered");
+
+    let parent_while_gated =
+        tokio::time::timeout(std::time::Duration::from_millis(100), parent.dispose_wait()).await;
+    assert!(
+        parent_while_gated.is_err(),
+        "parent dispose_wait must not finish while child async disposer is gated; got {parent_while_gated:?}"
+    );
+    assert!(
+        !async_done.load(Ordering::SeqCst),
+        "child disposer should still be gated"
+    );
+
+    let _ = release_tx.send(());
+    tokio::time::timeout(std::time::Duration::from_secs(2), child_task)
+        .await
+        .expect("child dispose_wait timed out")
+        .expect("join")
+        .expect("child dispose_wait");
+    // 父可能已在超时路径启动；再 wait 同一 completion。
+    tokio::time::timeout(std::time::Duration::from_secs(2), parent.dispose_wait())
+        .await
+        .expect("parent dispose_wait timed out")
+        .expect("parent dispose_wait");
+    assert!(async_done.load(Ordering::SeqCst));
+    runtime.shutdown().await.expect("shutdown");
+}

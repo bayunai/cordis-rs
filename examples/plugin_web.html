@@ -1,0 +1,319 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Cordis Plugin Hotplug</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap"
+      rel="stylesheet"
+    />
+    <style>
+      :root {
+        --bg: #12151a;
+        --panel: #1a1f27;
+        --panel-2: #222833;
+        --line: #2e3644;
+        --text: #e8edf5;
+        --muted: #8b96a8;
+        --accent: #e2a65c;
+        --ok: #6fbf8a;
+        --warn: #d4a017;
+        --off: #6b7382;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        min-height: 100vh;
+        font-family: "IBM Plex Sans", sans-serif;
+        color: var(--text);
+        background:
+          radial-gradient(1200px 600px at 10% -10%, #243044 0%, transparent 55%),
+          radial-gradient(900px 500px at 100% 0%, #2a2218 0%, transparent 45%),
+          var(--bg);
+      }
+      main {
+        max-width: 1080px;
+        margin: 0 auto;
+        padding: 2rem 1.25rem 3rem;
+      }
+      h1 {
+        margin: 0 0 0.35rem;
+        font-size: 1.65rem;
+        font-weight: 600;
+        letter-spacing: -0.02em;
+      }
+      .sub {
+        color: var(--muted);
+        margin: 0 0 1.75rem;
+        font-size: 0.95rem;
+      }
+      .grid {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 0.9rem;
+        margin-bottom: 1rem;
+      }
+      @media (max-width: 820px) {
+        .grid {
+          grid-template-columns: 1fr;
+        }
+      }
+      .card {
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        padding: 1rem 1.05rem;
+      }
+      .card h2 {
+        margin: 0;
+        font-size: 1.05rem;
+        font-weight: 600;
+      }
+      .meta {
+        margin: 0.35rem 0 0.85rem;
+        color: var(--muted);
+        font-size: 0.82rem;
+        font-family: "IBM Plex Mono", monospace;
+      }
+      .row {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.45rem;
+      }
+      button {
+        font: inherit;
+        border: 1px solid var(--line);
+        background: var(--panel-2);
+        color: var(--text);
+        border-radius: 7px;
+        padding: 0.4rem 0.75rem;
+        cursor: pointer;
+      }
+      button:hover:not(:disabled) {
+        border-color: var(--accent);
+        color: var(--accent);
+      }
+      button:disabled {
+        opacity: 0.4;
+        cursor: not-allowed;
+      }
+      button.primary {
+        background: #3a2f1f;
+        border-color: #6a5130;
+        color: var(--accent);
+      }
+      .pill {
+        display: inline-block;
+        font-family: "IBM Plex Mono", monospace;
+        font-size: 0.75rem;
+        padding: 0.15rem 0.5rem;
+        border-radius: 999px;
+        border: 1px solid var(--line);
+        color: var(--off);
+      }
+      .pill.on {
+        color: var(--ok);
+        border-color: #355844;
+      }
+      .pill.pending {
+        color: var(--warn);
+        border-color: #6a5a20;
+      }
+      .panel {
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        padding: 0.9rem 1rem;
+        margin-top: 0.9rem;
+      }
+      .panel h3 {
+        margin: 0 0 0.6rem;
+        font-size: 0.9rem;
+        font-weight: 500;
+        color: var(--muted);
+      }
+      #registry {
+        font-family: "IBM Plex Mono", monospace;
+        font-size: 0.8rem;
+        white-space: pre-wrap;
+        margin: 0;
+        color: #c5d0e0;
+      }
+      #log {
+        height: 280px;
+        overflow: auto;
+        font-family: "IBM Plex Mono", monospace;
+        font-size: 0.78rem;
+        line-height: 1.45;
+        background: #0e1116;
+        border-radius: 8px;
+        padding: 0.75rem;
+        border: 1px solid var(--line);
+      }
+      .log-line {
+        color: #b8c4d6;
+      }
+      .log-line.sys {
+        color: var(--accent);
+      }
+      .actions {
+        display: flex;
+        gap: 0.5rem;
+        flex-wrap: wrap;
+        margin-top: 0.75rem;
+      }
+      input[type="text"] {
+        flex: 1;
+        min-width: 160px;
+        font: inherit;
+        background: #0e1116;
+        border: 1px solid var(--line);
+        color: var(--text);
+        border-radius: 7px;
+        padding: 0.4rem 0.65rem;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Cordis 插件插拔</h1>
+      <p class="sub">
+        Logger / Greeter / Counter · Counter 依赖前两者 · 支持挂载、卸载与 Logger
+        热替换
+      </p>
+
+      <div class="grid">
+        <section class="card" data-plugin="logger">
+          <h2>Logger <span class="pill" id="st-logger">off</span></h2>
+          <p class="meta">demo.logger · provide LOGGER · on NOTE</p>
+          <div class="row">
+            <button class="primary" data-act="mount">挂载</button>
+            <button data-act="replace">替换 vN</button>
+            <button data-act="unmount">卸载</button>
+          </div>
+        </section>
+        <section class="card" data-plugin="greeter">
+          <h2>Greeter <span class="pill" id="st-greeter">off</span></h2>
+          <p class="meta">demo.greeter · provide GREETING</p>
+          <div class="row">
+            <button class="primary" data-act="mount">挂载</button>
+            <button data-act="unmount">卸载</button>
+          </div>
+        </section>
+        <section class="card" data-plugin="counter">
+          <h2>Counter <span class="pill" id="st-counter">off</span></h2>
+          <p class="meta">demo.counter · needs LOGGER + GREETING</p>
+          <div class="row">
+            <button class="primary" data-act="mount">挂载</button>
+            <button data-act="unmount">卸载</button>
+          </div>
+        </section>
+      </div>
+
+      <section class="panel">
+        <h3>Registry / ticks</h3>
+        <pre id="registry">(loading)</pre>
+        <div class="actions">
+          <input id="note" type="text" placeholder="发一条 NOTE…" value="hello from web" />
+          <button id="emit">Emit NOTE</button>
+          <button id="refresh">刷新状态</button>
+        </div>
+      </section>
+
+      <section class="panel">
+        <h3>Live log</h3>
+        <div id="log"></div>
+      </section>
+    </main>
+    <script>
+      const logEl = document.getElementById("log");
+      const registryEl = document.getElementById("registry");
+
+      function appendLog(text, sys) {
+        const line = document.createElement("div");
+        line.className = "log-line" + (sys ? " sys" : "");
+        line.textContent = text;
+        logEl.appendChild(line);
+        logEl.scrollTop = logEl.scrollHeight;
+      }
+
+      function setPill(id, state) {
+        const el = document.getElementById(id);
+        el.textContent = state || "off";
+        el.className = "pill";
+        if (!state || state === "off" || state === "Disposed") return;
+        if (state === "Active") el.classList.add("on");
+        else el.classList.add("pending");
+      }
+
+      async function api(path, body) {
+        const res = await fetch(path, {
+          method: body ? "POST" : "GET",
+          headers: body ? { "Content-Type": "application/json" } : undefined,
+          body: body ? JSON.stringify(body) : undefined,
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.error || res.statusText);
+        return data;
+      }
+
+      async function refresh() {
+        const s = await api("/api/state");
+        setPill("st-logger", s.plugins.logger || "off");
+        setPill("st-greeter", s.plugins.greeter || "off");
+        setPill("st-counter", s.plugins.counter || "off");
+        registryEl.textContent =
+          `ticks=${s.ticks}  logger_gen=${s.logger_gen}  greeter=${s.greeter_name}\n` +
+          (s.registry.length
+            ? s.registry
+                .map(
+                  (g) =>
+                    `${g.key}: ${g.fibers.map((f) => `${f.id}:${f.state}`).join(", ")}`
+                )
+                .join("\n")
+            : "(empty)");
+      }
+
+      document.querySelectorAll("[data-plugin]").forEach((card) => {
+        const plugin = card.dataset.plugin;
+        card.querySelectorAll("button[data-act]").forEach((btn) => {
+          btn.addEventListener("click", async () => {
+            const act = btn.dataset.act;
+            try {
+              if (act === "mount") await api("/api/mount", { plugin });
+              else if (act === "unmount") await api("/api/unmount", { plugin });
+              else if (act === "replace") await api("/api/replace", { plugin });
+              await refresh();
+            } catch (e) {
+              appendLog(`error: ${e.message}`, true);
+            }
+          });
+        });
+      });
+
+      document.getElementById("emit").onclick = async () => {
+        try {
+          await api("/api/emit", {
+            text: document.getElementById("note").value || "note",
+          });
+          await refresh();
+        } catch (e) {
+          appendLog(`error: ${e.message}`, true);
+        }
+      };
+      document.getElementById("refresh").onclick = () => refresh().catch(console.error);
+
+      const es = new EventSource("/api/logs");
+      es.onmessage = (ev) => appendLog(ev.data);
+      es.onerror = () => appendLog("(log stream reconnecting…)", true);
+
+      refresh().catch((e) => appendLog(`error: ${e.message}`, true));
+      setInterval(() => refresh().catch(() => {}), 1200);
+    </script>
+  </body>
+</html>

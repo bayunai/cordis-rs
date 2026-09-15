@@ -54,9 +54,10 @@ impl DisposeCompletion {
 
     pub(super) async fn wait(self: &Arc<Self>) -> Result<(), CoreError> {
         loop {
-            // 必须在检查结果前登记 waiter，避免 finish() 位于“检查为空”和
-            // notified().await 之间时丢失 notify_waiters() 的唤醒。
+            // 先 pin+enable 登记 waiter，再读结果，避免 finish() 夹在检查与 await 之间丢唤醒。
             let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             {
                 let slot = self.result.lock().expect("dispose completion");
                 if let Some(result) = slot.as_ref() {
@@ -362,5 +363,45 @@ impl Drop for EffectScopeInner {
                 abort_work(work);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod completion_wait_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn dispose_completion_multi_waiter_observes_finish_without_timeout() {
+        let completion = DisposeCompletion::new();
+        let mut waiters = Vec::new();
+        for _ in 0..64 {
+            let completion = completion.clone();
+            waiters.push(tokio::spawn(async move {
+                tokio::time::timeout(Duration::from_secs(2), completion.wait())
+                    .await
+                    .expect("dispose wait timed out")
+            }));
+        }
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        completion.finish(Ok(()));
+        for waiter in waiters {
+            waiter.await.expect("join").expect("dispose ok");
+        }
+        // 已完成后的后续 waiter 直接读同一结果。
+        tokio::time::timeout(Duration::from_secs(1), completion.wait())
+            .await
+            .expect("late waiter timed out")
+            .expect("late waiter ok");
+    }
+
+    /// P1-3 表征：协调任务若不调用 `finish`，waiter 会挂起（修复后应改为有限错误返回）。
+    #[tokio::test]
+    async fn p1_dispose_completion_without_finish_times_out() {
+        let completion = DisposeCompletion::new();
+        let wait = tokio::time::timeout(Duration::from_millis(200), completion.wait()).await;
+        assert!(wait.is_err(), "waiter must hang until finish; got {wait:?}");
     }
 }

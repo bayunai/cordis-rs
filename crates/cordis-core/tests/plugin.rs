@@ -727,6 +727,8 @@ async fn plugin_dispose_clears_registry_index() {
             .any(|item| item.plugin_key == KEY.as_str() && item.fibers.len() == 1)
     );
     fiber.dispose();
+    // dispose_now 在 Effect DisposeCompletion 完成后再 unregister。
+    fiber.dispose_wait().await.expect("dispose_wait");
     assert!(
         runtime
             .diagnostics()
@@ -957,6 +959,168 @@ async fn unmount_self_from_inject_spawn_and_async_disposer_returns_reentrant() {
         seen.load(Ordering::SeqCst) >= 3,
         "inject+spawn+disposer should each observe UnmountReentrant, got {}",
         seen.load(Ordering::SeqCst)
+    );
+    runtime.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn dispose_now_async_disposer_unmount_self_returns_reentrant() {
+    use cordis_core::PluginKey;
+
+    static KEY: PluginKey = PluginKey::new("test.dispose-now-unmount-self");
+    let runtime = runtime();
+    let root = runtime.root();
+    let runtime_clone = runtime.clone();
+    let seen = Arc::new(AtomicUsize::new(0));
+    let (entered_tx, entered_rx) = oneshot::channel::<()>();
+    let (release_tx, release_rx) = oneshot::channel::<()>();
+    let entered_tx = Arc::new(Mutex::new(Some(entered_tx)));
+    let release_rx = Arc::new(Mutex::new(Some(release_rx)));
+
+    struct DisposeNowUnmountPlugin {
+        runtime: Runtime,
+        seen: Arc<AtomicUsize>,
+        entered: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+        release: Arc<Mutex<Option<oneshot::Receiver<()>>>>,
+    }
+    #[async_trait]
+    impl Plugin for DisposeNowUnmountPlugin {
+        fn key(&self) -> PluginKey {
+            KEY
+        }
+        async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
+            let runtime = self.runtime.clone();
+            let seen = self.seen.clone();
+            let entered = self.entered.clone();
+            let release = self.release.clone();
+            let effect = ctx.effect()?;
+            effect.on_dispose_async(move || {
+                let runtime = runtime.clone();
+                let seen = seen.clone();
+                async move {
+                    if let Some(tx) = entered.lock().expect("entered").take() {
+                        let _ = tx.send(());
+                    }
+                    let receiver = release.lock().expect("release").take();
+                    if let Some(rx) = receiver {
+                        let _ = rx.await;
+                    }
+                    match runtime.unmount(KEY).await {
+                        Err(CoreError::UnmountReentrant) => {
+                            seen.fetch_add(1, Ordering::SeqCst);
+                            Ok(())
+                        }
+                        other => Err(CoreError::EventListener(format!(
+                            "dispose_now disposer expected UnmountReentrant: {other:?}"
+                        ))),
+                    }
+                }
+            })?;
+            Ok(())
+        }
+    }
+
+    let mut fiber = root
+        .plugin(Arc::new(DisposeNowUnmountPlugin {
+            runtime: runtime_clone,
+            seen: seen.clone(),
+            entered: entered_tx,
+            release: release_rx,
+        }))
+        .await
+        .unwrap();
+    fiber.dispose();
+    entered_rx.await.expect("disposer entered");
+    // DisposeCompletion 完成前仍保留 plugin 索引与 pending_wait。
+    assert!(
+        runtime
+            .diagnostics()
+            .plugin_registry
+            .iter()
+            .any(|group| group.plugin_key == KEY.as_str())
+    );
+    let _ = release_tx.send(());
+    fiber
+        .dispose_wait()
+        .await
+        .expect("dispose_wait after dispose_now");
+    assert_eq!(seen.load(Ordering::SeqCst), 1);
+    wait_until(|| {
+        runtime
+            .diagnostics()
+            .plugin_registry
+            .iter()
+            .all(|group| group.plugin_key != KEY.as_str())
+    })
+    .await;
+    runtime.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn dispose_now_async_disposer_can_unmount_unrelated_key() {
+    use cordis_core::PluginKey;
+
+    static SELF_KEY: PluginKey = PluginKey::new("test.dispose-now-unmount-other-self");
+    static OTHER_KEY: PluginKey = PluginKey::new("test.dispose-now-unmount-other-target");
+    let runtime = runtime();
+    let root = runtime.root();
+
+    struct OtherPlugin;
+    #[async_trait]
+    impl Plugin for OtherPlugin {
+        fn key(&self) -> PluginKey {
+            OTHER_KEY
+        }
+        async fn apply(&self, _ctx: &Context) -> Result<(), CoreError> {
+            Ok(())
+        }
+    }
+    let _other = root.plugin(Arc::new(OtherPlugin)).await.unwrap();
+
+    let runtime_clone = runtime.clone();
+    let unmounted = Arc::new(AtomicBool::new(false));
+    struct UnmountOtherOnDispose {
+        runtime: Runtime,
+        unmounted: Arc<AtomicBool>,
+    }
+    #[async_trait]
+    impl Plugin for UnmountOtherOnDispose {
+        fn key(&self) -> PluginKey {
+            SELF_KEY
+        }
+        async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
+            let runtime = self.runtime.clone();
+            let unmounted = self.unmounted.clone();
+            let effect = ctx.effect()?;
+            effect.on_dispose_async(move || {
+                let runtime = runtime.clone();
+                let unmounted = unmounted.clone();
+                async move {
+                    runtime.unmount(OTHER_KEY).await?;
+                    unmounted.store(true, Ordering::SeqCst);
+                    Ok(())
+                }
+            })?;
+            Ok(())
+        }
+    }
+
+    let mut fiber = root
+        .plugin(Arc::new(UnmountOtherOnDispose {
+            runtime: runtime_clone,
+            unmounted: unmounted.clone(),
+        }))
+        .await
+        .unwrap();
+    fiber.dispose();
+    fiber.dispose_wait().await.expect("dispose_wait");
+    assert!(unmounted.load(Ordering::SeqCst));
+    assert!(
+        runtime
+            .diagnostics()
+            .plugin_registry
+            .iter()
+            .all(|group| group.plugin_key != OTHER_KEY.as_str())
     );
     runtime.shutdown().await.expect("shutdown");
 }

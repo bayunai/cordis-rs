@@ -76,6 +76,8 @@ impl ShutdownCompletion {
     async fn wait(self: &Arc<Self>) -> Result<(), CoreError> {
         loop {
             let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             {
                 let slot = self.result.lock().expect("shutdown completion");
                 if let Some(result) = slot.as_ref() {

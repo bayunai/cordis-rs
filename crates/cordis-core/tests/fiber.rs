@@ -996,6 +996,156 @@ async fn cancelled_initial_plugin_mount_revokes_fiber() {
 }
 
 #[tokio::test]
+async fn cancelled_initial_mount_before_apply_revokes_without_apply() {
+    // 覆盖「abandon 已置位且 apply 尚未开始」：见 `activate::initial_mount_revoke_tests`。
+    // 此处用门控 apply 验证调用方取消后不提交服务（温和：等 apply 返回再撤销）。
+    use cordis_core::PluginKey;
+
+    static KEY: PluginKey = PluginKey::new("test.cancelled-initial-before-apply");
+    let runtime = runtime();
+    let root = runtime.root();
+    let (entered_tx, entered_rx) = oneshot::channel::<()>();
+    let (release_tx, release_rx) = oneshot::channel::<()>();
+    let entered_tx = Arc::new(Mutex::new(Some(entered_tx)));
+    let release_rx = Arc::new(Mutex::new(Some(release_rx)));
+    let apply_count = Arc::new(AtomicUsize::new(0));
+
+    struct GatePlugin {
+        entered: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+        release: Arc<Mutex<Option<oneshot::Receiver<()>>>>,
+        applies: Arc<AtomicUsize>,
+    }
+    #[async_trait]
+    impl Plugin for GatePlugin {
+        fn key(&self) -> PluginKey {
+            KEY
+        }
+        async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
+            self.applies.fetch_add(1, Ordering::SeqCst);
+            if let Some(tx) = self.entered.lock().expect("entered").take() {
+                let _ = tx.send(());
+            }
+            let receiver = self.release.lock().expect("release").take();
+            if let Some(rx) = receiver {
+                let _ = rx.await;
+            }
+            ctx.provide(NUMBER, Number(9))?;
+            Ok(())
+        }
+    }
+
+    let applies_for_mount = apply_count.clone();
+    let mount = tokio::spawn({
+        let root = root.clone();
+        async move {
+            root.plugin(Arc::new(GatePlugin {
+                entered: entered_tx,
+                release: release_rx,
+                applies: applies_for_mount,
+            }))
+            .await
+        }
+    });
+    entered_rx.await.expect("entered apply");
+    mount.abort();
+    assert!(matches!(mount.await, Err(error) if error.is_cancelled()));
+    let _ = release_tx.send(());
+
+    wait_until(|| {
+        runtime
+            .diagnostics()
+            .plugin_registry
+            .iter()
+            .all(|group| group.plugin_key != KEY.as_str())
+    })
+    .await;
+    assert_eq!(apply_count.load(Ordering::SeqCst), 1);
+    assert_service_unavailable(&root, NUMBER);
+    runtime.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn unload_registers_pending_wait_for_concurrent_unmount_reentry() {
+    use cordis_core::PluginKey;
+
+    static KEY: PluginKey = PluginKey::new("test.unload-pending-wait-reentry");
+    let runtime = runtime();
+    let root = runtime.root();
+    let runtime_clone = runtime.clone();
+    let seen = Arc::new(AtomicUsize::new(0));
+    let (entered_tx, entered_rx) = oneshot::channel::<()>();
+    let (release_tx, release_rx) = oneshot::channel::<()>();
+    let entered_tx = Arc::new(Mutex::new(Some(entered_tx)));
+    let release_rx = Arc::new(Mutex::new(Some(release_rx)));
+
+    struct GatedUnloadPlugin {
+        runtime: Runtime,
+        seen: Arc<AtomicUsize>,
+        entered: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+        release: Arc<Mutex<Option<oneshot::Receiver<()>>>>,
+    }
+    #[async_trait]
+    impl Plugin for GatedUnloadPlugin {
+        fn key(&self) -> PluginKey {
+            KEY
+        }
+        async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
+            let runtime = self.runtime.clone();
+            let seen = self.seen.clone();
+            let entered = self.entered.clone();
+            let release = self.release.clone();
+            let effect = ctx.effect()?;
+            effect.on_dispose_async(move || {
+                let runtime = runtime.clone();
+                let seen = seen.clone();
+                async move {
+                    if let Some(tx) = entered.lock().expect("entered").take() {
+                        let _ = tx.send(());
+                    }
+                    let receiver = release.lock().expect("release").take();
+                    if let Some(rx) = receiver {
+                        let _ = rx.await;
+                    }
+                    match runtime.unmount(KEY).await {
+                        Err(CoreError::UnmountReentrant) => {
+                            seen.fetch_add(1, Ordering::SeqCst);
+                            Ok(())
+                        }
+                        other => Err(CoreError::EventListener(format!(
+                            "unload disposer expected UnmountReentrant: {other:?}"
+                        ))),
+                    }
+                }
+            })?;
+            Ok(())
+        }
+    }
+
+    let mut fiber = root
+        .plugin(Arc::new(GatedUnloadPlugin {
+            runtime: runtime_clone,
+            seen: seen.clone(),
+            entered: entered_tx,
+            release: release_rx,
+        }))
+        .await
+        .unwrap();
+    let mut restart = Box::pin(fiber.restart());
+    tokio::select! {
+        result = &mut restart => panic!("restart completed unexpectedly: {result:?}"),
+        result = entered_rx => {
+            result.expect("unload disposer entered");
+        }
+    }
+    let _ = release_tx.send(());
+    restart.await.expect("restart");
+    assert_eq!(seen.load(Ordering::SeqCst), 1);
+    assert_eq!(fiber.state(), FiberState::Active);
+    fiber.dispose_wait().await.expect("dispose");
+    runtime.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
 async fn fiber_dispose_then_dispose_wait_preserves_async_errors() {
     use cordis_core::PluginKey;
 
@@ -1023,4 +1173,364 @@ async fn fiber_dispose_then_dispose_wait_preserves_async_errors() {
     let error = fiber.dispose_wait().await.expect_err("wait after dispose");
     assert!(matches!(error, CoreError::DisposeFailed { .. }));
     let _ = runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn delayed_dispose_wait_after_dispose_preserves_async_errors() {
+    use cordis_core::PluginKey;
+
+    static KEY: PluginKey = PluginKey::new("test.delayed.dispose.wait.error");
+    let runtime = runtime();
+    let root = runtime.root();
+    let (entered_tx, entered_rx) = oneshot::channel::<()>();
+    let (release_tx, release_rx) = oneshot::channel::<()>();
+    let entered_tx = Arc::new(Mutex::new(Some(entered_tx)));
+    let release_rx = Arc::new(Mutex::new(Some(release_rx)));
+
+    struct GatedBoomPlugin {
+        entered: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+        release: Arc<Mutex<Option<oneshot::Receiver<()>>>>,
+    }
+    #[async_trait]
+    impl Plugin for GatedBoomPlugin {
+        fn key(&self) -> PluginKey {
+            KEY
+        }
+        async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
+            let entered = self.entered.clone();
+            let release = self.release.clone();
+            let effect = ctx.effect()?;
+            effect.on_dispose_async(move || {
+                let entered = entered.clone();
+                let release = release.clone();
+                async move {
+                    if let Some(tx) = entered.lock().expect("entered").take() {
+                        let _ = tx.send(());
+                    }
+                    let receiver = release.lock().expect("release").take();
+                    if let Some(rx) = receiver {
+                        let _ = rx.await;
+                    }
+                    Err(CoreError::EventListener("delayed dispose boom".into()))
+                }
+            })?;
+            Ok(())
+        }
+    }
+
+    let mut fiber = root
+        .plugin(Arc::new(GatedBoomPlugin {
+            entered: entered_tx,
+            release: release_rx,
+        }))
+        .await
+        .unwrap();
+    fiber.dispose();
+    entered_rx.await.expect("disposer entered");
+    let _ = release_tx.send(());
+    // 等后台 finalize 完成并清空 pending_wait 后再 wait，不得吞错。
+    wait_until(|| {
+        runtime
+            .diagnostics()
+            .plugin_registry
+            .iter()
+            .all(|group| group.plugin_key != KEY.as_str())
+    })
+    .await;
+    let error = fiber
+        .dispose_wait()
+        .await
+        .expect_err("delayed dispose_wait");
+    assert!(matches!(error, CoreError::DisposeFailed { .. }));
+    let again = fiber.dispose_wait().await.expect_err("second dispose_wait");
+    assert!(matches!(again, CoreError::DisposeFailed { .. }));
+    let _ = runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn dispose_during_unload_keeps_registry_until_release_finishes() {
+    use cordis_core::PluginKey;
+
+    static KEY: PluginKey = PluginKey::new("test.dispose-during-unload");
+    let runtime = runtime();
+    let root = runtime.root();
+    let (entered_tx, entered_rx) = oneshot::channel::<()>();
+    let (release_tx, release_rx) = oneshot::channel::<()>();
+    let entered_tx = Arc::new(Mutex::new(Some(entered_tx)));
+    let release_rx = Arc::new(Mutex::new(Some(release_rx)));
+
+    struct GatedUnloadDisposePlugin {
+        entered: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+        release: Arc<Mutex<Option<oneshot::Receiver<()>>>>,
+    }
+    #[async_trait]
+    impl Plugin for GatedUnloadDisposePlugin {
+        fn key(&self) -> PluginKey {
+            KEY
+        }
+        async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
+            let entered = self.entered.clone();
+            let release = self.release.clone();
+            let effect = ctx.effect()?;
+            effect.on_dispose_async(move || {
+                let entered = entered.clone();
+                let release = release.clone();
+                async move {
+                    if let Some(tx) = entered.lock().expect("entered").take() {
+                        let _ = tx.send(());
+                    }
+                    let receiver = release.lock().expect("release").take();
+                    if let Some(rx) = receiver {
+                        let _ = rx.await;
+                    }
+                    Ok(())
+                }
+            })?;
+            Ok(())
+        }
+    }
+
+    let mut fiber = root
+        .plugin(Arc::new(GatedUnloadDisposePlugin {
+            entered: entered_tx,
+            release: release_rx,
+        }))
+        .await
+        .unwrap();
+    let mut restart = Box::pin(fiber.restart());
+    tokio::select! {
+        result = &mut restart => panic!("restart completed unexpectedly: {result:?}"),
+        result = entered_rx => {
+            result.expect("unload disposer entered");
+        }
+    }
+    // 取消 wait 不中断 unload；随后 dispose 须 adopt pending_wait，不得提前 unregister。
+    drop(restart);
+    assert!(
+        runtime
+            .diagnostics()
+            .plugin_registry
+            .iter()
+            .any(|group| group.plugin_key == KEY.as_str()),
+        "unload in flight must keep plugin index"
+    );
+    fiber.dispose();
+    assert!(
+        runtime
+            .diagnostics()
+            .plugin_registry
+            .iter()
+            .any(|group| group.plugin_key == KEY.as_str()),
+        "dispose during unload must keep plugin index until release completes"
+    );
+    let _ = release_tx.send(());
+    let wait_result = fiber.dispose_wait().await;
+    assert!(
+        wait_result.is_ok(),
+        "dispose_wait should observe release result, got {wait_result:?}"
+    );
+    wait_until(|| {
+        runtime
+            .diagnostics()
+            .plugin_registry
+            .iter()
+            .all(|group| group.plugin_key != KEY.as_str())
+    })
+    .await;
+    assert!(fiber.is_disposed());
+    assert_ne!(fiber.state(), FiberState::Unloading);
+    assert_ne!(fiber.state(), FiberState::Loading);
+    runtime.shutdown().await.expect("shutdown");
+}
+
+// P1-1: 期望 Loading 期 unmount/dispose 等待 pending_effect 的 DisposeCompletion，
+// 完成前保留 plugin_registry；现状对 pending_effect 只 dispose() 后立即 unregister。
+#[tokio::test]
+#[ignore = "P1: Loading pending_effect dispose does not await completion"]
+async fn p1_unmount_during_loading_waits_for_pending_effect_disposer() {
+    use cordis_core::PluginKey;
+
+    static KEY: PluginKey = PluginKey::new("test.p1.loading-pending-effect");
+    let runtime = runtime();
+    let root = runtime.root();
+    let (apply_entered_tx, apply_entered_rx) = oneshot::channel::<()>();
+    let (apply_release_tx, apply_release_rx) = oneshot::channel::<()>();
+    let (disp_entered_tx, disp_entered_rx) = oneshot::channel::<()>();
+    let (disp_release_tx, disp_release_rx) = oneshot::channel::<()>();
+    let apply_entered_tx = Arc::new(Mutex::new(Some(apply_entered_tx)));
+    let apply_release_rx = Arc::new(Mutex::new(Some(apply_release_rx)));
+    let disp_entered_tx = Arc::new(Mutex::new(Some(disp_entered_tx)));
+    let disp_release_rx = Arc::new(Mutex::new(Some(disp_release_rx)));
+    let disposer_ran = Arc::new(AtomicBool::new(false));
+
+    struct LoadingPlugin {
+        apply_entered: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+        apply_release: Arc<Mutex<Option<oneshot::Receiver<()>>>>,
+        disp_entered: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+        disp_release: Arc<Mutex<Option<oneshot::Receiver<()>>>>,
+        disposer_ran: Arc<AtomicBool>,
+    }
+    #[async_trait]
+    impl Plugin for LoadingPlugin {
+        fn key(&self) -> PluginKey {
+            KEY
+        }
+        async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
+            let effect = ctx.effect()?;
+            let disp_entered = self.disp_entered.clone();
+            let disp_release = self.disp_release.clone();
+            let disposer_ran = self.disposer_ran.clone();
+            effect.on_dispose_async(move || {
+                let disp_entered = disp_entered.clone();
+                let disp_release = disp_release.clone();
+                let disposer_ran = disposer_ran.clone();
+                async move {
+                    if let Some(tx) = disp_entered.lock().expect("disp entered").take() {
+                        let _ = tx.send(());
+                    }
+                    let receiver = disp_release.lock().expect("disp release").take();
+                    if let Some(rx) = receiver {
+                        let _ = rx.await;
+                    }
+                    disposer_ran.store(true, Ordering::SeqCst);
+                    Ok(())
+                }
+            })?;
+            if let Some(tx) = self.apply_entered.lock().expect("apply entered").take() {
+                let _ = tx.send(());
+            }
+            let receiver = self.apply_release.lock().expect("apply release").take();
+            if let Some(rx) = receiver {
+                let _ = rx.await;
+            }
+            Ok(())
+        }
+    }
+
+    let mount = tokio::spawn({
+        let root = root.clone();
+        let disposer_ran = disposer_ran.clone();
+        async move {
+            root.plugin(Arc::new(LoadingPlugin {
+                apply_entered: apply_entered_tx,
+                apply_release: apply_release_rx,
+                disp_entered: disp_entered_tx,
+                disp_release: disp_release_rx,
+                disposer_ran,
+            }))
+            .await
+        }
+    });
+    apply_entered_rx.await.expect("apply entered");
+
+    let mut unmount = Box::pin(runtime.unmount(KEY));
+    // 合同：disposer 完成前 unmount 不得成功返回，且 registry 仍可见。
+    tokio::select! {
+        result = &mut unmount => {
+            panic!("unmount finished before pending_effect disposer: {result:?}");
+        }
+        result = disp_entered_rx => {
+            result.expect("disposer should run while unmount waits");
+        }
+        _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {
+            panic!("disposer did not start within timeout (unmount may have skipped wait)");
+        }
+    }
+    assert!(
+        runtime
+            .diagnostics()
+            .plugin_registry
+            .iter()
+            .any(|group| group.plugin_key == KEY.as_str()),
+        "plugin index must remain until pending_effect DisposeCompletion finishes"
+    );
+    let _ = disp_release_tx.send(());
+    let _ = apply_release_tx.send(());
+    unmount
+        .await
+        .expect("unmount should succeed after disposer");
+    assert!(disposer_ran.load(Ordering::SeqCst));
+    wait_until(|| {
+        runtime
+            .diagnostics()
+            .plugin_registry
+            .iter()
+            .all(|group| group.plugin_key != KEY.as_str())
+    })
+    .await;
+    let _ = mount.await;
+    runtime.shutdown().await.expect("shutdown");
+}
+
+// P1-2: cancel 发生在 apply 已跑完 provide、即将返回前；合同要求无孤儿 Active。
+// （更窄的「revoke 检查之后、commit 之前」窗口需内部 hook，本测覆盖可稳定复现的公开路径。）
+#[tokio::test]
+async fn p1_abandon_while_apply_gated_before_return_leaves_no_orphan() {
+    use cordis_core::PluginKey;
+
+    static KEY: PluginKey = PluginKey::new("test.p1.abandon-toctou");
+    let runtime = runtime();
+    let root = runtime.root();
+    let (ready_tx, ready_rx) = oneshot::channel::<()>();
+    let (release_tx, release_rx) = oneshot::channel::<()>();
+    let ready_tx = Arc::new(Mutex::new(Some(ready_tx)));
+    let release_rx = Arc::new(Mutex::new(Some(release_rx)));
+    let apply_count = Arc::new(AtomicUsize::new(0));
+
+    struct GatePlugin {
+        ready: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+        release: Arc<Mutex<Option<oneshot::Receiver<()>>>>,
+        applies: Arc<AtomicUsize>,
+    }
+    #[async_trait]
+    impl Plugin for GatePlugin {
+        fn key(&self) -> PluginKey {
+            KEY
+        }
+        async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
+            self.applies.fetch_add(1, Ordering::SeqCst);
+            ctx.provide(NUMBER, Number(42))?;
+            if let Some(tx) = self.ready.lock().expect("ready").take() {
+                let _ = tx.send(());
+            }
+            let receiver = self.release.lock().expect("release").take();
+            if let Some(rx) = receiver {
+                let _ = rx.await;
+            }
+            Ok(())
+        }
+    }
+
+    let mount = tokio::spawn({
+        let root = root.clone();
+        let applies = apply_count.clone();
+        async move {
+            root.plugin(Arc::new(GatePlugin {
+                ready: ready_tx,
+                release: release_rx,
+                applies,
+            }))
+            .await
+        }
+    });
+    ready_rx.await.expect("apply ready before return");
+    mount.abort();
+    assert!(matches!(mount.await, Err(error) if error.is_cancelled()));
+    let _ = release_tx.send(());
+
+    wait_until(|| {
+        runtime
+            .diagnostics()
+            .plugin_registry
+            .iter()
+            .all(|group| group.plugin_key != KEY.as_str())
+            && runtime
+                .diagnostics()
+                .plugin_fibers
+                .iter()
+                .all(|fiber| fiber.plugin_key != KEY.as_str())
+    })
+    .await;
+    assert_service_unavailable(&root, NUMBER);
+    runtime.shutdown().await.expect("shutdown");
 }

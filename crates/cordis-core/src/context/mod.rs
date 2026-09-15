@@ -255,13 +255,13 @@ impl Context {
             effect: Mutex::new(None),
             pending_effect: Mutex::new(None),
             pending_wait: Mutex::new(None),
+            dispose_result: Mutex::new(None),
             state: Mutex::new(FiberState::Pending),
             last_error: Mutex::new(None),
             resolved_providers: Mutex::new(Vec::new()),
             disposed: std::sync::atomic::AtomicBool::new(false),
             busy: Mutex::new(false),
             lifecycle: Mutex::new(None),
-            caller_cancelled: std::sync::atomic::AtomicBool::new(false),
             mount_ctx: Mutex::new(Some(self.clone())),
         });
         self.inner.registry.register_plugin_fiber(inner.clone())?;
@@ -276,7 +276,7 @@ impl Context {
             initial_mount: true,
         })?;
         let mut guard = crate::fiber::InitialMountWaitGuard {
-            fiber: inner.clone(),
+            completion: completion.clone(),
             completed: false,
         };
         let result = completion.wait().await;
@@ -286,16 +286,11 @@ impl Context {
         // 只有首次挂载的调用者明确取消，才撤销实例并不返回 Handle。
         match result {
             Ok(()) | Err(CoreError::PluginApply(_)) => {}
-            Err(CoreError::FiberDisposed)
-                if !inner
-                    .caller_cancelled
-                    .load(std::sync::atomic::Ordering::Acquire) => {}
+            Err(CoreError::FiberDisposed) if !completion.abandon_handle_requested() => {}
             Err(error) => return Err(error),
         }
         if inner.disposed.load(std::sync::atomic::Ordering::Acquire)
-            && inner
-                .caller_cancelled
-                .load(std::sync::atomic::Ordering::Acquire)
+            && completion.abandon_handle_requested()
         {
             return Err(CoreError::FiberDisposed);
         }

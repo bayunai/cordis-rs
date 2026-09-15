@@ -22,6 +22,24 @@ use resources::{BoxFuture, ManagedWork, Resources};
 
 static NEXT_EFFECT_ID: AtomicU64 = AtomicU64::new(1);
 
+/// 共享不可变祖先链：子 Scope 只挂一层 `Arc`，不按深度拷贝 ID 数组。
+#[derive(Clone)]
+struct AncestorNode {
+    id: u64,
+    parent: Option<Arc<AncestorNode>>,
+}
+
+fn lineage_contains(lineage: &Option<Arc<AncestorNode>>, id: u64) -> bool {
+    let mut current = lineage.as_ref();
+    while let Some(node) = current {
+        if node.id == id {
+            return true;
+        }
+        current = node.parent.as_ref();
+    }
+    false
+}
+
 pub(super) struct EffectScopeInner {
     pub(super) id: u64,
     pub(super) name: String,
@@ -29,9 +47,8 @@ pub(super) struct EffectScopeInner {
     pub(super) cancellation: CancellationToken,
     pub(super) disposed: AtomicBool,
     pub(super) parent: Mutex<Option<Weak<EffectScopeInner>>>,
-    /// 创建时冻结的祖先 Scope ID。释放会解除 `parent` 弱引用，但生命周期
-    /// 回调仍需判断自己是否在被等待的 Effect 树内。
-    ancestors: Vec<u64>,
+    /// 创建时冻结的逻辑祖先链。`detach_from_parent` 只摘除父子弱引用，不清本链。
+    lineage: Option<Arc<AncestorNode>>,
     resources: Mutex<Resources>,
     completion: Mutex<Option<Arc<DisposeCompletion>>>,
 }
@@ -44,14 +61,14 @@ pub(crate) struct EffectScope {
 
 impl EffectScope {
     pub(crate) fn root(handle: Handle) -> Self {
-        Self::new("root", handle, CancellationToken::new(), Vec::new())
+        Self::new("root", handle, CancellationToken::new(), None)
     }
 
     fn new(
         name: impl Into<String>,
         handle: Handle,
         cancellation: CancellationToken,
-        ancestors: Vec<u64>,
+        lineage: Option<Arc<AncestorNode>>,
     ) -> Self {
         Self {
             inner: Arc::new(EffectScopeInner {
@@ -61,7 +78,7 @@ impl EffectScope {
                 cancellation,
                 disposed: AtomicBool::new(false),
                 parent: Mutex::new(None),
-                ancestors,
+                lineage,
                 resources: Mutex::new(Resources::default()),
                 completion: Mutex::new(None),
             }),
@@ -73,16 +90,15 @@ impl EffectScope {
     }
 
     pub(crate) fn child_named(&self, name: impl Into<String>) -> Self {
+        let lineage = Some(Arc::new(AncestorNode {
+            id: self.inner.id,
+            parent: self.inner.lineage.clone(),
+        }));
         let child = Self::new(
             name,
             self.inner.handle.clone(),
             self.inner.cancellation.child_token(),
-            self.inner
-                .ancestors
-                .iter()
-                .copied()
-                .chain(std::iter::once(self.inner.id))
-                .collect(),
+            lineage,
         );
         if let Ok(mut parent) = child.inner.parent.lock() {
             *parent = Some(Arc::downgrade(&self.inner));
@@ -104,13 +120,13 @@ impl EffectScope {
         self.inner.handle.clone()
     }
 
-    /// 两 Scope 是否属于同一 Effect 树（自身或互为祖先）。
+    /// 两 Scope 是否属于同一 Effect 树（自身或互为祖先；不依赖 live parent 弱引用）。
     pub(crate) fn is_same_tree_as(&self, other: &Self) -> bool {
         if Arc::ptr_eq(&self.inner, &other.inner) {
             return true;
         }
-        self.inner.ancestors.contains(&other.inner.id)
-            || other.inner.ancestors.contains(&self.inner.id)
+        lineage_contains(&self.inner.lineage, other.inner.id)
+            || lineage_contains(&other.inner.lineage, self.inner.id)
     }
 
     pub(crate) fn id(&self) -> u64 {
@@ -264,5 +280,55 @@ impl EffectHandle {
     #[allow(dead_code)]
     pub(crate) fn scope(&self) -> &EffectScope {
         &self.scope
+    }
+}
+
+#[cfg(test)]
+mod lineage_tests {
+    use super::*;
+
+    #[test]
+    fn shared_lineage_survives_detach_and_siblings_are_distinct() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let handle = runtime.handle().clone();
+        std::mem::forget(runtime);
+
+        let root = EffectScope::root(handle);
+        let left = root.child_named("left");
+        let right = root.child_named("right");
+        let nested = left.child_named("nested");
+
+        assert!(left.is_same_tree_as(&nested));
+        assert!(nested.is_same_tree_as(&left));
+        assert!(root.is_same_tree_as(&nested));
+        assert!(!left.is_same_tree_as(&right));
+        assert!(!nested.is_same_tree_as(&right));
+
+        nested.detach_from_parent();
+        assert!(nested.parent_id().is_none());
+        // detach 只摘 live parent，逻辑祖先链仍用于同树判定。
+        assert!(nested.is_same_tree_as(&left));
+        assert!(left.is_same_tree_as(&nested));
+    }
+
+    // P1-4 相关：已 dispose 父上 `child_named` 会立刻 `dispose()`（可能 HoistToParent）。
+    // 子自身 DisposeCompletion 应仍可在有限时间内 wait（与 AwaitLocal 父/子竞态分测）。
+    #[tokio::test]
+    async fn p1_child_named_on_disposed_parent_local_wait_converges() {
+        let handle = tokio::runtime::Handle::current();
+        let root = EffectScope::root(handle);
+        let parent = root.child_named("parent");
+        parent.dispose_wait().await.expect("parent dispose_wait");
+        assert!(parent.is_disposed());
+
+        let child = parent.child_named("late");
+        assert!(child.is_disposed());
+        tokio::time::timeout(std::time::Duration::from_secs(2), child.dispose_wait())
+            .await
+            .expect("late child dispose_wait must not hang")
+            .expect("dispose_wait");
     }
 }

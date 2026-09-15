@@ -1,0 +1,257 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Plugin Stack Demo</title>
+    <style>
+      :root {
+        --bg: #0f1419;
+        --panel: #1a2332;
+        --line: #2c3a4f;
+        --text: #e8edf5;
+        --muted: #8b9bb4;
+        --ok: #3ecf8e;
+        --warn: #e6a23c;
+        --off: #6b7280;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        font-family: ui-sans-serif, system-ui, sans-serif;
+        background: var(--bg);
+        color: var(--text);
+      }
+      main {
+        max-width: 1100px;
+        margin: 0 auto;
+        padding: 24px 16px 48px;
+      }
+      h1 { font-size: 1.35rem; margin: 0 0 6px; }
+      .sub { color: var(--muted); margin-bottom: 20px; font-size: 0.9rem; }
+      .grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+        gap: 12px;
+        margin-bottom: 16px;
+      }
+      .card {
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        padding: 14px;
+      }
+      .card h2 { margin: 0 0 8px; font-size: 1rem; }
+      .deps { color: var(--muted); font-size: 0.8rem; margin-bottom: 10px; }
+      .pill {
+        display: inline-block;
+        padding: 2px 8px;
+        border-radius: 999px;
+        font-size: 0.75rem;
+        background: #243044;
+        color: var(--muted);
+        margin-bottom: 10px;
+      }
+      .pill.Active { color: var(--ok); }
+      .pill.Pending { color: var(--warn); }
+      .pill.off, .pill.Disposed, .pill.Failed { color: var(--off); }
+      .row { display: flex; flex-wrap: wrap; gap: 8px; }
+      button, select, input, textarea {
+        font: inherit;
+        border-radius: 8px;
+        border: 1px solid var(--line);
+        background: #121926;
+        color: var(--text);
+        padding: 8px 10px;
+      }
+      button { cursor: pointer; }
+      button:hover { border-color: #4b5f7d; }
+      button.primary { background: #2563eb; border-color: #2563eb; }
+      label { display: block; font-size: 0.8rem; color: var(--muted); margin: 8px 0 4px; }
+      textarea { width: 100%; min-height: 72px; resize: vertical; }
+      input[type="text"], select { width: 100%; }
+      pre {
+        margin: 0;
+        padding: 12px;
+        background: #0b1018;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        max-height: 280px;
+        overflow: auto;
+        font-size: 0.8rem;
+        line-height: 1.45;
+        white-space: pre-wrap;
+        word-break: break-word;
+      }
+      .cols {
+        display: grid;
+        grid-template-columns: 1.1fr 0.9fr;
+        gap: 12px;
+      }
+      @media (max-width: 800px) {
+        .cols { grid-template-columns: 1fr; }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>DB → Logger → HTTP 插件栈</h1>
+      <p class="sub">
+        自由装卸三个插件；HTTP Active 后可随意发请求，调用会经 Logger 异步写入 DB。
+      </p>
+
+      <div class="grid">
+        <section class="card" data-plugin="db">
+          <h2>DB</h2>
+          <div class="deps">无依赖 · 内存库（可换成 SQLite/PG）</div>
+          <div id="st-db" class="pill off">off</div>
+          <div class="row">
+            <button data-act="mount">挂载</button>
+            <button data-act="unmount">卸载</button>
+          </div>
+        </section>
+        <section class="card" data-plugin="logger">
+          <h2>Logger</h2>
+          <div class="deps">inject DB · 对外 Logger::info</div>
+          <div id="st-logger" class="pill off">off</div>
+          <div class="row">
+            <button data-act="mount">挂载</button>
+            <button data-act="unmount">卸载</button>
+          </div>
+        </section>
+        <section class="card" data-plugin="http">
+          <h2>HTTP</h2>
+          <div class="deps">inject Logger · 对外 HttpCaller::request</div>
+          <div id="st-http" class="pill off">off</div>
+          <div class="row">
+            <button data-act="mount">挂载</button>
+            <button data-act="unmount">卸载</button>
+          </div>
+        </section>
+      </div>
+
+      <div class="cols">
+        <section class="card">
+          <h2>自由 HTTP 请求</h2>
+          <label>Method</label>
+          <select id="method">
+            <option>GET</option>
+            <option>POST</option>
+            <option>PUT</option>
+            <option>DELETE</option>
+          </select>
+          <label>URL</label>
+          <input id="url" type="text" value="https://httpbin.org/get" />
+          <label>Body（可选）</label>
+          <textarea id="body" placeholder='{"hello":"cordis"}'></textarea>
+          <div class="row" style="margin-top: 10px">
+            <button class="primary" id="send">发送请求</button>
+            <button id="mount-all">一键挂满</button>
+            <button id="clear-db">清空 DB 日志</button>
+          </div>
+          <label>响应</label>
+          <pre id="response">尚未请求</pre>
+        </section>
+        <section class="card">
+          <h2>实时总线</h2>
+          <pre id="bus"></pre>
+          <h2 style="margin-top: 12px">DB 中的日志</h2>
+          <pre id="db-logs">（空）</pre>
+        </section>
+      </div>
+    </main>
+    <script>
+      const busEl = document.getElementById("bus");
+      const dbEl = document.getElementById("db-logs");
+      const responseEl = document.getElementById("response");
+
+      function setPill(id, state) {
+        const el = document.getElementById(id);
+        el.textContent = state || "off";
+        el.className = "pill " + (state || "off");
+      }
+
+      async function api(path, body) {
+        const res = await fetch(path, {
+          method: body ? "POST" : "GET",
+          headers: body ? { "content-type": "application/json" } : undefined,
+          body: body ? JSON.stringify(body) : undefined,
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.error || res.statusText);
+        return data;
+      }
+
+      async function refresh() {
+        const s = await api("/api/state");
+        setPill("st-db", s.plugins.db);
+        setPill("st-logger", s.plugins.logger);
+        setPill("st-http", s.plugins.http);
+        dbEl.textContent = (s.db_logs && s.db_logs.length)
+          ? s.db_logs.join("\n")
+          : "（空）";
+      }
+
+      document.querySelectorAll("[data-plugin]").forEach((card) => {
+        const plugin = card.dataset.plugin;
+        card.querySelectorAll("[data-act]").forEach((btn) => {
+          btn.addEventListener("click", async () => {
+            try {
+              const act = btn.dataset.act;
+              if (act === "mount") await api("/api/mount", { plugin });
+              else await api("/api/unmount", { plugin });
+              await refresh();
+            } catch (e) {
+              alert(e.message);
+            }
+          });
+        });
+      });
+
+      document.getElementById("mount-all").onclick = async () => {
+        try {
+          for (const plugin of ["db", "logger", "http"]) {
+            try { await api("/api/mount", { plugin }); } catch (_) {}
+          }
+          await refresh();
+        } catch (e) {
+          alert(e.message);
+        }
+      };
+
+      document.getElementById("clear-db").onclick = async () => {
+        try {
+          await api("/api/clear-db", {});
+          await refresh();
+        } catch (e) {
+          alert(e.message);
+        }
+      };
+
+      document.getElementById("send").onclick = async () => {
+        try {
+          const data = await api("/api/request", {
+            method: document.getElementById("method").value,
+            url: document.getElementById("url").value,
+            body: document.getElementById("body").value,
+          });
+          responseEl.textContent =
+            "status " + data.status + "\n\n" + data.body;
+          await refresh();
+        } catch (e) {
+          responseEl.textContent = "错误: " + e.message;
+          await refresh();
+        }
+      };
+
+      const es = new EventSource("/api/logs");
+      es.onmessage = (ev) => {
+        busEl.textContent += ev.data + "\n";
+        busEl.scrollTop = busEl.scrollHeight;
+        refresh();
+      };
+      refresh();
+      setInterval(refresh, 2000);
+    </script>
+  </body>
+</html>

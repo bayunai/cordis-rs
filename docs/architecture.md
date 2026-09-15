@@ -118,7 +118,11 @@ Context::plugin(Arc<dyn Plugin>)
 
 `Plugin::key()` 声明稳定身份。Runtime 按 Key 归组 Fiber；`Runtime::unmount(key)` 标记卸载中、拒绝同 Key 新挂载、`dispose_wait` 全部实例后清分组；释放错误聚合返回，但仍完成分组清理。
 
-`unmount` 的重入保护按 **Effect Scope 树**判定，而非粗暴禁止所有生命周期回调：若当前用户回调（`apply` / inject / spawn / async disposer）所属 Scope 与任一待卸载 Fiber 将等待的 Scope 同树，立即返回 `UnmountReentrant`，不 cancel、不等待。卸载无关插件的 Key 仍允许。`shutdown` 的全局 `ShutdownReentrant` 约束不变。
+`unmount` 的重入保护按 **Effect Scope 树**判定，而非粗暴禁止所有生命周期回调：若当前用户回调（`apply` / inject / spawn / async disposer）所属 Scope 与任一待卸载 Fiber 将等待的 Scope 同树，立即返回 `UnmountReentrant`，不 cancel、不等待。卸载无关插件的 Key 仍允许。同树判定使用创建时冻结的共享祖先链（`detach` 后仍有效）。`shutdown` 的全局 `ShutdownReentrant` 约束不变。
+
+卸载 / `dispose_now` 在 Effect `DisposeCompletion` 完成前保留 `pending_wait` 与 plugin 索引，使 async disposer / 并发 `unmount` 仍能看到归属；完成后才 `unregister`。
+
+首次挂载：`Context::plugin` 的 wait 被取消时向本轮协调器请求放弃 Handle——若 `apply` 尚未开始则直接撤销；若已开始则**不** abort 用户 Future，等 `apply` 返回后不提交 Active、释放临时 Scope 并注销 Fiber。因此 `Plugin::apply` **不得无限阻塞**；长等须用 Effect `spawn` + 取消令牌。
 
 `Fiber::replace` 仅允许同 Key；旧 Effect 释放失败时进入 `Failed`，不启动新 `apply`。
 

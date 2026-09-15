@@ -5,7 +5,10 @@ use crate::{
     CoreError,
     plugin::{Plugin, PluginMetadata},
 };
-use std::sync::{Arc, Mutex, atomic::Ordering};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 use tokio::{sync::Notify, task::JoinHandle};
 
 /// 一轮生命周期操作的共享 completion（同构 DisposeCompletion）。
@@ -13,14 +16,17 @@ pub(crate) struct LifecycleCompletion {
     notify: Notify,
     result: Mutex<Option<Result<(), CoreError>>>,
     retain: Mutex<Option<JoinHandle<()>>>,
+    /// 首次挂载：调用方已放弃返回的 Handle。
+    abandon_handle: AtomicBool,
 }
 
 impl LifecycleCompletion {
-    fn new() -> Arc<Self> {
+    pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self {
             notify: Notify::new(),
             result: Mutex::new(None),
             retain: Mutex::new(None),
+            abandon_handle: AtomicBool::new(false),
         })
     }
 
@@ -42,6 +48,8 @@ impl LifecycleCompletion {
     pub(crate) async fn wait(self: &Arc<Self>) -> Result<(), CoreError> {
         loop {
             let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             {
                 let slot = self.result.lock().expect("lifecycle completion");
                 if let Some(result) = slot.as_ref() {
@@ -50,6 +58,14 @@ impl LifecycleCompletion {
             }
             notified.await;
         }
+    }
+
+    pub(crate) fn request_abandon_handle(&self) {
+        self.abandon_handle.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn abandon_handle_requested(&self) -> bool {
+        self.abandon_handle.load(Ordering::Acquire)
     }
 }
 
@@ -65,16 +81,16 @@ pub(crate) enum LifecycleOp {
     },
 }
 
-/// 首次挂载 wait 被取消时置位，协调器据此撤销挂载。
+/// 首次挂载 wait 被取消时，向本轮协调器请求放弃 Handle。
 pub(crate) struct InitialMountWaitGuard {
-    pub(crate) fiber: Arc<FiberInner>,
+    pub(crate) completion: Arc<LifecycleCompletion>,
     pub(crate) completed: bool,
 }
 
 impl Drop for InitialMountWaitGuard {
     fn drop(&mut self) {
         if !self.completed {
-            self.fiber.caller_cancelled.store(true, Ordering::Release);
+            self.completion.request_abandon_handle();
         }
     }
 }
@@ -186,5 +202,44 @@ impl FiberInner {
             scopes.push(scope.clone());
         }
         scopes
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_completion_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn lifecycle_completion_multi_waiter_observes_finish_without_timeout() {
+        let completion = LifecycleCompletion::new();
+        let mut waiters = Vec::new();
+        for _ in 0..64 {
+            let completion = completion.clone();
+            waiters.push(tokio::spawn(async move {
+                tokio::time::timeout(Duration::from_secs(2), completion.wait())
+                    .await
+                    .expect("lifecycle wait timed out")
+            }));
+        }
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        completion.finish(Ok(()));
+        for waiter in waiters {
+            waiter.await.expect("join").expect("lifecycle ok");
+        }
+        tokio::time::timeout(Duration::from_secs(1), completion.wait())
+            .await
+            .expect("late waiter timed out")
+            .expect("late waiter ok");
+    }
+
+    /// P1-3 表征：Lifecycle 协调体若不 `finish`，waiter 挂起（修复后应 finally finish）。
+    #[tokio::test]
+    async fn p1_lifecycle_completion_without_finish_times_out() {
+        let completion = LifecycleCompletion::new();
+        let wait = tokio::time::timeout(Duration::from_millis(200), completion.wait()).await;
+        assert!(wait.is_err(), "waiter must hang until finish; got {wait:?}");
     }
 }
