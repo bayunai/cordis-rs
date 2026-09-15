@@ -28,7 +28,7 @@ pub use error::CoreError;
 pub use event::{
     EventKey, ListenFilter, ListenOptions, Next, ParallelKey, SerialKey, Unsubscribe, WaterfallKey,
 };
-pub use fiber::{Fiber, FiberState};
+pub use fiber::{Fiber, FiberState, FiberStateChange};
 pub use isolation::IsolationLabel;
 pub use plugin::{Plugin, PluginKey};
 pub use runtime::Runtime;

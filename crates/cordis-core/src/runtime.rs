@@ -1,6 +1,10 @@
 use crate::{
-    Context, CoreError, PluginKey, context::ContextInner, diagnostics::RuntimeSnapshot,
-    effect::EffectScope, fiber::Fiber, inject::Registry,
+    Context, CoreError, PluginKey,
+    context::ContextInner,
+    diagnostics::RuntimeSnapshot,
+    effect::EffectScope,
+    fiber::{Fiber, FiberStateChange},
+    inject::Registry,
 };
 use std::sync::{
     Arc,
@@ -85,6 +89,11 @@ impl Runtime {
     /// 只读诊断快照：不含 Service 实例或业务数据。
     pub fn diagnostics(&self) -> RuntimeSnapshot {
         self.inner.registry.diagnostics()
+    }
+
+    /// 订阅 Plugin Fiber 生命周期转换；接收滞后时调用 `diagnostics()` 重建快照。
+    pub fn subscribe_fiber_states(&self) -> tokio::sync::broadcast::Receiver<FiberStateChange> {
+        self.inner.registry.subscribe_fiber_states()
     }
 
     /// 按 [`PluginKey`] 统一卸载：拒绝并发新挂载，等待该组全部 Fiber `dispose_wait`。

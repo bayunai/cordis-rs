@@ -7,7 +7,7 @@ use crate::{
         PluginRegistrySnapshot, ProviderSnapshot, RuntimeSnapshot,
     },
     effect::EffectScope,
-    fiber::{FiberInner, FiberState},
+    fiber::{FiberInner, FiberState, FiberStateChange},
     isolation::{IsolationLabel, RuntimeToken},
     plugin::PluginKey,
     service::ErasedService,
@@ -24,7 +24,7 @@ use std::{
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
-use tokio::sync::Notify;
+use tokio::sync::{Notify, broadcast};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -205,10 +205,12 @@ pub(crate) struct Registry {
     scheduler_stopped: AtomicBool,
     scheduler_cancel: CancellationToken,
     scheduler_task: Mutex<Option<JoinHandle<()>>>,
+    fiber_state_events: broadcast::Sender<FiberStateChange>,
 }
 
 impl Registry {
     pub(crate) fn new() -> Arc<Self> {
+        let (fiber_state_events, _) = broadcast::channel(1024);
         Arc::new(Self {
             state: Mutex::new(RegistryState {
                 nodes: HashMap::new(),
@@ -234,7 +236,16 @@ impl Registry {
             scheduler_stopped: AtomicBool::new(false),
             scheduler_cancel: CancellationToken::new(),
             scheduler_task: Mutex::new(None),
+            fiber_state_events,
         })
+    }
+
+    pub(crate) fn subscribe_fiber_states(&self) -> broadcast::Receiver<FiberStateChange> {
+        self.fiber_state_events.subscribe()
+    }
+
+    pub(crate) fn publish_fiber_state(&self, change: FiberStateChange) {
+        let _ = self.fiber_state_events.send(change);
     }
 
     pub(crate) fn runtime_token(&self) -> &RuntimeToken {
@@ -1212,6 +1223,7 @@ impl Registry {
                             FiberState::Loading => FiberStateSnapshot::Loading,
                             FiberState::Active => FiberStateSnapshot::Active,
                             FiberState::Failed => FiberStateSnapshot::Failed,
+                            FiberState::Unloading => FiberStateSnapshot::Unloading,
                             FiberState::Disposed => FiberStateSnapshot::Disposed,
                         };
                         PluginRegistryFiberSnapshot {
@@ -1285,7 +1297,7 @@ impl Registry {
             }
             loop {
                 let ready = self.take_ready();
-                let ready_plugins = self.take_ready_plugin_fibers();
+                let ready_plugins = self.take_ready_plugin_fibers().await;
                 if ready.is_empty() && ready_plugins.is_empty() {
                     break;
                 }
@@ -1424,7 +1436,7 @@ impl Registry {
         ))
     }
 
-    fn take_ready_plugin_fibers(&self) -> Vec<Arc<FiberInner>> {
+    async fn take_ready_plugin_fibers(&self) -> Vec<Arc<FiberInner>> {
         let fibers = {
             let Ok(state) = self.state.lock() else {
                 return Vec::new();
@@ -1455,8 +1467,18 @@ impl Registry {
             };
             let state = *fiber.state.lock().expect("state");
             if state == FiberState::Active && resolved != providers {
-                fiber.unload_to_pending();
+                let _ = fiber.unload_to_pending_wait().await;
             }
+            if fiber.busy.lock().map(|guard| *guard).unwrap_or(true) {
+                continue;
+            }
+            let deps = fiber.dependencies.lock().expect("deps").clone();
+            let providers = {
+                let Ok(state) = self.state.lock() else {
+                    continue;
+                };
+                provider_ids(&state, fiber.node, &deps)
+            };
             let state = *fiber.state.lock().expect("state");
             let deps_ready = providers.len() == deps.len();
             if state == FiberState::Pending && deps_ready {

@@ -246,23 +246,11 @@ impl Context {
             mount_ctx: Mutex::new(Some(self.clone())),
         });
         self.inner.registry.register_plugin_fiber(inner.clone())?;
+        inner.publish_initial_state();
         let weak = Arc::downgrade(&inner);
         self.inner.scope.on_dispose(move || {
             if let Some(fiber) = weak.upgrade() {
-                fiber
-                    .disposed
-                    .store(true, std::sync::atomic::Ordering::Release);
-                if let Ok(mut state) = fiber.state.lock() {
-                    *state = FiberState::Disposed;
-                }
-                if let Ok(mut effect) = fiber.effect.lock()
-                    && let Some(scope) = effect.take()
-                {
-                    scope.dispose();
-                }
-                if let Some(registry) = fiber.registry.upgrade() {
-                    registry.unregister_plugin_fiber(fiber.id);
-                }
+                fiber.dispose_now();
             }
         });
         let _ = inner.try_activate().await;

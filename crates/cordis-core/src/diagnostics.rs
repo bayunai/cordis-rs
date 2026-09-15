@@ -46,6 +46,7 @@ pub enum FiberStateSnapshot {
     Loading,
     Active,
     Failed,
+    Unloading,
     Disposed,
 }
 

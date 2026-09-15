@@ -69,13 +69,15 @@ Context::plugin(Arc<dyn Plugin>)
                 跨 Key：Runtime::unmount(key) 后再 plugin(new)
 ```
 
-Provider 变化时，依赖该 Key 的 Plugin Fiber 自动 `Active → Pending → Active`。配置更新固定为：宿主读取并校验配置 → 构造新的不可变 Plugin 实例 → `Fiber::replace`（Core **无** `update(json)`）。
+Provider 变化、`restart()` 与 `replace()` 都先经历 `Active → Unloading → Pending → Loading → Active`：Core 取消并等待旧 Effect 的受控任务退出后，才允许下一次 `apply()`。因此不会出现旧任务与新 Plugin 实例并行运行的窗口。配置更新固定为：宿主读取并校验配置 → 构造新的不可变 Plugin 实例 → `Fiber::replace`（Core **无** `update(json)`）。
 
 - 配置无效：宿主记录配置错误，**不得调用** `replace`；旧 Active 实例继续运行。
 - 新实例 `apply` 失败：旧实例已释放，Fiber 进入 `Failed`；Core 不回滚配置或恢复旧实例。
 - `restart()` 只用于配置未变时的重新执行、依赖变化或人工恢复，禁止作为可变配置更新入口。
 
 `Context::inject` 仍返回 `InjectionHandle`（派生依赖），与 Plugin Fiber 分开诊断。
+
+`Runtime::subscribe_fiber_states()` 提供容量为 1024 的只读广播流，依次报告 `None → Pending` 以及后续状态转换。监听滞后会收到 `broadcast::error::RecvError::Lagged`；宿主应调用 `Runtime::diagnostics()` 重建当前快照。状态通知不能阻塞、拒绝或回滚 Fiber 生命周期。
 
 ## Effect
 

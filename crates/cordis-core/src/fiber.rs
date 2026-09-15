@@ -16,7 +16,18 @@ pub enum FiberState {
     Loading,
     Active,
     Failed,
+    Unloading,
     Disposed,
+}
+
+/// Plugin Fiber 的只读生命周期转换事件。
+#[derive(Debug, Clone)]
+pub struct FiberStateChange {
+    pub fiber_id: u64,
+    pub plugin_key: PluginKey,
+    pub node: u64,
+    pub previous: Option<FiberState>,
+    pub current: FiberState,
 }
 
 /// 已挂载插件的可重启 / 可替换生命周期句柄。
@@ -67,42 +78,11 @@ impl Fiber {
     }
 
     pub fn dispose(&mut self) {
-        if self.inner.disposed.swap(true, Ordering::AcqRel) {
-            return;
-        }
-        if let Ok(mut busy) = self.inner.busy.lock() {
-            *busy = false;
-        }
-        {
-            let mut state = self.inner.state.lock().expect("state");
-            *state = FiberState::Disposed;
-        }
-        if let Some(effect) = self.inner.effect.lock().expect("effect").take() {
-            effect.dispose();
-        }
-        if let Some(registry) = self.inner.registry.upgrade() {
-            registry.unregister_plugin_fiber(self.inner.id);
-        }
+        self.inner.dispose_now();
     }
 
     pub async fn dispose_wait(&mut self) {
-        if self.inner.disposed.swap(true, Ordering::AcqRel) {
-            return;
-        }
-        if let Ok(mut busy) = self.inner.busy.lock() {
-            *busy = false;
-        }
-        {
-            let mut state = self.inner.state.lock().expect("state");
-            *state = FiberState::Disposed;
-        }
-        let effect = self.inner.effect.lock().expect("effect").take();
-        if let Some(effect) = effect {
-            effect.dispose_wait().await;
-        }
-        if let Some(registry) = self.inner.registry.upgrade() {
-            registry.unregister_plugin_fiber(self.inner.id);
-        }
+        self.inner.dispose_wait_inner().await;
     }
 
     /// 保留同一 Plugin，强制重新解析依赖并 `apply`。
@@ -126,20 +106,7 @@ impl Fiber {
     }
 
     async fn restart_inner(&mut self) -> Result<(), CoreError> {
-        let effect = self.inner.effect.lock().expect("effect").take();
-        if let Some(effect) = effect {
-            effect.dispose_wait().await;
-        }
-        if self.is_disposed() {
-            return Err(CoreError::FiberDisposed);
-        }
-        self.inner
-            .resolved_providers
-            .lock()
-            .expect("providers")
-            .clear();
-        *self.inner.last_error.lock().expect("error") = None;
-        if !self.inner.set_state_if_alive(FiberState::Pending) {
+        if !self.inner.unload_effect_to_pending().await {
             return Err(CoreError::FiberDisposed);
         }
         self.inner.try_activate().await
@@ -169,11 +136,7 @@ impl Fiber {
                     actual,
                 });
             }
-            let effect = self.inner.effect.lock().expect("effect").take();
-            if let Some(effect) = effect {
-                effect.dispose_wait().await;
-            }
-            if self.is_disposed() {
+            if !self.inner.unload_effect_to_pending().await {
                 return Err(CoreError::FiberDisposed);
             }
             let deps = plugin.inject();
@@ -185,7 +148,7 @@ impl Fiber {
                 .expect("providers")
                 .clear();
             *self.inner.last_error.lock().expect("error") = None;
-            if !self.inner.set_state_if_alive(FiberState::Pending) {
+            if !self.inner.transition_if_alive(FiberState::Pending) {
                 return Err(CoreError::FiberDisposed);
             }
             self.inner.try_activate().await
@@ -200,6 +163,141 @@ impl Fiber {
 }
 
 impl FiberInner {
+    pub(crate) fn publish_initial_state(&self) {
+        if let Some(registry) = self.registry.upgrade() {
+            registry.publish_fiber_state(FiberStateChange {
+                fiber_id: self.id,
+                plugin_key: self.plugin_key,
+                node: self.node,
+                previous: None,
+                current: FiberState::Pending,
+            });
+        }
+    }
+
+    fn publish_transition(&self, previous: FiberState, current: FiberState) {
+        if previous == current {
+            return;
+        }
+        if let Some(registry) = self.registry.upgrade() {
+            registry.publish_fiber_state(FiberStateChange {
+                fiber_id: self.id,
+                plugin_key: self.plugin_key,
+                node: self.node,
+                previous: Some(previous),
+                current,
+            });
+        }
+    }
+
+    /// 活跃生命周期转换；已释放时将状态收敛到 Disposed，拒绝后续非终态转换。
+    pub(crate) fn transition_if_alive(&self, next: FiberState) -> bool {
+        let (alive, changed) = {
+            let Ok(mut state) = self.state.lock() else {
+                return false;
+            };
+            if self.disposed.load(Ordering::Acquire) || *state == FiberState::Disposed {
+                let previous = *state;
+                if previous != FiberState::Disposed {
+                    *state = FiberState::Disposed;
+                    (false, Some((previous, FiberState::Disposed)))
+                } else {
+                    (false, None)
+                }
+            } else {
+                let previous = *state;
+                if previous != next {
+                    *state = next;
+                    (true, Some((previous, next)))
+                } else {
+                    (true, None)
+                }
+            }
+        };
+        if let Some((previous, current)) = changed {
+            self.publish_transition(previous, current);
+        }
+        alive
+    }
+
+    fn transition_disposed(&self) {
+        let changed = {
+            let Ok(mut state) = self.state.lock() else {
+                return;
+            };
+            let previous = *state;
+            if previous == FiberState::Disposed {
+                None
+            } else {
+                *state = FiberState::Disposed;
+                Some(previous)
+            }
+        };
+        if let Some(previous) = changed {
+            self.publish_transition(previous, FiberState::Disposed);
+        }
+    }
+
+    fn begin_dispose(&self) -> Option<Option<EffectScope>> {
+        if self.disposed.swap(true, Ordering::AcqRel) {
+            return None;
+        }
+        if let Ok(mut busy) = self.busy.lock() {
+            *busy = false;
+        }
+        let effect = self.effect.lock().expect("effect").take();
+        if effect.is_some() {
+            self.transition_disposing();
+        } else {
+            self.transition_disposed();
+        }
+        Some(effect)
+    }
+
+    fn transition_disposing(&self) {
+        let changed = {
+            let Ok(mut state) = self.state.lock() else {
+                return;
+            };
+            let previous = *state;
+            if previous == FiberState::Disposed || previous == FiberState::Unloading {
+                None
+            } else {
+                *state = FiberState::Unloading;
+                Some(previous)
+            }
+        };
+        if let Some(previous) = changed {
+            self.publish_transition(previous, FiberState::Unloading);
+        }
+    }
+
+    pub(crate) fn dispose_now(&self) {
+        let Some(effect) = self.begin_dispose() else {
+            return;
+        };
+        if let Some(effect) = effect {
+            effect.dispose();
+            self.transition_disposed();
+        }
+        if let Some(registry) = self.registry.upgrade() {
+            registry.unregister_plugin_fiber(self.id);
+        }
+    }
+
+    pub(crate) async fn dispose_wait_inner(&self) {
+        let Some(effect) = self.begin_dispose() else {
+            return;
+        };
+        if let Some(effect) = effect {
+            effect.dispose_wait().await;
+            self.transition_disposed();
+        }
+        if let Some(registry) = self.registry.upgrade() {
+            registry.unregister_plugin_fiber(self.id);
+        }
+    }
+
     pub(crate) fn missing_dependencies(&self) -> Vec<ServiceId> {
         let Some(registry) = self.registry.upgrade() else {
             return Vec::new();
@@ -216,6 +314,7 @@ impl FiberInner {
             FiberState::Loading => crate::diagnostics::FiberStateSnapshot::Loading,
             FiberState::Active => crate::diagnostics::FiberStateSnapshot::Active,
             FiberState::Failed => crate::diagnostics::FiberStateSnapshot::Failed,
+            FiberState::Unloading => crate::diagnostics::FiberStateSnapshot::Unloading,
             FiberState::Disposed => crate::diagnostics::FiberStateSnapshot::Disposed,
         };
         let deps = self.dependencies.lock().expect("deps").clone();
@@ -237,39 +336,27 @@ impl FiberInner {
         }
     }
 
-    /// 在同一把 state 锁内写入；已 dispose / 已是 Disposed 时保持 Disposed，返回 false。
-    pub(crate) fn set_state_if_alive(&self, next: FiberState) -> bool {
-        let Ok(mut state) = self.state.lock() else {
-            return false;
-        };
-        if self.disposed.load(Ordering::Acquire) || *state == FiberState::Disposed {
-            *state = FiberState::Disposed;
-            return false;
-        }
-        *state = next;
-        true
-    }
-
     pub(crate) fn claim_activation(&self) -> ActivateClaim {
         if self.disposed.load(Ordering::Acquire) {
             return ActivateClaim::Skipped;
         }
-        let Ok(mut state) = self.state.lock() else {
-            return ActivateClaim::Skipped;
-        };
-        if self.disposed.load(Ordering::Acquire) || *state == FiberState::Disposed {
-            *state = FiberState::Disposed;
-            return ActivateClaim::Skipped;
-        }
-        match *state {
-            FiberState::Pending => {
+        let changed = {
+            let Ok(mut state) = self.state.lock() else {
+                return ActivateClaim::Skipped;
+            };
+            if self.disposed.load(Ordering::Acquire) || *state != FiberState::Pending {
+                None
+            } else {
+                let previous = *state;
                 *state = FiberState::Loading;
-                ActivateClaim::Claimed
+                Some(previous)
             }
-            FiberState::Loading
-            | FiberState::Active
-            | FiberState::Failed
-            | FiberState::Disposed => ActivateClaim::Skipped,
+        };
+        if let Some(previous) = changed {
+            self.publish_transition(previous, FiberState::Loading);
+            ActivateClaim::Claimed
+        } else {
+            ActivateClaim::Skipped
         }
     }
 
@@ -292,7 +379,7 @@ impl FiberInner {
         }
         self.resolved_providers.lock().expect("providers").clear();
         *self.last_error.lock().expect("error") = None;
-        let _ = self.set_state_if_alive(FiberState::Pending);
+        let _ = self.transition_if_alive(FiberState::Pending);
         if mark_dirty && let Some(registry) = self.registry.upgrade() {
             registry.mark_dirty_public();
         }
@@ -307,7 +394,7 @@ impl FiberInner {
         }
 
         let Some(registry) = self.registry.upgrade() else {
-            let _ = self.set_state_if_alive(FiberState::Failed);
+            let _ = self.transition_if_alive(FiberState::Failed);
             return Err(CoreError::ContextDisposed);
         };
         let deps = self.dependencies.lock().expect("deps").clone();
@@ -321,7 +408,7 @@ impl FiberInner {
         if parent_scope.is_disposed() {
             *self.last_error.lock().expect("error") =
                 Some("parent scope disposed before apply".into());
-            let _ = self.set_state_if_alive(FiberState::Failed);
+            let _ = self.transition_if_alive(FiberState::Failed);
             return Err(CoreError::ContextDisposed);
         }
         let effect_scope = parent_scope.child_named("plugin");
@@ -330,7 +417,7 @@ impl FiberInner {
             None => {
                 effect_scope.dispose();
                 *self.last_error.lock().expect("error") = Some("mount context missing".into());
-                let _ = self.set_state_if_alive(FiberState::Failed);
+                let _ = self.transition_if_alive(FiberState::Failed);
                 return Err(CoreError::ContextDisposed);
             }
         };
@@ -353,14 +440,14 @@ impl FiberInner {
             Ok(()) => {
                 if self.disposed.load(Ordering::Acquire) {
                     effect_scope.dispose();
-                    let _ = self.set_state_if_alive(FiberState::Disposed);
+                    self.transition_disposed();
                     return Err(CoreError::FiberDisposed);
                 }
                 if effect_scope.is_disposed() || parent_scope.is_disposed() {
                     effect_scope.dispose();
                     *self.last_error.lock().expect("error") =
                         Some("plugin scope was disposed during apply".into());
-                    let _ = self.set_state_if_alive(FiberState::Failed);
+                    let _ = self.transition_if_alive(FiberState::Failed);
                     return Err(CoreError::PluginApply(
                         "plugin scope was disposed during apply".into(),
                     ));
@@ -377,7 +464,7 @@ impl FiberInner {
                 *self.effect.lock().expect("effect") = Some(effect_scope);
                 *self.resolved_providers.lock().expect("providers") = providers;
                 *self.last_error.lock().expect("error") = None;
-                if !self.set_state_if_alive(FiberState::Active) {
+                if !self.transition_if_alive(FiberState::Active) {
                     if let Some(scope) = self.effect.lock().expect("effect").take() {
                         scope.dispose();
                     }
@@ -391,22 +478,48 @@ impl FiberInner {
             Err(error) => {
                 effect_scope.dispose();
                 if self.disposed.load(Ordering::Acquire) {
-                    let _ = self.set_state_if_alive(FiberState::Disposed);
+                    self.transition_disposed();
                     return Err(CoreError::FiberDisposed);
                 }
                 *self.last_error.lock().expect("error") = Some(error.to_string());
-                let _ = self.set_state_if_alive(FiberState::Failed);
+                let _ = self.transition_if_alive(FiberState::Failed);
                 Err(CoreError::PluginApply(error.to_string()))
             }
         }
     }
 
-    pub(crate) fn unload_to_pending(&self) {
-        if let Some(effect) = self.effect.lock().expect("effect").take() {
-            effect.dispose();
+    async fn unload_effect_to_pending(&self) -> bool {
+        let effect = self.effect.lock().expect("effect").take();
+        if let Some(effect) = effect {
+            if !self.transition_if_alive(FiberState::Unloading) {
+                return false;
+            }
+            effect.dispose_wait().await;
+        }
+        if self.disposed.load(Ordering::Acquire) {
+            return false;
         }
         self.resolved_providers.lock().expect("providers").clear();
-        let _ = self.set_state_if_alive(FiberState::Pending);
+        *self.last_error.lock().expect("error") = None;
+        self.transition_if_alive(FiberState::Pending)
+    }
+
+    pub(crate) async fn unload_to_pending_wait(&self) -> bool {
+        if self.disposed.load(Ordering::Acquire) {
+            return false;
+        }
+        {
+            let Ok(mut busy) = self.busy.lock() else {
+                return false;
+            };
+            if *busy {
+                return false;
+            }
+            *busy = true;
+        }
+        let result = self.unload_effect_to_pending().await;
+        *self.busy.lock().expect("busy") = false;
+        result
     }
 }
 

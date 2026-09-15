@@ -76,8 +76,9 @@ cargo run -p cordis-core --example reactive
 - `Runtime::new()` 须在 Tokio 中调用；专用调度器处理 dirty 重算。
 - `Context::extend()`：创建不拥有独立生命周期的派生视图。
 - `isolate` / `isolate_with`：创建仅对派生视图生效的 ServiceKey 隔离标签（不可跨 Runtime）。
-- Context 不可释放；资源由 `Runtime`、`EffectContext` 或 `Fiber` 持有和释放。
+- Context 不可释放；资源由 `Runtime`、`EffectContext` 或 `Fiber` 持有和释放。Fiber 在重启、替换或依赖变更时会先进入 `Unloading`，旧任务退出后才重新激活。
 - `Context::plugin` 返回 `Fiber`（`restart` / 同 Key `replace` / `dispose_wait`）；跨 Key 用 `Runtime::unmount`。
+- `Runtime::subscribe_fiber_states()` 提供 Fiber 只读状态广播；订阅者滞后时使用 `Runtime::diagnostics()` 重建快照。
 - 具名 Effect + 诊断树（plugin_fibers / plugin_registry / inject_fibers / effects）。
 - 事件四模式：Observe / Waterfall / Serial / Parallel；支持 `ListenOptions`（once / prepend / global / filter）。
 - `ConfigKey` + `intercept` / `config`：派生配置覆盖，不影响 Service。
