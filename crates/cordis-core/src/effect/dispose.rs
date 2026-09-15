@@ -3,7 +3,11 @@
 //! 同步 cleanup 立即执行；等待顺序为：子 Scope 完成 → 当前异步 disposer LIFO → 当前受控任务。
 //! 资源集合定义见 `resources`，本文件只管处置时序。
 
-use std::sync::{Arc, Weak, atomic::Ordering};
+use std::{
+    any::Any,
+    panic::{AssertUnwindSafe, catch_unwind},
+    sync::{Arc, Weak, atomic::Ordering},
+};
 
 use crate::CoreError;
 
@@ -11,6 +15,7 @@ use super::{
     EffectScope, EffectScopeInner,
     resources::{ManagedWork, abort_work},
 };
+use futures_util::FutureExt;
 use tokio::{sync::Notify, task::JoinHandle};
 
 pub(super) struct DisposeCompletion {
@@ -71,6 +76,27 @@ pub(super) enum DisposePolicy {
     AwaitLocal,
 }
 
+fn format_panic_payload(payload: Box<dyn Any + Send>) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        format!("dispose callback panicked: {message}")
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        format!("dispose callback panicked: {message}")
+    } else {
+        "dispose callback panicked".to_string()
+    }
+}
+
+fn run_sync_cleanup(cleanup: Box<dyn FnOnce() + Send>) {
+    let _ = catch_unwind(AssertUnwindSafe(cleanup));
+}
+
+/// 运行同步 cleanup；panic 写入 `errors` 并继续。
+fn run_sync_cleanup_collect(cleanup: Box<dyn FnOnce() + Send>, errors: &mut Vec<String>) {
+    if let Err(payload) = catch_unwind(AssertUnwindSafe(cleanup)) {
+        errors.push(format_panic_payload(payload));
+    }
+}
+
 impl EffectScope {
     pub(crate) fn dispose(&self) {
         let _ = self.begin_dispose(DisposePolicy::HoistToParent);
@@ -101,7 +127,7 @@ impl EffectScope {
             child.abandon();
         }
         for cleanup in cleanups.into_iter().rev() {
-            cleanup();
+            run_sync_cleanup(cleanup);
         }
         abort_work(work);
         completion.finish(Ok(()));
@@ -146,8 +172,9 @@ impl EffectScope {
         for child in children.into_iter().rev() {
             child.dispose();
         }
+        let mut sync_errors = Vec::new();
         for cleanup in cleanups.into_iter().rev() {
-            cleanup();
+            run_sync_cleanup_collect(cleanup, &mut sync_errors);
         }
 
         let mut child_waits = Vec::new();
@@ -162,7 +189,7 @@ impl EffectScope {
         let handle = self.inner.handle.clone();
         let completion_for_task = completion.clone();
         let coordinator = handle.spawn(async move {
-            let mut errors = Vec::new();
+            let mut errors = sync_errors;
             // 子 Scope 必须先完整释放；父 Scope 的 async disposer 才能安全关闭
             // 自己拥有、但可能仍被子资源使用的连接或句柄。
             for join in child_waits {
@@ -175,9 +202,10 @@ impl EffectScope {
                 }
             }
             for disposer in async_disposers.into_iter().rev() {
-                match disposer().await {
-                    Ok(()) => {}
-                    Err(error) => errors.push(error.to_string()),
+                match AssertUnwindSafe(disposer()).catch_unwind().await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => errors.push(error.to_string()),
+                    Err(payload) => errors.push(format_panic_payload(payload)),
                 }
             }
             for join in tasks {
@@ -280,7 +308,7 @@ impl Drop for EffectScopeInner {
                     child.abandon();
                 }
                 for cleanup in cleanups.into_iter().rev() {
-                    cleanup();
+                    run_sync_cleanup(cleanup);
                 }
                 let parent = self
                     .parent

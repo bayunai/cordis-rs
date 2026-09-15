@@ -12,9 +12,10 @@ use crate::{
     registry::Registry,
 };
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicBool, Ordering},
 };
+use tokio::sync::Notify;
 
 /// Runtime 的所有 Context 与 Effect 的根所有者。
 ///
@@ -30,7 +31,47 @@ pub struct Runtime {
 struct RuntimeInner {
     registry: Arc<Registry>,
     root: Context,
-    shutdown_completed: AtomicBool,
+    shutdown: Mutex<Option<Arc<ShutdownCompletion>>>,
+    /// 受控 shutdown 已完成 `stop_scheduler().await`；供 Drop 跳过 abort。
+    scheduler_awaited: AtomicBool,
+}
+
+struct ShutdownCompletion {
+    notify: Notify,
+    result: Mutex<Option<Result<(), CoreError>>>,
+}
+
+impl ShutdownCompletion {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            notify: Notify::new(),
+            result: Mutex::new(None),
+        })
+    }
+
+    fn finish(&self, result: Result<(), CoreError>) {
+        {
+            let mut slot = self.result.lock().expect("shutdown completion");
+            if slot.is_some() {
+                return;
+            }
+            *slot = Some(result);
+        }
+        self.notify.notify_waiters();
+    }
+
+    async fn wait(self: &Arc<Self>) -> Result<(), CoreError> {
+        loop {
+            let notified = self.notify.notified();
+            {
+                let slot = self.result.lock().expect("shutdown completion");
+                if let Some(result) = slot.as_ref() {
+                    return result.clone();
+                }
+            }
+            notified.await;
+        }
+    }
 }
 
 impl Runtime {
@@ -57,7 +98,8 @@ impl Runtime {
                         scope: root_scope,
                     }),
                 },
-                shutdown_completed: AtomicBool::new(false),
+                shutdown: Mutex::new(None),
+                scheduler_awaited: AtomicBool::new(false),
             }),
         })
     }
@@ -76,15 +118,33 @@ impl Runtime {
     /// 受控关闭：Root dispose_wait → settle → 等待调度器退出。
     ///
     /// 这是宿主应使用的正常关闭路径。释放错误仍会完成 settle 与停调度器后返回。
+    /// 并发与后续调用共享同一轮 completion 与同一结果。
     pub async fn shutdown(&self) -> Result<(), CoreError> {
-        if self.inner.shutdown_completed.swap(true, Ordering::AcqRel) {
-            // 已关闭过：仍确保调度器已停并 awaited。
-            self.inner.registry.stop_scheduler().await;
-            return Ok(());
+        enum Start {
+            Wait(Arc<ShutdownCompletion>),
+            Lead(Arc<ShutdownCompletion>),
         }
+        let start = {
+            let mut slot = self.inner.shutdown.lock().expect("shutdown slot");
+            if let Some(existing) = slot.as_ref() {
+                Start::Wait(existing.clone())
+            } else {
+                let completion = ShutdownCompletion::new();
+                *slot = Some(completion.clone());
+                Start::Lead(completion)
+            }
+        };
+
+        let completion = match start {
+            Start::Wait(existing) => return existing.wait().await,
+            Start::Lead(completion) => completion,
+        };
+
         let dispose_result = self.inner.root.inner.scope.dispose_wait().await;
         self.inner.registry.settle().await;
         self.inner.registry.stop_scheduler().await;
+        self.inner.scheduler_awaited.store(true, Ordering::Release);
+        completion.finish(dispose_result.clone());
         dispose_result
     }
 
@@ -130,7 +190,7 @@ impl Runtime {
 
 impl Drop for RuntimeInner {
     fn drop(&mut self) {
-        if self.shutdown_completed.load(Ordering::Acquire) {
+        if self.scheduler_awaited.load(Ordering::Acquire) {
             // shutdown 已 await 调度器；Handle 已被 take。
             return;
         }

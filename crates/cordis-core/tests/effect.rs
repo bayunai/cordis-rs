@@ -103,6 +103,66 @@ async fn shutdown_stops_scheduler_and_rejects_root_ops() {
     ));
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_and_subsequent_shutdown_share_same_dispose_failed() {
+    let runtime = runtime();
+    let effect = runtime.root().effect().unwrap();
+    let (started_tx, started_rx) = oneshot::channel::<()>();
+    let (release_tx, release_rx) = oneshot::channel::<()>();
+    let started_tx = Arc::new(Mutex::new(Some(started_tx)));
+    let release_rx = Arc::new(Mutex::new(Some(release_rx)));
+    effect
+        .on_dispose_async(move || {
+            let started_tx = started_tx.clone();
+            let release_rx = release_rx.clone();
+            async move {
+                if let Some(tx) = started_tx.lock().expect("started").take() {
+                    let _ = tx.send(());
+                }
+                let receiver = release_rx.lock().expect("release").take();
+                if let Some(rx) = receiver {
+                    let _ = rx.await;
+                }
+                Err(CoreError::EventListener("shared shutdown boom".into()))
+            }
+        })
+        .unwrap();
+
+    let first = {
+        let runtime = runtime.clone();
+        tokio::spawn(async move { runtime.shutdown().await })
+    };
+    started_rx.await.expect("dispose started");
+    let second = {
+        let runtime = runtime.clone();
+        tokio::spawn(async move { runtime.shutdown().await })
+    };
+    tokio::task::yield_now().await;
+    let _ = release_tx.send(());
+
+    let err_a = first.await.expect("join a").expect_err("a");
+    let err_b = second.await.expect("join b").expect_err("b");
+    for error in [&err_a, &err_b] {
+        match error {
+            CoreError::DisposeFailed { errors } => {
+                assert!(
+                    errors
+                        .iter()
+                        .any(|item| item.contains("shared shutdown boom")),
+                    "missing boom: {errors:?}"
+                );
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+    assert_eq!(format!("{err_a:?}"), format!("{err_b:?}"));
+    assert!(runtime.scheduler_stopped());
+
+    let err_later = runtime.shutdown().await.expect_err("subsequent");
+    assert_eq!(format!("{err_a:?}"), format!("{err_later:?}"));
+    assert!(runtime.scheduler_stopped());
+}
+
 #[tokio::test]
 async fn dispose_cancels_without_abort_shutdown_waits() {
     let runtime = runtime();
@@ -354,6 +414,106 @@ async fn dispose_wait_aggregates_async_disposer_errors_and_continues() {
             assert_eq!(errors.len(), 2);
             assert!(errors.iter().any(|item| item.contains("first")));
             assert!(errors.iter().any(|item| item.contains("second")));
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+    runtime.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn dispose_wait_captures_sync_cleanup_panic_and_continues() {
+    let runtime = runtime();
+    let root = runtime.root();
+    let effect = root.effect().unwrap();
+    let ran = Arc::new(AtomicUsize::new(0));
+
+    let first = ran.clone();
+    effect.on_dispose(move || {
+        first.fetch_add(1, Ordering::SeqCst);
+    });
+    effect.on_dispose(|| panic!("sync boom"));
+    let third = ran.clone();
+    effect.on_dispose(move || {
+        third.fetch_add(1, Ordering::SeqCst);
+    });
+
+    let error = effect.dispose_wait().await.expect_err("sync panic");
+    assert_eq!(ran.load(Ordering::SeqCst), 2);
+    match error {
+        CoreError::DisposeFailed { errors } => {
+            assert_eq!(errors.len(), 1);
+            assert!(errors[0].contains("sync boom"));
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+    runtime.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn dispose_wait_captures_async_disposer_panic_and_continues() {
+    let runtime = runtime();
+    let root = runtime.root();
+    let effect = root.effect().unwrap();
+    let ran = Arc::new(AtomicUsize::new(0));
+
+    let first = ran.clone();
+    effect
+        .on_dispose_async(move || {
+            let first = first.clone();
+            async move {
+                first.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        })
+        .unwrap();
+    effect
+        .on_dispose_async(|| async move { panic!("async boom") })
+        .unwrap();
+    let third = ran.clone();
+    effect
+        .on_dispose_async(move || {
+            let third = third.clone();
+            async move {
+                third.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        })
+        .unwrap();
+
+    let error = effect.dispose_wait().await.expect_err("async panic");
+    assert_eq!(ran.load(Ordering::SeqCst), 2);
+    match error {
+        CoreError::DisposeFailed { errors } => {
+            assert_eq!(errors.len(), 1);
+            assert!(errors[0].contains("async boom"));
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+    runtime.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn parent_dispose_wait_hoists_child_disposer_panic() {
+    let runtime = runtime();
+    let root = runtime.root();
+    let parent = root.effect().unwrap();
+    let child = parent.extend().unwrap().effect().unwrap();
+    child.on_dispose(|| panic!("child sync boom"));
+    child
+        .on_dispose_async(|| async move { panic!("child async boom") })
+        .unwrap();
+
+    let error = parent.dispose_wait().await.expect_err("hoisted panic");
+    match error {
+        CoreError::DisposeFailed { errors } => {
+            assert!(
+                errors.iter().any(|item| item.contains("child sync boom")),
+                "missing sync panic: {errors:?}"
+            );
+            assert!(
+                errors.iter().any(|item| item.contains("child async boom")),
+                "missing async panic: {errors:?}"
+            );
         }
         other => panic!("unexpected error: {other:?}"),
     }

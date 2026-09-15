@@ -51,6 +51,44 @@ async fn plugin_apply_error_surfaces() {
     assert!(fiber.last_error().is_some());
 }
 
+struct SettleInApplyPlugin {
+    runtime: Runtime,
+}
+
+#[async_trait]
+impl Plugin for SettleInApplyPlugin {
+    fn key(&self) -> cordis_core::PluginKey {
+        cordis_core::PluginKey::new("test.settle-in-apply")
+    }
+    async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
+        // 若调度器在 await apply 时仍持有 recompute_lock / 或 settle 等待本轮 recompute，会死锁。
+        self.runtime.settle().await;
+        ctx.provide(NUMBER, Number(1))?;
+        Ok(())
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn plugin_apply_calling_settle_does_not_deadlock() {
+    let runtime = runtime();
+    let root = runtime.root();
+    let mount = {
+        let runtime = runtime.clone();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            root.plugin(Arc::new(SettleInApplyPlugin { runtime })),
+        )
+    };
+    let mut fiber = mount
+        .await
+        .expect("mount timed out — likely deadlock")
+        .unwrap();
+    assert_eq!(fiber.state(), FiberState::Active);
+    assert_eq!(root.get(NUMBER).unwrap().0, 1);
+    fiber.dispose_wait().await.expect("dispose_wait");
+    runtime.shutdown().await.expect("shutdown");
+}
+
 #[tokio::test]
 async fn plugin_remount_does_not_accumulate_child_scopes() {
     let runtime = runtime();

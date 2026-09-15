@@ -4,7 +4,7 @@
 
 use crate::service::ServiceId;
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum CoreError {
     #[error("Context 已释放")]
     ContextDisposed,

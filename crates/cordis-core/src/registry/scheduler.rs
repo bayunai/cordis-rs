@@ -4,12 +4,35 @@
 
 use crate::{
     CoreError,
+    effect::EffectScope,
     fiber::{FiberInner, FiberState},
-    registry::Registry,
+    registry::{InjectionId, Registry},
     service::resolver::provider_ids,
 };
 use std::sync::{Arc, Weak, atomic::Ordering};
 use tokio::task::JoinHandle;
+
+tokio::task_local! {
+    /// 当前任务正处于锁外执行的 inject / Plugin::apply 用户 Future 中。
+    static IN_RECOMPUTE_USER: ();
+}
+
+struct RecomputeBatch {
+    epoch: u64,
+    ready: Vec<InjectionId>,
+    stale_scopes: Vec<EffectScope>,
+    unload: Vec<Arc<FiberInner>>,
+    activate: Vec<Arc<FiberInner>>,
+}
+
+impl RecomputeBatch {
+    fn is_empty(&self) -> bool {
+        self.ready.is_empty()
+            && self.stale_scopes.is_empty()
+            && self.unload.is_empty()
+            && self.activate.is_empty()
+    }
+}
 
 impl Registry {
     /// 启动唯一的响应式重算调度器；必须在 Tokio Runtime 内调用一次。
@@ -77,6 +100,11 @@ impl Registry {
     }
 
     pub(crate) async fn settle(self: &Arc<Self>) {
+        // 嵌套于本轮 recompute 的用户 Future：已在 flush 中，不可再等待 quiescent。
+        if IN_RECOMPUTE_USER.try_with(|_| ()).is_ok() {
+            return;
+        }
+
         loop {
             // 先登记 waiter，再检查状态，避免丢失 notify_waiters。
             let notified = self.quiescent.notified();
@@ -107,44 +135,87 @@ impl Registry {
 
     pub(crate) fn mark_dirty(self: &Arc<Self>) {
         self.dirty.store(true, Ordering::Release);
+        self.recompute_epoch.fetch_add(1, Ordering::AcqRel);
         if self.scheduler_stopped.load(Ordering::Acquire) {
             return;
         }
         self.wake.notify_one();
     }
 
+    /// 锁内取批 / 锁外执行用户 Future / 带 epoch 校验收尾。
     async fn recompute(self: Arc<Self>) {
-        let _guard = self.recompute_lock.lock().await;
-        self.recomputing.store(true, Ordering::Release);
-        loop {
-            if !self.dirty.swap(false, Ordering::AcqRel) {
-                break;
-            }
-            loop {
-                let ready = self.take_ready();
-                let ready_plugins = self.take_ready_plugin_fibers().await;
-                if ready.is_empty() && ready_plugins.is_empty() {
-                    break;
-                }
-                for injection in ready {
-                    self.run_injection(injection).await;
-                }
-                for fiber in ready_plugins {
-                    self.run_plugin_fiber(fiber).await;
-                }
+        {
+            let _guard = self.recompute_lock.lock().await;
+            if self.recomputing.swap(true, Ordering::AcqRel) {
+                // 已有会话在飞；本轮脏标记会由在飞会话收尾时看到。
+                return;
             }
         }
-        self.recomputing.store(false, Ordering::Release);
-        self.quiescent.notify_waiters();
-        if self.dirty.load(Ordering::Acquire) && !self.scheduler_stopped.load(Ordering::Acquire) {
-            self.wake.notify_one();
+
+        loop {
+            let batch = {
+                let _guard = self.recompute_lock.lock().await;
+                let epoch = self.recompute_epoch.load(Ordering::Acquire);
+                let _ = self.dirty.swap(false, Ordering::AcqRel);
+                let injection = self.take_ready();
+                let (unload, activate) = self.classify_plugin_fibers();
+                RecomputeBatch {
+                    epoch,
+                    ready: injection.ready,
+                    stale_scopes: injection.stale_scopes,
+                    unload,
+                    activate,
+                }
+            };
+
+            if batch.is_empty() {
+                let _guard = self.recompute_lock.lock().await;
+                let epoch_advanced = self.recompute_epoch.load(Ordering::Acquire) != batch.epoch;
+                if self.dirty.load(Ordering::Acquire) || epoch_advanced {
+                    continue;
+                }
+                self.recomputing.store(false, Ordering::Release);
+                self.quiescent.notify_waiters();
+                if self.dirty.load(Ordering::Acquire)
+                    && !self.scheduler_stopped.load(Ordering::Acquire)
+                {
+                    self.wake.notify_one();
+                }
+                return;
+            }
+
+            // 锁外：用户 sync cleanup / unload wait / inject / Plugin::apply。
+            for scope in batch.stale_scopes {
+                scope.dispose();
+            }
+            for fiber in batch.unload {
+                let _ = fiber.unload_to_pending_wait().await;
+            }
+            for injection in batch.ready {
+                let registry = self.clone();
+                IN_RECOMPUTE_USER
+                    .scope((), async move {
+                        registry.run_injection(injection).await;
+                    })
+                    .await;
+            }
+            for fiber in batch.activate {
+                let registry = self.clone();
+                IN_RECOMPUTE_USER
+                    .scope((), async move {
+                        registry.run_plugin_fiber(fiber).await;
+                    })
+                    .await;
+            }
+            // unload 后 Pending 可能已就绪且未 mark_dirty；下一轮再取批即可。
         }
     }
 
-    async fn take_ready_plugin_fibers(&self) -> Vec<Arc<FiberInner>> {
+    /// 仅识别需 unload / 可 activate 的 Fiber；禁止在此 await。
+    fn classify_plugin_fibers(&self) -> (Vec<Arc<FiberInner>>, Vec<Arc<FiberInner>>) {
         let fibers = {
             let Ok(state) = self.state.lock() else {
-                return Vec::new();
+                return (Vec::new(), Vec::new());
             };
             state
                 .plugin_fibers
@@ -154,7 +225,8 @@ impl Registry {
                 .collect::<Vec<_>>()
         };
 
-        let mut ready = Vec::new();
+        let mut unload = Vec::new();
+        let mut activate = Vec::new();
         for fiber in fibers {
             if fiber.disposed.load(Ordering::Acquire) {
                 continue;
@@ -172,25 +244,15 @@ impl Registry {
             };
             let state = *fiber.state.lock().expect("state");
             if state == FiberState::Active && resolved != providers {
-                let _ = fiber.unload_to_pending_wait().await;
-            }
-            if fiber.busy.lock().map(|guard| *guard).unwrap_or(true) {
+                unload.push(fiber);
                 continue;
             }
-            let deps = fiber.dependencies.lock().expect("deps").clone();
-            let providers = {
-                let Ok(state) = self.state.lock() else {
-                    continue;
-                };
-                provider_ids(&state, fiber.node, &deps)
-            };
-            let state = *fiber.state.lock().expect("state");
             let deps_ready = providers.len() == deps.len();
             if state == FiberState::Pending && deps_ready {
-                ready.push(fiber);
+                activate.push(fiber);
             }
         }
-        ready
+        (unload, activate)
     }
 
     async fn run_plugin_fiber(self: &Arc<Self>, fiber: Arc<FiberInner>) {
