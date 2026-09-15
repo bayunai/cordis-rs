@@ -30,6 +30,72 @@ async fn late_provider_activates_consumer_without_manual_settle() {
 }
 
 #[tokio::test]
+async fn scheduler_injection_calling_settle_does_not_deadlock() {
+    let runtime = runtime();
+    let root = runtime.root();
+    let activated = Arc::new(AtomicUsize::new(0));
+    let observed = activated.clone();
+    let runtime_for_callback = runtime.clone();
+    let handle = root
+        .inject([NUMBER.id()], move |services, _effect| {
+            let observed = observed.clone();
+            let runtime = runtime_for_callback.clone();
+            async move {
+                runtime.settle().await;
+                assert_eq!(services.get(NUMBER)?.0, 7);
+                observed.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        })
+        .unwrap();
+    assert_eq!(handle.state(), InjectionState::Pending);
+
+    root.effect().unwrap().provide(NUMBER, Number(7)).unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        wait_injection(&handle, InjectionState::Active),
+    )
+    .await
+    .expect("scheduler injection timed out — likely settle deadlock");
+    assert_eq!(activated.load(Ordering::SeqCst), 1);
+    runtime.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn injection_callback_panic_fails_only_that_injection_and_scheduler_continues() {
+    let runtime = runtime();
+    let root = runtime.root();
+    let failed = root
+        .inject(
+            [NUMBER.id()],
+            |_services, _effect| -> std::future::Ready<Result<(), CoreError>> {
+                panic!("injection callback boom");
+            },
+        )
+        .unwrap();
+    let healthy_runs = Arc::new(AtomicUsize::new(0));
+    let counter = healthy_runs.clone();
+    let healthy = root
+        .inject([NUMBER.id()], move |_services, _effect| {
+            let counter = counter.clone();
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        })
+        .unwrap();
+
+    root.effect().unwrap().provide(NUMBER, Number(1)).unwrap();
+    wait_injection(&failed, InjectionState::Failed).await;
+    wait_injection(&healthy, InjectionState::Active).await;
+    assert_eq!(healthy_runs.load(Ordering::SeqCst), 1);
+    tokio::time::timeout(std::time::Duration::from_secs(2), runtime.settle())
+        .await
+        .expect("scheduler must remain available after injection panic");
+    runtime.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
 async fn provider_removal_disposes_consumer_and_reactivation_rebuilds_it() {
     let runtime = runtime();
     let root = runtime.root();

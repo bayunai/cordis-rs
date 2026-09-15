@@ -5,10 +5,18 @@
 use crate::{
     CoreError, ServiceId, Services,
     effect::EffectScope,
+    error::format_panic_message,
     registry::{InjectionId, NodeId, Registry},
     service::resolver::{provider_ids, resolve_provider},
 };
-use std::{collections::HashMap, future::Future, pin::Pin, sync::Arc};
+use futures_util::FutureExt;
+use std::{
+    collections::HashMap,
+    future::Future,
+    panic::{AssertUnwindSafe, catch_unwind},
+    pin::Pin,
+    sync::Arc,
+};
 
 type InjectFuture = Pin<Box<dyn Future<Output = Result<(), CoreError>> + Send>>;
 pub(crate) type InjectCallback = Arc<dyn Fn(Services, EffectScope) -> InjectFuture + Send + Sync>;
@@ -44,6 +52,20 @@ pub(crate) struct InjectionSnapshot {
     pub(crate) providers: Vec<u64>,
     pub(crate) node: NodeId,
     pub(crate) deps: Vec<ServiceId>,
+}
+
+async fn invoke_callback(
+    callback: &InjectCallback,
+    services: Services,
+    child: EffectScope,
+) -> Result<(), String> {
+    let future = catch_unwind(AssertUnwindSafe(|| callback(services, child)))
+        .map_err(|payload| format_panic_message("injection callback", payload))?;
+    match AssertUnwindSafe(future).catch_unwind().await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(error.to_string()),
+        Err(payload) => Err(format_panic_message("injection callback", payload)),
+    }
 }
 
 impl Registry {
@@ -189,7 +211,7 @@ impl Registry {
             return;
         };
         let child = snapshot.parent.child();
-        let outcome = (snapshot.callback)(snapshot.services, child.clone()).await;
+        let outcome = invoke_callback(&snapshot.callback, snapshot.services, child.clone()).await;
         let fresh = {
             let Ok(state) = self.state.lock() else {
                 child.dispose();

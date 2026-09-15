@@ -15,7 +15,7 @@ use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
 };
-use tokio::sync::Notify;
+use tokio::{runtime::Handle, sync::Notify, task::JoinHandle};
 
 /// Runtime 的所有 Context 与 Effect 的根所有者。
 ///
@@ -31,6 +31,7 @@ pub struct Runtime {
 struct RuntimeInner {
     registry: Arc<Registry>,
     root: Context,
+    handle: Handle,
     shutdown: Mutex<Option<Arc<ShutdownCompletion>>>,
     /// 受控 shutdown 已完成 `stop_scheduler().await`；供 Drop 跳过 abort。
     scheduler_awaited: AtomicBool,
@@ -39,6 +40,9 @@ struct RuntimeInner {
 struct ShutdownCompletion {
     notify: Notify,
     result: Mutex<Option<Result<(), CoreError>>>,
+    /// 保持关闭协调器独立于任一调用者 future；首个 shutdown() 调用者取消后，
+    /// 其余等待者仍能取得同一轮结果。
+    retain: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl ShutdownCompletion {
@@ -46,7 +50,12 @@ impl ShutdownCompletion {
         Arc::new(Self {
             notify: Notify::new(),
             result: Mutex::new(None),
+            retain: Mutex::new(None),
         })
+    }
+
+    fn attach_coordinator(&self, handle: JoinHandle<()>) {
+        *self.retain.lock().expect("shutdown retain") = Some(handle);
     }
 
     fn finish(&self, result: Result<(), CoreError>) {
@@ -80,7 +89,7 @@ impl Runtime {
         registry.start_scheduler()?;
         let root_id = registry.allocate_id();
         let handle = tokio::runtime::Handle::current();
-        let root_scope = EffectScope::root(handle);
+        let root_scope = EffectScope::root(handle.clone());
         registry.add_node(
             root_id,
             None,
@@ -98,6 +107,7 @@ impl Runtime {
                         scope: root_scope,
                     }),
                 },
+                handle,
                 shutdown: Mutex::new(None),
                 scheduler_awaited: AtomicBool::new(false),
             }),
@@ -120,32 +130,31 @@ impl Runtime {
     /// 这是宿主应使用的正常关闭路径。释放错误仍会完成 settle 与停调度器后返回。
     /// 并发与后续调用共享同一轮 completion 与同一结果。
     pub async fn shutdown(&self) -> Result<(), CoreError> {
-        enum Start {
-            Wait(Arc<ShutdownCompletion>),
-            Lead(Arc<ShutdownCompletion>),
-        }
-        let start = {
+        let (completion, start_coordinator) = {
             let mut slot = self.inner.shutdown.lock().expect("shutdown slot");
             if let Some(existing) = slot.as_ref() {
-                Start::Wait(existing.clone())
+                (existing.clone(), false)
             } else {
                 let completion = ShutdownCompletion::new();
                 *slot = Some(completion.clone());
-                Start::Lead(completion)
+                (completion, true)
             }
         };
 
-        let completion = match start {
-            Start::Wait(existing) => return existing.wait().await,
-            Start::Lead(completion) => completion,
-        };
+        if start_coordinator {
+            let inner = self.inner.clone();
+            let completion_for_task = completion.clone();
+            let coordinator = self.inner.handle.spawn(async move {
+                let dispose_result = inner.root.inner.scope.dispose_wait().await;
+                inner.registry.settle().await;
+                inner.registry.stop_scheduler().await;
+                inner.scheduler_awaited.store(true, Ordering::Release);
+                completion_for_task.finish(dispose_result);
+            });
+            completion.attach_coordinator(coordinator);
+        }
 
-        let dispose_result = self.inner.root.inner.scope.dispose_wait().await;
-        self.inner.registry.settle().await;
-        self.inner.registry.stop_scheduler().await;
-        self.inner.scheduler_awaited.store(true, Ordering::Release);
-        completion.finish(dispose_result.clone());
-        dispose_result
+        completion.wait().await
     }
 
     /// 调度器是否已停止（测试/诊断）。

@@ -3,8 +3,25 @@
 //! 认领 Pending→Loading，解析依赖并调用 Plugin::apply；生命周期入口在 `lifecycle`。
 
 use super::{ActivateClaim, FiberInner, FiberState};
-use crate::{Context, CoreError, ServiceId, effect::EffectScope};
-use std::sync::{Arc, atomic::Ordering};
+use crate::{Context, CoreError, ServiceId, effect::EffectScope, error::format_panic_message};
+use futures_util::FutureExt;
+use std::{
+    panic::{AssertUnwindSafe, catch_unwind},
+    sync::{Arc, atomic::Ordering},
+};
+
+async fn invoke_plugin_apply(
+    plugin: &Arc<dyn crate::plugin::Plugin>,
+    context: &Context,
+) -> Result<(), String> {
+    let future = catch_unwind(AssertUnwindSafe(|| plugin.apply(context)))
+        .map_err(|payload| format_panic_message("plugin apply", payload))?;
+    match AssertUnwindSafe(future).catch_unwind().await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(error.to_string()),
+        Err(payload) => Err(format_panic_message("plugin apply", payload)),
+    }
+}
 
 impl FiberInner {
     pub(crate) fn claim_activation(&self) -> ActivateClaim {
@@ -107,7 +124,7 @@ impl FiberInner {
             Some(self.id),
             &effect_scope,
         );
-        match plugin.apply(&apply_ctx).await {
+        match invoke_plugin_apply(&plugin, &apply_ctx).await {
             Ok(()) => {
                 if self.disposed.load(Ordering::Acquire) {
                     effect_scope.dispose();

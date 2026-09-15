@@ -800,3 +800,86 @@ async fn drop_runtime_without_shutdown_does_not_run_pending_async_disposers() {
         "Drop must not start pending async disposers"
     );
 }
+
+#[tokio::test]
+async fn async_disposer_factory_panic_is_collected_and_later_cleanup_runs() {
+    fn panic_factory() -> std::future::Ready<Result<(), CoreError>> {
+        panic!("factory boom");
+    }
+
+    let runtime = runtime();
+    let effect = runtime.root().effect().unwrap();
+    let completed = Arc::new(AtomicBool::new(false));
+    let observed = completed.clone();
+    effect
+        .on_dispose_async(move || async move {
+            observed.store(true, Ordering::SeqCst);
+            Ok(())
+        })
+        .unwrap();
+    effect.on_dispose_async(panic_factory).unwrap();
+
+    let error = effect.dispose_wait().await.expect_err("factory panic");
+    assert!(completed.load(Ordering::SeqCst));
+    match error {
+        CoreError::DisposeFailed { errors } => assert!(
+            errors
+                .iter()
+                .any(|item| item.contains("dispose callback") && item.contains("factory boom")),
+            "missing factory panic: {errors:?}"
+        ),
+        other => panic!("unexpected: {other:?}"),
+    }
+    runtime.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_coordinator_survives_first_waiter_abort() {
+    let runtime = runtime();
+    let effect = runtime.root().effect().unwrap();
+    let (started_tx, started_rx) = oneshot::channel::<()>();
+    let (release_tx, release_rx) = oneshot::channel::<()>();
+    let started_tx = Arc::new(Mutex::new(Some(started_tx)));
+    let release_rx = Arc::new(Mutex::new(Some(release_rx)));
+    effect
+        .on_dispose_async(move || {
+            let started_tx = started_tx.clone();
+            let release_rx = release_rx.clone();
+            async move {
+                if let Some(tx) = started_tx.lock().expect("started").take() {
+                    let _ = tx.send(());
+                }
+                let receiver = release_rx.lock().expect("release").take();
+                if let Some(rx) = receiver {
+                    let _ = rx.await;
+                }
+                Ok(())
+            }
+        })
+        .unwrap();
+
+    let first = {
+        let runtime = runtime.clone();
+        tokio::spawn(async move { runtime.shutdown().await })
+    };
+    started_rx.await.expect("shutdown disposal started");
+    first.abort();
+    assert!(
+        first
+            .await
+            .expect_err("first caller must be aborted")
+            .is_cancelled()
+    );
+
+    let second = {
+        let runtime = runtime.clone();
+        tokio::spawn(async move { runtime.shutdown().await })
+    };
+    let _ = release_tx.send(());
+    tokio::time::timeout(std::time::Duration::from_secs(2), second)
+        .await
+        .expect("second shutdown waiter timed out")
+        .expect("second shutdown join")
+        .expect("shutdown result");
+    assert!(runtime.scheduler_stopped());
+}

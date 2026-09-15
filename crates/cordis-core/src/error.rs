@@ -3,6 +3,18 @@
 //! 覆盖 Context、Service、事件、Fiber、注入与调度等失败路径。
 
 use crate::service::ServiceId;
+use std::any::Any;
+
+/// 将扩展边界捕获到的 panic 转换为可诊断、但不泄漏非字符串载荷的错误文本。
+pub(crate) fn format_panic_message(boundary: &str, payload: Box<dyn Any + Send>) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        format!("{boundary} panicked: {message}")
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        format!("{boundary} panicked: {message}")
+    } else {
+        format!("{boundary} panicked")
+    }
+}
 
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum CoreError {

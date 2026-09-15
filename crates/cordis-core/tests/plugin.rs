@@ -60,10 +60,14 @@ impl Plugin for SettleInApplyPlugin {
     fn key(&self) -> cordis_core::PluginKey {
         cordis_core::PluginKey::new("test.settle-in-apply")
     }
+    fn inject(&self) -> Vec<cordis_core::ServiceId> {
+        vec![NUMBER.id()]
+    }
     async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
         // 若调度器在 await apply 时仍持有 recompute_lock / 或 settle 等待本轮 recompute，会死锁。
         self.runtime.settle().await;
-        ctx.provide(NUMBER, Number(1))?;
+        assert_eq!(ctx.get(NUMBER)?.0, 1);
+        ctx.provide(DERIVED, Number(2))?;
         Ok(())
     }
 }
@@ -72,20 +76,94 @@ impl Plugin for SettleInApplyPlugin {
 async fn plugin_apply_calling_settle_does_not_deadlock() {
     let runtime = runtime();
     let root = runtime.root();
-    let mount = {
-        let runtime = runtime.clone();
-        tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            root.plugin(Arc::new(SettleInApplyPlugin { runtime })),
-        )
-    };
-    let mut fiber = mount
+    let mut fiber = root
+        .plugin(Arc::new(SettleInApplyPlugin {
+            runtime: runtime.clone(),
+        }))
         .await
-        .expect("mount timed out — likely deadlock")
         .unwrap();
+    assert_eq!(fiber.state(), FiberState::Pending);
+
+    // 必须通过“Pending → Provider 出现 → scheduler 自动 apply”的真实路径，
+    // 而不是挂载调用者直接 try_activate() 的路径。
+    let provider = root.effect().unwrap();
+    provider.provide(NUMBER, Number(1)).unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        wait_until(|| fiber.state() == FiberState::Active),
+    )
+    .await
+    .expect("scheduler apply timed out — likely settle deadlock");
     assert_eq!(fiber.state(), FiberState::Active);
-    assert_eq!(root.get(NUMBER).unwrap().0, 1);
+    assert_eq!(root.get(DERIVED).unwrap().0, 2);
     fiber.dispose_wait().await.expect("dispose_wait");
+    runtime.shutdown().await.expect("shutdown");
+}
+
+struct PanicApplyPlugin;
+
+#[async_trait]
+impl Plugin for PanicApplyPlugin {
+    fn key(&self) -> cordis_core::PluginKey {
+        cordis_core::PluginKey::new("test.panic-apply")
+    }
+
+    fn inject(&self) -> Vec<cordis_core::ServiceId> {
+        vec![NUMBER.id()]
+    }
+
+    async fn apply(&self, _ctx: &Context) -> Result<(), CoreError> {
+        panic!("plugin apply boom");
+    }
+}
+
+struct HealthyAfterPanicPlugin {
+    runs: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl Plugin for HealthyAfterPanicPlugin {
+    fn key(&self) -> cordis_core::PluginKey {
+        cordis_core::PluginKey::new("test.healthy-after-panic")
+    }
+
+    fn inject(&self) -> Vec<cordis_core::ServiceId> {
+        vec![NUMBER.id()]
+    }
+
+    async fn apply(&self, _ctx: &Context) -> Result<(), CoreError> {
+        self.runs.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn plugin_apply_panic_fails_only_its_fiber_and_scheduler_continues() {
+    let runtime = runtime();
+    let root = runtime.root();
+    let panic_fiber = root.plugin(Arc::new(PanicApplyPlugin)).await.unwrap();
+    let healthy_runs = Arc::new(AtomicUsize::new(0));
+    let healthy_fiber = root
+        .plugin(Arc::new(HealthyAfterPanicPlugin {
+            runs: healthy_runs.clone(),
+        }))
+        .await
+        .unwrap();
+    assert_eq!(panic_fiber.state(), FiberState::Pending);
+    assert_eq!(healthy_fiber.state(), FiberState::Pending);
+
+    root.effect().unwrap().provide(NUMBER, Number(1)).unwrap();
+    wait_until(|| panic_fiber.state() == FiberState::Failed).await;
+    wait_until(|| healthy_fiber.state() == FiberState::Active).await;
+    assert_eq!(healthy_runs.load(Ordering::SeqCst), 1);
+    assert!(
+        panic_fiber
+            .last_error()
+            .is_some_and(|error| error.contains("plugin apply") && error.contains("boom"))
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(2), runtime.settle())
+        .await
+        .expect("scheduler must remain available after plugin panic");
     runtime.shutdown().await.expect("shutdown");
 }
 

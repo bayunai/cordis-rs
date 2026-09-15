@@ -4,16 +4,15 @@
 //! 资源集合定义见 `resources`，本文件只管处置时序。
 
 use std::{
-    any::Any,
     panic::{AssertUnwindSafe, catch_unwind},
     sync::{Arc, Weak, atomic::Ordering},
 };
 
-use crate::CoreError;
+use crate::{CoreError, error::format_panic_message};
 
 use super::{
     EffectScope, EffectScopeInner,
-    resources::{ManagedWork, abort_work},
+    resources::{AsyncDisposer, ManagedWork, abort_work},
 };
 use futures_util::FutureExt;
 use tokio::{sync::Notify, task::JoinHandle};
@@ -76,16 +75,6 @@ pub(super) enum DisposePolicy {
     AwaitLocal,
 }
 
-fn format_panic_payload(payload: Box<dyn Any + Send>) -> String {
-    if let Some(message) = payload.downcast_ref::<&str>() {
-        format!("dispose callback panicked: {message}")
-    } else if let Some(message) = payload.downcast_ref::<String>() {
-        format!("dispose callback panicked: {message}")
-    } else {
-        "dispose callback panicked".to_string()
-    }
-}
-
 fn run_sync_cleanup(cleanup: Box<dyn FnOnce() + Send>) {
     let _ = catch_unwind(AssertUnwindSafe(cleanup));
 }
@@ -93,7 +82,17 @@ fn run_sync_cleanup(cleanup: Box<dyn FnOnce() + Send>) {
 /// 运行同步 cleanup；panic 写入 `errors` 并继续。
 fn run_sync_cleanup_collect(cleanup: Box<dyn FnOnce() + Send>, errors: &mut Vec<String>) {
     if let Err(payload) = catch_unwind(AssertUnwindSafe(cleanup)) {
-        errors.push(format_panic_payload(payload));
+        errors.push(format_panic_message("dispose callback", payload));
+    }
+}
+
+async fn run_async_disposer(disposer: AsyncDisposer) -> Result<(), String> {
+    let future = catch_unwind(AssertUnwindSafe(disposer))
+        .map_err(|payload| format_panic_message("dispose callback", payload))?;
+    match AssertUnwindSafe(future).catch_unwind().await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(error.to_string()),
+        Err(payload) => Err(format_panic_message("dispose callback", payload)),
     }
 }
 
@@ -202,10 +201,8 @@ impl EffectScope {
                 }
             }
             for disposer in async_disposers.into_iter().rev() {
-                match AssertUnwindSafe(disposer()).catch_unwind().await {
-                    Ok(Ok(())) => {}
-                    Ok(Err(error)) => errors.push(error.to_string()),
-                    Err(payload) => errors.push(format_panic_payload(payload)),
+                if let Err(error) = run_async_disposer(disposer).await {
+                    errors.push(error);
                 }
             }
             for join in tasks {
