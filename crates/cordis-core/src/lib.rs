@@ -22,7 +22,7 @@ pub use context::{Context, EffectContext, InjectionHandle, InjectionState};
 pub use diagnostics::{
     EffectSnapshot, FiberStateSnapshot, InjectFiberSnapshot, IsolationSnapshot,
     PluginFiberSnapshot, PluginRegistryFiberSnapshot, PluginRegistrySnapshot, ProviderSnapshot,
-    RuntimeSnapshot,
+    RuntimeSnapshot, UnavailableDependencySnapshot,
 };
 pub use effect::EffectHandle;
 pub use error::CoreError;
@@ -32,5 +32,6 @@ pub use event::{
 pub use fiber::{Fiber, FiberState, FiberStateChange};
 pub use isolation::IsolationLabel;
 pub use plugin::{Plugin, PluginKey};
+pub use registry::provider::ProviderHandle;
 pub use runtime::Runtime;
-pub use service::{ServiceId, ServiceKey, Services};
+pub use service::{ProviderAvailability, ServiceId, ServiceKey, Services};

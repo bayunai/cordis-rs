@@ -178,12 +178,7 @@ fn build_graph(runtime: &Runtime) -> GraphJson {
         .iter()
         .map(|p| p.context_depth)
         .max()
-        .or_else(|| {
-            snap.plugin_fibers
-                .iter()
-                .map(|f| f.context_depth)
-                .max()
-        })
+        .or_else(|| snap.plugin_fibers.iter().map(|f| f.context_depth).max())
         .unwrap_or(1);
 
     let fibers: Vec<GraphFiberJson> = snap
@@ -197,10 +192,10 @@ fn build_graph(runtime: &Runtime) -> GraphJson {
                     p.effect_id
                         .zip(f.root_effect)
                         .is_some_and(|(pe, re)| pe == re)
-                        || snap.effects.iter().any(|e| {
-                            e.fiber_id == Some(f.id)
-                                && p.effect_id == Some(e.id)
-                        })
+                        || snap
+                            .effects
+                            .iter()
+                            .any(|e| e.fiber_id == Some(f.id) && p.effect_id == Some(e.id))
                 })
                 .map(|p| p.service.to_string())
                 .collect();

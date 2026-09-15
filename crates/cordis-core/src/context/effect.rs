@@ -5,7 +5,7 @@
 
 use super::{Context, InjectionHandle};
 use crate::{
-    ConfigKey, CoreError, ServiceId, ServiceKey, Services,
+    ConfigKey, CoreError, ProviderAvailability, ProviderHandle, ServiceId, ServiceKey, Services,
     callback_context::{LifecycleFrame, USER_LIFECYCLE_CALLBACK},
     effect::EffectHandle,
     event::{EventKey, ListenOptions, Next, ParallelKey, SerialKey, Unsubscribe, WaterfallKey},
@@ -27,6 +27,19 @@ impl EffectContext {
         service: T,
     ) -> Result<(), CoreError> {
         self.context.provide(key, service)
+    }
+
+    pub fn provide_checked<T, F>(
+        &self,
+        key: ServiceKey<T>,
+        service: T,
+        check: F,
+    ) -> Result<ProviderHandle, CoreError>
+    where
+        T: Send + Sync + 'static,
+        F: Fn() -> ProviderAvailability + Send + Sync + 'static,
+    {
+        self.context.provide_checked(key, service, check)
     }
 
     pub fn get<T: Send + Sync + 'static>(&self, key: ServiceKey<T>) -> Result<Arc<T>, CoreError> {

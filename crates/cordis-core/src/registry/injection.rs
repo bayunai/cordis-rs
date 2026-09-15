@@ -7,6 +7,7 @@ use crate::{
     callback_context::{LifecycleFrame, USER_LIFECYCLE_CALLBACK},
     effect::EffectScope,
     error::format_panic_message,
+    registry::provider::ProviderRevision,
     registry::{InjectionId, Registry},
     service::resolver::{provider_ids, resolve_provider},
 };
@@ -37,7 +38,7 @@ pub(crate) struct InjectionRecord {
     pub(crate) callback: InjectCallback,
     pub(crate) child_scope: Option<EffectScope>,
     pub(crate) phase: InjectionPhase,
-    pub(crate) resolved_providers: Vec<u64>,
+    pub(crate) resolved_providers: Vec<ProviderRevision>,
     pub(crate) last_error: Option<String>,
 }
 
@@ -50,7 +51,7 @@ pub(crate) struct InjectionSnapshot {
     pub(crate) callback: InjectCallback,
     pub(crate) services: Services,
     pub(crate) parent: EffectScope,
-    pub(crate) providers: Vec<u64>,
+    pub(crate) providers: Vec<ProviderRevision>,
     pub(crate) context: Context,
     pub(crate) deps: Vec<ServiceId>,
 }
@@ -279,7 +280,10 @@ impl Registry {
         for key in &injection.dependencies {
             let provider = resolve_provider(&state, &injection.context, *key)?;
             values.insert(*key, provider.value.clone());
-            providers.push(provider.id);
+            providers.push(ProviderRevision {
+                id: provider.id,
+                availability_revision: provider.availability_revision,
+            });
         }
         Some(InjectionSnapshot {
             callback: injection.callback.clone(),

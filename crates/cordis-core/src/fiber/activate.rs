@@ -67,7 +67,7 @@ impl FiberInner {
         &self,
         registry: &crate::registry::Registry,
         deps: &[ServiceId],
-    ) -> Option<Vec<u64>> {
+    ) -> Option<Vec<crate::registry::provider::ProviderRevision>> {
         let mut providers = Vec::with_capacity(deps.len());
         for key in deps {
             let service = registry.resolve_with_id(&self.context, *key)?;
@@ -139,7 +139,7 @@ impl FiberInner {
     fn try_commit_active(
         &self,
         scope: EffectScope,
-        providers: Vec<u64>,
+        providers: Vec<crate::registry::provider::ProviderRevision>,
         initial_mount: bool,
     ) -> Result<(), CoreError> {
         let mut ownership = self.ownership.lock().expect("ownership");

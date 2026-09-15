@@ -4,7 +4,7 @@
 //! 生命周期动作与激活逻辑分别在 `lifecycle`、`activate`。
 
 use super::FiberInner;
-use crate::plugin::PluginKey;
+use crate::{diagnostics::UnavailableDependencySnapshot, plugin::PluginKey};
 use std::sync::atomic::Ordering;
 
 /// Plugin Fiber 公开生命周期状态。
@@ -25,6 +25,8 @@ pub struct FiberStateChange {
     pub plugin_key: PluginKey,
     pub previous: Option<FiberState>,
     pub current: FiberState,
+    /// 当前处于严格解析不可用状态、但仍已注册的依赖。
+    pub unavailable_dependencies: Vec<UnavailableDependencySnapshot>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,6 +43,7 @@ impl FiberInner {
                 plugin_key: self.plugin_key,
                 previous: None,
                 current: FiberState::Pending,
+                unavailable_dependencies: self.unavailable_dependencies(),
             });
         }
     }
@@ -55,6 +58,7 @@ impl FiberInner {
                 plugin_key: self.plugin_key,
                 previous: Some(previous),
                 current,
+                unavailable_dependencies: self.unavailable_dependencies(),
             });
         }
     }

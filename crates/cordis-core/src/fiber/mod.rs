@@ -45,7 +45,7 @@ pub(crate) struct FiberInner {
     pub(crate) dispose_result: Mutex<Option<Result<(), crate::CoreError>>>,
     pub(crate) state: Mutex<FiberState>,
     pub(crate) last_error: Mutex<Option<String>>,
-    pub(crate) resolved_providers: Mutex<Vec<u64>>,
+    pub(crate) resolved_providers: Mutex<Vec<crate::registry::provider::ProviderRevision>>,
     pub(crate) disposed: AtomicBool,
     pub(crate) busy: Mutex<bool>,
     pub(crate) lifecycle: Mutex<Option<Arc<LifecycleCompletion>>>,
@@ -84,9 +84,23 @@ impl FiberInner {
             return Vec::new();
         };
         let deps = self.dependencies.lock().expect("deps").clone();
-        deps.into_iter()
-            .filter(|key| registry.resolve(&self.context, *key).is_none())
-            .collect()
+        let Ok(state) = registry.state.lock() else {
+            return Vec::new();
+        };
+        crate::registry::dependency_diagnostics(&state, &self.context, &deps).0
+    }
+
+    pub(crate) fn unavailable_dependencies(
+        &self,
+    ) -> Vec<crate::diagnostics::UnavailableDependencySnapshot> {
+        let Some(registry) = self.registry.upgrade() else {
+            return Vec::new();
+        };
+        let deps = self.dependencies.lock().expect("deps").clone();
+        let Ok(state) = registry.state.lock() else {
+            return Vec::new();
+        };
+        crate::registry::dependency_diagnostics(&state, &self.context, &deps).1
     }
 
     pub(crate) fn snapshot(&self) -> crate::diagnostics::PluginFiberSnapshot {
@@ -100,6 +114,7 @@ impl FiberInner {
         };
         let deps = self.dependencies.lock().expect("deps").clone();
         let missing = self.missing_dependencies();
+        let unavailable = self.unavailable_dependencies();
         crate::diagnostics::PluginFiberSnapshot {
             id: self.id,
             plugin_key: self.plugin_key.as_str(),
@@ -107,6 +122,7 @@ impl FiberInner {
             state,
             dependencies: deps.iter().map(|d| d.as_str()).collect(),
             missing_dependencies: missing.iter().map(|d| d.as_str()).collect(),
+            unavailable_dependencies: unavailable,
             last_error: self.last_error.lock().expect("fiber error").clone(),
             root_effect: self
                 .ownership

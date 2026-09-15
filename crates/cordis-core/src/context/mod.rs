@@ -10,7 +10,7 @@ pub use effect::EffectContext;
 pub use injection::{InjectionHandle, InjectionState};
 
 use crate::{
-    ConfigKey, CoreError, ServiceId, ServiceKey, Services,
+    ConfigKey, CoreError, ProviderAvailability, ProviderHandle, ServiceId, ServiceKey, Services,
     effect::EffectScope,
     event::{
         EventKey, ListenMeta, ListenOptions, Next, ParallelKey, SerialKey, Unsubscribe,
@@ -19,7 +19,7 @@ use crate::{
     fiber::{Fiber, FiberInner, FiberState},
     isolation::IsolationLabel,
     plugin::{Plugin, read_metadata},
-    registry::Registry,
+    registry::{Registry, provider::ProviderCheck},
     service::ErasedService,
 };
 use std::{
@@ -139,7 +139,42 @@ impl Context {
                 value: Arc::new(service),
             },
             self.inner.scope.clone(),
-        )
+            ProviderAvailability::Ready,
+            None,
+        )?;
+        Ok(())
+    }
+
+    /// 注册带可用性检查的 Service，并返回由 Provider 自己持有的刷新句柄。
+    ///
+    /// `check` 必须是无阻塞的状态读取；连接探测等异步工作由 Provider 自己完成，
+    /// 完成后调用 [`ProviderHandle::refresh`] 触发依赖重算。
+    pub fn provide_checked<T, F>(
+        &self,
+        key: ServiceKey<T>,
+        service: T,
+        check: F,
+    ) -> Result<ProviderHandle, CoreError>
+    where
+        T: Send + Sync + 'static,
+        F: Fn() -> ProviderAvailability + Send + Sync + 'static,
+    {
+        self.ensure_alive()?;
+        let registry = self.registry()?;
+        let check: ProviderCheck = Arc::new(check);
+        let availability = Registry::evaluate_check(&check)?;
+        let provider_id = registry.provide(
+            self.clone(),
+            key.id(),
+            ErasedService {
+                type_id: key.type_id(),
+                value: Arc::new(service),
+            },
+            self.inner.scope.clone(),
+            availability,
+            Some(check),
+        )?;
+        Ok(registry.checked_provider_handle(provider_id, key.id()))
     }
 
     /// 立即取得当前 Context 或其祖先可见的 Service。

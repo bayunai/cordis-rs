@@ -2,7 +2,7 @@
 //!
 //! 导出 Context / Fiber / Effect 等结构信息；不包含服务载荷。
 
-use crate::registry::InjectionPhase;
+use crate::{ProviderAvailability, registry::InjectionPhase};
 
 /// 非敏感运行时诊断快照。
 #[derive(Debug, Clone, Default)]
@@ -27,6 +27,15 @@ pub struct ProviderSnapshot {
     pub service: &'static str,
     pub provider_id: u64,
     pub effect_id: Option<u64>,
+    /// 严格解析下的有效状态，包含 Provider check 与所属 Plugin Fiber 状态。
+    pub availability: ProviderAvailability,
+}
+
+/// 声明式依赖已注册但当前不能严格解析的受控诊断信息。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnavailableDependencySnapshot {
+    pub service: &'static str,
+    pub reason: std::sync::Arc<str>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,6 +67,7 @@ pub struct InjectFiberSnapshot {
     pub phase: FiberStateSnapshot,
     pub dependencies: Vec<&'static str>,
     pub missing_dependencies: Vec<&'static str>,
+    pub unavailable_dependencies: Vec<UnavailableDependencySnapshot>,
     pub last_error: Option<String>,
 }
 
@@ -70,6 +80,7 @@ pub struct PluginFiberSnapshot {
     pub state: FiberStateSnapshot,
     pub dependencies: Vec<&'static str>,
     pub missing_dependencies: Vec<&'static str>,
+    pub unavailable_dependencies: Vec<UnavailableDependencySnapshot>,
     pub last_error: Option<String>,
     pub root_effect: Option<u64>,
 }

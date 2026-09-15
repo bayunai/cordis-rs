@@ -13,6 +13,22 @@ use std::{
     sync::Arc,
 };
 
+/// Provider 对严格 Service 解析的可用性声明。
+///
+/// `Unavailable` 不会移除已注册的 Provider。它仍会遮蔽父 Context 的同 Key
+/// Provider，但 `get()`、`inject()` 与 Plugin 依赖解析会把它视为不可用。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProviderAvailability {
+    Ready,
+    Unavailable { reason: Arc<str> },
+}
+
+impl ProviderAvailability {
+    pub(crate) fn is_ready(&self) -> bool {
+        matches!(self, Self::Ready)
+    }
+}
+
 /// 稳定的 Service 标识。扩展应只通过 [`ServiceKey`] 创建它。
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ServiceId(&'static str);

@@ -22,6 +22,10 @@ pub enum CoreError {
     ContextDisposed,
     #[error("Service {service} 当前不可用")]
     ServiceUnavailable { service: ServiceId },
+    #[error("Provider {service} 已释放")]
+    ProviderDisposed { service: ServiceId },
+    #[error("Provider 检查失败: {0}")]
+    ProviderCheck(String),
     #[error("Service {service} 已在当前 Context 注册")]
     ServiceConflict { service: ServiceId },
     #[error("Service {service} 的 Rust 类型不匹配")]

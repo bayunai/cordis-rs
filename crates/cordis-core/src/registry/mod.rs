@@ -18,6 +18,7 @@ use crate::{
     diagnostics::{
         EffectSnapshot, FiberStateSnapshot, InjectFiberSnapshot, IsolationSnapshot,
         PluginRegistryFiberSnapshot, PluginRegistrySnapshot, ProviderSnapshot, RuntimeSnapshot,
+        UnavailableDependencySnapshot,
     },
     event::listener::{EventContract, EventListener},
     fiber::{FiberInner, FiberState, FiberStateChange},
@@ -27,7 +28,7 @@ use crate::{
         injection::InjectionRecord,
         provider::{EffectRecord, ProviderRecord},
     },
-    service::resolver::resolve_provider,
+    service::resolver::{ProviderResolution, effective_availability, resolve_provider_state},
 };
 use std::{
     any::TypeId,
@@ -68,6 +69,28 @@ pub(crate) struct Registry {
     pub(crate) scheduler_cancel: CancellationToken,
     pub(crate) scheduler_task: Mutex<Option<JoinHandle<()>>>,
     pub(crate) fiber_state_events: broadcast::Sender<FiberStateChange>,
+}
+
+pub(crate) fn dependency_diagnostics(
+    state: &RegistryState,
+    context: &Context,
+    dependencies: &[ServiceId],
+) -> (Vec<ServiceId>, Vec<UnavailableDependencySnapshot>) {
+    let mut missing = Vec::new();
+    let mut unavailable = Vec::new();
+    for service in dependencies {
+        match resolve_provider_state(state, context, *service) {
+            ProviderResolution::Missing => missing.push(*service),
+            ProviderResolution::Unavailable(reason) => {
+                unavailable.push(UnavailableDependencySnapshot {
+                    service: service.as_str(),
+                    reason,
+                });
+            }
+            ProviderResolution::Ready(_) => {}
+        }
+    }
+    (missing, unavailable)
 }
 
 impl Registry {
@@ -184,18 +207,15 @@ impl Registry {
                 },
                 provider_id: provider.id,
                 effect_id: provider.effect_id,
+                availability: effective_availability(&state, provider),
             })
             .collect();
         let inject_fibers = state
             .injections
             .iter()
             .map(|(id, injection)| {
-                let missing = injection
-                    .dependencies
-                    .iter()
-                    .filter(|key| resolve_provider(&state, &injection.context, **key).is_none())
-                    .map(|key| key.as_str())
-                    .collect::<Vec<_>>();
+                let (missing, unavailable) =
+                    dependency_diagnostics(&state, &injection.context, &injection.dependencies);
                 InjectFiberSnapshot {
                     id: *id,
                     context_depth: injection.context.context_depth(),
@@ -205,7 +225,8 @@ impl Registry {
                         .iter()
                         .map(|key| key.as_str())
                         .collect(),
-                    missing_dependencies: missing,
+                    missing_dependencies: missing.iter().map(|service| service.as_str()).collect(),
+                    unavailable_dependencies: unavailable,
                     last_error: injection.last_error.clone(),
                 }
             })

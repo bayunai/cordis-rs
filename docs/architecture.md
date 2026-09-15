@@ -45,13 +45,13 @@ bootstrap.toml
 - `IsolationLabel` 由 Runtime 分配，跨 Runtime 使用 → `IsolationRuntimeMismatch`。
 - `Context::extend()` 创建不可变派生 Context 视图，不创建 Registry 节点或 Scope；父 Context 不会被修改，最后一个引用释放后视图自然回收。
 - `Context::isolate(key)` 返回 `(派生 Context, 新标签)`；`isolate_with(key, label)` 返回加入既有标签的派生 Context。
-- 解析：若当前 Context 谱系对该 Key 有隔离覆盖，则只看同 label 的 Provider；否则走父子 Local 覆盖。
+- 解析：若当前 Context 谱系对该 Key 有隔离覆盖，则只看同 label 的 Provider；否则走父子 Local 覆盖。最近槽位即使未就绪也会遮蔽父级，严格解析绝不静默回退。
 - 隔离**只影响声明的 Key**；其他 Service 仍按父子链解析。
 
 ## 响应式注入
 
 1. `Context::inject(deps, callback)` 登记派生 inject fiber；依赖未齐时为 `Pending`。
-2. `provide` / Provider 释放会标记 dirty，调度器串行重算。
+2. `provide`、`provide_checked` 的就绪状态变化、Provider 释放都会标记 dirty，调度器串行重算。
 3. 派生 Context 覆盖父 Provider（未隔离 Key）；Effect/Fiber 释放后 Provider 自动回退。
 4. 同槽冲突返回 `ServiceConflict`；Runtime 内 ID↔TypeId 永久锁定。
 
@@ -81,6 +81,12 @@ Context::plugin(Arc<dyn Plugin>)
 
 `Context::inject` 仍返回 `InjectionHandle`（派生依赖），与 Plugin Fiber 分开诊断。
 
+### Provider 就绪状态
+
+普通 `provide()` 注册的 Provider 默认 `Ready`。`provide_checked(key, value, check)` 会保存一个同步、无阻塞的状态检查函数，并返回 `ProviderHandle`；Provider 自己的健康任务在本地状态变化后调用 `refresh()`。Core 不轮询、不发网络请求。
+
+公开 `get()`、`inject()` 与 Plugin `inject()` 一律要求 Provider 的检查结果为 `Ready`，且其所属 Plugin Fiber 已 `Active`。Core 不提供读取未就绪实例的公开旁路；诊断通过 Registry 内部元数据区分“未注册”与“已注册未就绪”。可用性翻转会递增 Provider revision，确保短暂的失效/恢复也会使消费者重新验证。
+
 `Runtime::subscribe_fiber_states()` 提供容量为 1024 的只读广播流，依次报告 `None → Pending` 以及后续状态转换。监听滞后会收到 `broadcast::error::RecvError::Lagged`；宿主应调用 `Runtime::diagnostics()` 重建当前快照。状态通知不能阻塞、拒绝或回滚 Fiber 生命周期。
 
 ## Effect
@@ -108,7 +114,7 @@ Context::plugin(Arc<dyn Plugin>)
 
 ## 诊断
 
-`Runtime::diagnostics()` 含：isolations、providers、plugin_fibers（含 `plugin_key`）、plugin_registry（Key + Fiber id/state）、inject_fibers、effects。普通 Context 是不可枚举的短生命周期视图，不进入诊断；无 Service / Config 值。
+`Runtime::diagnostics()` 含：isolations、providers、plugin_fibers（含 `plugin_key`）、plugin_registry（Key + Fiber id/state）、inject_fibers、effects。Provider 与依赖 Snapshot 会显示受控的未就绪原因；业务 `get()` 错误不会携带原因。普通 Context 是不可枚举的短生命周期视图，不进入诊断；无 Service / Config 值。
 
 ## Config / intercept
 
