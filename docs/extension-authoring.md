@@ -89,10 +89,11 @@ async fn main() -> Result<(), CoreError> {
 ## 任务与取消
 
 - 长期监听、循环和后台刷新用 `EffectContext::spawn`，并响应 `CancellationToken`。
-- 连接关闭、flush、注销等一次性收尾用 `on_dispose_async`（Scope 已进入释放阶段，不接收取消令牌）。
+- 连接关闭、flush、注销等一次性收尾用 `on_dispose_async`（Scope 已进入释放阶段，不接收取消令牌；多个 disposer **严格串行 LIFO**）。
 - 需要确认资源真实释放或获取失败时必须 `await dispose_wait()` / `unmount()` / `shutdown()`。
-- 单纯 `dispose()` 是 fire-and-forget；异步释放失败只能由后续父 Scope 或 Runtime 的等待路径返回。
-- `dispose` 上收托管任务与异步 disposer；热路径用 `dispose_wait` / `replace`。
+- 单纯 `dispose()` 是 fire-and-forget；之后仍可 `dispose_wait()` 等待同一轮完成并读取相同错误。非 Tokio 线程也可调用 `dispose()`（由 Runtime 创建时捕获的 Handle 调度）。
+- `Drop` / 未 `shutdown` 的进程退出不会启动尚未执行的 async disposer；受控关闭路径才会完整执行。
+- `dispose` 上收释放协调；热路径用 `dispose_wait` / `replace`。
 
 ## 禁止事项
 

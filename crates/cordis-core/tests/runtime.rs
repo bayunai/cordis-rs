@@ -2562,3 +2562,222 @@ async fn unmount_and_shutdown_return_dispose_errors_after_cleanup() {
     assert!(matches!(shutdown_error, CoreError::DisposeFailed { .. }));
     assert!(runtime.scheduler_stopped());
 }
+
+#[tokio::test]
+async fn dispose_then_dispose_wait_shares_same_completion_result() {
+    let runtime = runtime();
+    let root = runtime.root();
+    let effect = root.effect().unwrap();
+    let (started_tx, started_rx) = oneshot::channel::<()>();
+    let (release_tx, release_rx) = oneshot::channel::<()>();
+    let started_tx = Arc::new(Mutex::new(Some(started_tx)));
+    let release_rx = Arc::new(Mutex::new(Some(release_rx)));
+    effect
+        .on_dispose_async(move || {
+            let started_tx = started_tx.clone();
+            let release_rx = release_rx.clone();
+            async move {
+                if let Some(tx) = started_tx.lock().expect("started").take() {
+                    let _ = tx.send(());
+                }
+                let receiver = release_rx.lock().expect("release").take();
+                if let Some(rx) = receiver {
+                    let _ = rx.await;
+                }
+                Err(CoreError::EventListener("shared boom".into()))
+            }
+        })
+        .unwrap();
+
+    effect.dispose();
+    started_rx.await.expect("started");
+    let wait_a = {
+        let effect = effect.clone();
+        tokio::spawn(async move { effect.dispose_wait().await })
+    };
+    let wait_b = {
+        let effect = effect.clone();
+        tokio::spawn(async move { effect.dispose_wait().await })
+    };
+    let _ = release_tx.send(());
+    let err_a = wait_a.await.expect("join").expect_err("a");
+    let err_b = wait_b.await.expect("join").expect_err("b");
+    for error in [err_a, err_b] {
+        match error {
+            CoreError::DisposeFailed { errors } => {
+                assert_eq!(errors.len(), 1);
+                assert!(errors[0].contains("shared boom"));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+    runtime.shutdown().await.expect_err("hoisted dispose error");
+}
+
+#[tokio::test]
+async fn fiber_dispose_then_dispose_wait_preserves_async_errors() {
+    use cordis_core::PluginKey;
+
+    static KEY: PluginKey = PluginKey::new("test.async.dispose.then.wait");
+    let runtime = runtime();
+    let root = runtime.root();
+
+    struct BoomPlugin;
+    #[async_trait]
+    impl Plugin for BoomPlugin {
+        fn key(&self) -> PluginKey {
+            KEY
+        }
+        async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
+            let effect = ctx.effect()?;
+            effect.on_dispose_async(|| async move {
+                Err(CoreError::EventListener("fiber dispose boom".into()))
+            })?;
+            Ok(())
+        }
+    }
+
+    let mut fiber = root.plugin(Arc::new(BoomPlugin)).await.unwrap();
+    fiber.dispose();
+    let error = fiber.dispose_wait().await.expect_err("wait after dispose");
+    assert!(matches!(error, CoreError::DisposeFailed { .. }));
+    let _ = runtime.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dispose_from_std_thread_starts_async_disposer_without_panic() {
+    let runtime = runtime();
+    let root = runtime.root();
+    let effect = root.effect().unwrap();
+    let finished = Arc::new(AtomicBool::new(false));
+    let flag = finished.clone();
+    effect
+        .on_dispose_async(move || {
+            let flag = flag.clone();
+            async move {
+                flag.store(true, Ordering::SeqCst);
+                Ok(())
+            }
+        })
+        .unwrap();
+
+    let effect_for_thread = effect.clone();
+    std::thread::spawn(move || {
+        effect_for_thread.dispose();
+    })
+    .join()
+    .expect("thread join");
+
+    effect.dispose_wait().await.expect("dispose_wait");
+    assert!(finished.load(Ordering::SeqCst));
+    runtime.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn async_disposers_run_strict_serial_lifo() {
+    let runtime = runtime();
+    let root = runtime.root();
+    let effect = root.effect().unwrap();
+    let order = Arc::new(Mutex::new(Vec::new()));
+    let (gate_tx, gate_rx) = oneshot::channel::<()>();
+    let gate_rx = Arc::new(Mutex::new(Some(gate_rx)));
+
+    // 先注册 first（应后跑），再注册 second（应先跑并阻塞）。
+    let order_first = order.clone();
+    effect
+        .on_dispose_async(move || {
+            let order_first = order_first.clone();
+            async move {
+                order_first
+                    .lock()
+                    .expect("order")
+                    .push("first-start".to_string());
+                Ok(())
+            }
+        })
+        .unwrap();
+    let order_second = order.clone();
+    effect
+        .on_dispose_async(move || {
+            let order_second = order_second.clone();
+            let gate_rx = gate_rx.clone();
+            async move {
+                order_second
+                    .lock()
+                    .expect("order")
+                    .push("second-start".to_string());
+                let receiver = gate_rx.lock().expect("gate").take();
+                if let Some(rx) = receiver {
+                    let _ = rx.await;
+                }
+                order_second
+                    .lock()
+                    .expect("order")
+                    .push("second-end".to_string());
+                Ok(())
+            }
+        })
+        .unwrap();
+
+    let wait = {
+        let effect = effect.clone();
+        tokio::spawn(async move { effect.dispose_wait().await })
+    };
+    wait_until(|| {
+        order
+            .lock()
+            .expect("order")
+            .iter()
+            .any(|item| item == "second-start")
+    })
+    .await;
+    assert!(
+        !order
+            .lock()
+            .expect("order")
+            .iter()
+            .any(|item| item == "first-start"),
+        "earlier disposer must not start before later disposer finishes"
+    );
+    let _ = gate_tx.send(());
+    wait.await.expect("join").expect("dispose_wait");
+    assert_eq!(
+        *order.lock().expect("order"),
+        vec![
+            "second-start".to_string(),
+            "second-end".to_string(),
+            "first-start".to_string()
+        ]
+    );
+    runtime.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn drop_runtime_without_shutdown_does_not_run_pending_async_disposers() {
+    let finished = Arc::new(AtomicBool::new(false));
+    {
+        let runtime = runtime();
+        let root = runtime.root();
+        let effect = root.effect().unwrap();
+        let flag = finished.clone();
+        effect
+            .on_dispose_async(move || {
+                let flag = flag.clone();
+                async move {
+                    flag.store(true, Ordering::SeqCst);
+                    Ok(())
+                }
+            })
+            .unwrap();
+        // 不调用 dispose/shutdown，仅 drop Runtime。
+        drop(effect);
+        drop(runtime);
+    }
+    for _ in 0..16 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        !finished.load(Ordering::SeqCst),
+        "Drop must not start pending async disposers"
+    );
+}

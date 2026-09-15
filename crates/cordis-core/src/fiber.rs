@@ -44,6 +44,8 @@ pub(crate) struct FiberInner {
     pub(crate) plugin: Mutex<Arc<dyn Plugin>>,
     pub(crate) dependencies: Mutex<Vec<ServiceId>>,
     pub(crate) effect: Mutex<Option<EffectScope>>,
+    /// `dispose_now` 后仍可用于 `dispose_wait` 的 Scope 克隆。
+    pub(crate) pending_wait: Mutex<Option<EffectScope>>,
     pub(crate) state: Mutex<FiberState>,
     pub(crate) last_error: Mutex<Option<String>>,
     pub(crate) resolved_providers: Mutex<Vec<u64>>,
@@ -273,6 +275,7 @@ impl FiberInner {
             return;
         };
         if let Some(effect) = effect {
+            *self.pending_wait.lock().expect("pending_wait") = Some(effect.clone());
             effect.dispose();
             self.transition_disposed();
         }
@@ -282,20 +285,30 @@ impl FiberInner {
     }
 
     pub(crate) async fn dispose_wait_inner(&self) -> Result<(), CoreError> {
-        let Some(effect) = self.begin_dispose() else {
-            return Ok(());
-        };
-        let result = if let Some(effect) = effect {
+        if let Some(effect) = self.begin_dispose() {
+            let result = if let Some(effect) = effect {
+                *self.pending_wait.lock().expect("pending_wait") = Some(effect.clone());
+                let result = effect.dispose_wait().await;
+                self.transition_disposed();
+                result
+            } else {
+                Ok(())
+            };
+            if let Some(registry) = self.registry.upgrade() {
+                registry.unregister_plugin_fiber(self.id);
+            }
+            let _ = self.pending_wait.lock().expect("pending_wait").take();
+            return result;
+        }
+        // 已由 dispose_now 释放：等待同一轮 DisposeCompletion。
+        let pending = self.pending_wait.lock().expect("pending_wait").clone();
+        if let Some(effect) = pending {
             let result = effect.dispose_wait().await;
-            self.transition_disposed();
+            let _ = self.pending_wait.lock().expect("pending_wait").take();
             result
         } else {
             Ok(())
-        };
-        if let Some(registry) = self.registry.upgrade() {
-            registry.unregister_plugin_fiber(self.id);
         }
-        result
     }
 
     pub(crate) fn missing_dependencies(&self) -> Vec<ServiceId> {
@@ -562,15 +575,23 @@ mod claim_tests {
     }
 
     fn stub_fiber() -> Arc<FiberInner> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let handle = runtime.handle().clone();
+        // Keep the runtime alive for the scope handle duration of this test.
+        std::mem::forget(runtime);
         Arc::new(FiberInner {
             id: 1,
             plugin_key: crate::plugin::PluginKey::new("test.noop"),
             node: 0,
             registry: Weak::new(),
-            parent_scope: EffectScope::root(),
+            parent_scope: EffectScope::root(handle),
             plugin: Mutex::new(Arc::new(NoopPlugin)),
             dependencies: Mutex::new(Vec::new()),
             effect: Mutex::new(None),
+            pending_wait: Mutex::new(None),
             state: Mutex::new(FiberState::Pending),
             last_error: Mutex::new(None),
             resolved_providers: Mutex::new(Vec::new()),

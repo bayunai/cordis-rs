@@ -238,6 +238,7 @@ impl Context {
             plugin: Mutex::new(plugin),
             dependencies: Mutex::new(dependencies),
             effect: Mutex::new(None),
+            pending_wait: Mutex::new(None),
             state: Mutex::new(FiberState::Pending),
             last_error: Mutex::new(None),
             resolved_providers: Mutex::new(Vec::new()),

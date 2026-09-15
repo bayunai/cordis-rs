@@ -33,7 +33,8 @@ impl Runtime {
         let registry = Registry::new();
         registry.start_scheduler()?;
         let root_id = registry.allocate_id();
-        let root_scope = EffectScope::root();
+        let handle = tokio::runtime::Handle::current();
+        let root_scope = EffectScope::root(handle);
         registry.add_node(
             root_id,
             None,
@@ -128,8 +129,8 @@ impl Drop for RuntimeInner {
             // shutdown 已 await 调度器；Handle 已被 take。
             return;
         }
-        // 尽力同步关闭：取消 Root 资源，abort 调度器以释放 Registry。
-        self.root.inner.scope.dispose();
+        // 尽力同步关闭：不启动 async disposer，abort 调度器以释放 Registry。
+        self.root.inner.scope.abandon();
         self.registry.abort_scheduler();
     }
 }

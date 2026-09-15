@@ -83,9 +83,11 @@ Provider 变化、`restart()` 与 `replace()` 都先经历 `Active → Unloading
 
 - 具名 `EffectHandle`（`effect()` / `effect_named`）；记录父子、取消状态与资源计数。
 - Provider / 订阅 / 任务 / 子 Fiber 挂在创建它们的 Effect 或 Fiber 上；Context 只是视图，不能单独释放。
-- `dispose`：取消 Scope，立即执行同步 `on_dispose`（LIFO），再启动 `on_dispose_async`（LIFO）并把 JoinHandle 上收至父/Root，不等待。
-- `dispose_wait`：同样同步 cleanup 后，本地 await 受控任务与异步 disposer；失败聚合为 `DisposeFailed`。
+- 每次 Scope 释放共享一个 `DisposeCompletion`：`dispose()` 后再 `dispose_wait()`（可多次）等待同一轮结果与同一聚合错误。
+- `dispose`：取消 Scope，立即执行同步 `on_dispose`（LIFO），再经 Runtime 捕获的 Tokio Handle 启动释放协调任务；async disposer **串行** LIFO；协调等待上收至父/Root。
+- `dispose_wait`：等待同一 `DisposeCompletion`；失败聚合为 `DisposeFailed`。
 - 长期后台工作用 `spawn`（带取消令牌）；一次性收尾用 `on_dispose_async`（无取消令牌）。
+- `Drop` 为非受控关闭：同步 cleanup + 终止已启动工作，**不**启动尚未执行的 async disposer；完整异步释放须 `dispose_wait` / `shutdown`。
 
 ## Event
 
@@ -114,4 +116,4 @@ Provider 变化、`restart()` 与 `replace()` 都先经历 `Active → Unloading
 
 ## 关闭
 
-宿主须 `await Runtime::shutdown()`（返回 `Result`）。插件热替换优先 `fiber.replace` 或 `dispose_wait` 后再挂载。单纯 `dispose()` 为 fire-and-forget，释放失败只能由父 Scope / Fiber / Runtime 的等待路径观察。
+宿主须 `await Runtime::shutdown()`（返回 `Result`）。插件热替换优先 `fiber.replace` 或 `dispose_wait` 后再挂载。单纯 `dispose()` 为 fire-and-forget；之后仍可 `dispose_wait()` 观察同一轮释放结果。仅 `drop` Runtime **不**保证执行未启动的 async disposer。
