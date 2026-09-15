@@ -2752,6 +2752,85 @@ async fn async_disposers_run_strict_serial_lifo() {
     runtime.shutdown().await.expect("shutdown");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn parent_async_disposer_waits_for_child_scope_completion() {
+    let runtime = runtime();
+    let root = runtime.root();
+    let parent = root.effect().unwrap();
+    let child = parent.extend().unwrap().effect().unwrap();
+    let order = Arc::new(Mutex::new(Vec::new()));
+    let (child_started_tx, child_started_rx) = oneshot::channel::<()>();
+    let (child_release_tx, child_release_rx) = oneshot::channel::<()>();
+    let child_started_tx = Arc::new(Mutex::new(Some(child_started_tx)));
+    let child_release_rx = Arc::new(Mutex::new(Some(child_release_rx)));
+
+    let child_order = order.clone();
+    child
+        .on_dispose_async(move || {
+            let child_order = child_order.clone();
+            let child_started_tx = child_started_tx.clone();
+            let child_release_rx = child_release_rx.clone();
+            async move {
+                child_order
+                    .lock()
+                    .expect("order")
+                    .push("child-start".to_string());
+                if let Some(tx) = child_started_tx.lock().expect("started").take() {
+                    let _ = tx.send(());
+                }
+                let receiver = child_release_rx.lock().expect("release").take();
+                if let Some(rx) = receiver {
+                    let _ = rx.await;
+                }
+                child_order
+                    .lock()
+                    .expect("order")
+                    .push("child-end".to_string());
+                Ok(())
+            }
+        })
+        .unwrap();
+
+    let parent_order = order.clone();
+    parent
+        .on_dispose_async(move || {
+            let parent_order = parent_order.clone();
+            async move {
+                parent_order
+                    .lock()
+                    .expect("order")
+                    .push("parent-start".to_string());
+                Ok(())
+            }
+        })
+        .unwrap();
+
+    let wait = {
+        let parent = parent.clone();
+        tokio::spawn(async move { parent.dispose_wait().await })
+    };
+    child_started_rx.await.expect("child started");
+    assert!(
+        !order
+            .lock()
+            .expect("order")
+            .iter()
+            .any(|item| item == "parent-start"),
+        "parent async disposer must wait for child completion"
+    );
+    let _ = child_release_tx.send(());
+    wait.await.expect("join").expect("parent dispose wait");
+    assert_eq!(
+        *order.lock().expect("order"),
+        vec![
+            "child-start".to_string(),
+            "child-end".to_string(),
+            "parent-start".to_string()
+        ]
+    );
+    runtime.shutdown().await.expect("shutdown");
+}
+
 #[tokio::test]
 async fn drop_runtime_without_shutdown_does_not_run_pending_async_disposers() {
     let finished = Arc::new(AtomicBool::new(false));

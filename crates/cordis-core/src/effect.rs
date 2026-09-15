@@ -55,6 +55,9 @@ impl DisposeCompletion {
 
     async fn wait(self: &Arc<Self>) -> Result<(), CoreError> {
         loop {
+            // 必须在检查结果前登记 waiter，避免 finish() 位于“检查为空”和
+            // notified().await 之间时丢失 notify_waiters() 的唤醒。
+            let notified = self.notify.notified();
             {
                 let slot = self.result.lock().expect("dispose completion");
                 if let Some(result) = slot.as_ref() {
@@ -66,7 +69,7 @@ impl DisposeCompletion {
                     };
                 }
             }
-            self.notify.notified().await;
+            notified.await;
         }
     }
 }
@@ -322,33 +325,39 @@ impl EffectScope {
             cleanup();
         }
 
-        let mut work = existing_work;
-        work.extend(self.take_work_shallow());
+        let mut child_waits = Vec::new();
+        let mut tasks = Vec::new();
+        for item in existing_work.into_iter().chain(self.take_work_shallow()) {
+            match item {
+                ManagedWork::ChildWait(waiter) => child_waits.push(waiter),
+                ManagedWork::Task(task) => tasks.push(task),
+            }
+        }
 
         let handle = self.inner.handle.clone();
         let completion_for_task = completion.clone();
         let coordinator = handle.spawn(async move {
             let mut errors = Vec::new();
+            // 子 Scope 必须先完整释放；父 Scope 的 async disposer 才能安全关闭
+            // 自己拥有、但可能仍被子资源使用的连接或句柄。
+            for join in child_waits {
+                match join.await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(mut nested)) => errors.append(&mut nested),
+                    Err(error) => {
+                        errors.push(format!("child dispose wait join failed: {error}"));
+                    }
+                }
+            }
             for disposer in async_disposers.into_iter().rev() {
                 match disposer().await {
                     Ok(()) => {}
                     Err(error) => errors.push(error.to_string()),
                 }
             }
-            for item in work {
-                match item {
-                    ManagedWork::Task(join) => {
-                        if let Err(error) = join.await {
-                            errors.push(format!("managed task join failed: {error}"));
-                        }
-                    }
-                    ManagedWork::ChildWait(join) => match join.await {
-                        Ok(Ok(())) => {}
-                        Ok(Err(mut nested)) => errors.append(&mut nested),
-                        Err(error) => {
-                            errors.push(format!("child dispose wait join failed: {error}"));
-                        }
-                    },
+            for join in tasks {
+                if let Err(error) = join.await {
+                    errors.push(format!("managed task join failed: {error}"));
                 }
             }
             let result = if errors.is_empty() {

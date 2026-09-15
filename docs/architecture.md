@@ -84,7 +84,7 @@ Provider 变化、`restart()` 与 `replace()` 都先经历 `Active → Unloading
 - 具名 `EffectHandle`（`effect()` / `effect_named`）；记录父子、取消状态与资源计数。
 - Provider / 订阅 / 任务 / 子 Fiber 挂在创建它们的 Effect 或 Fiber 上；Context 只是视图，不能单独释放。
 - 每次 Scope 释放共享一个 `DisposeCompletion`：`dispose()` 后再 `dispose_wait()`（可多次）等待同一轮结果与同一聚合错误。
-- `dispose`：取消 Scope，立即执行同步 `on_dispose`（LIFO），再经 Runtime 捕获的 Tokio Handle 启动释放协调任务；async disposer **串行** LIFO；协调等待上收至父/Root。
+- `dispose`：取消 Scope，立即执行同步 `on_dispose`（LIFO），再经 Runtime 捕获的 Tokio Handle 启动释放协调任务；协调器先等待子 Scope 完成，再执行当前 Scope 的 async disposer（串行 LIFO），最后收敛当前 Scope 的后台任务；协调等待上收至父/Root。
 - `dispose_wait`：等待同一 `DisposeCompletion`；失败聚合为 `DisposeFailed`。
 - 长期后台工作用 `spawn`（带取消令牌）；一次性收尾用 `on_dispose_async`（无取消令牌）。
 - `Drop` 为非受控关闭：同步 cleanup + 终止已启动工作，**不**启动尚未执行的 async disposer；完整异步释放须 `dispose_wait` / `shutdown`。
