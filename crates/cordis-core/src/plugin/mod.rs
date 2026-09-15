@@ -4,9 +4,12 @@
 
 pub(crate) mod group;
 
-use crate::{Context, CoreError, ServiceId};
+use crate::{Context, CoreError, ServiceId, error::format_panic_message};
 use async_trait::async_trait;
-use std::fmt;
+use std::{
+    fmt,
+    panic::{AssertUnwindSafe, catch_unwind},
+};
 
 /// 稳定的插件身份；同 Runtime 内按 Key 归组 Fiber。
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -32,6 +35,21 @@ impl fmt::Debug for PluginKey {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.debug_tuple("PluginKey").field(&self.0).finish()
     }
+}
+
+/// 已在用户边界读取并通过 panic 隔离的 Plugin 静态元数据。
+pub(crate) struct PluginMetadata {
+    pub(crate) key: PluginKey,
+    pub(crate) dependencies: Vec<ServiceId>,
+}
+
+pub(crate) fn read_metadata(plugin: &dyn Plugin) -> Result<PluginMetadata, CoreError> {
+    let key = catch_unwind(AssertUnwindSafe(|| plugin.key()))
+        .map_err(|payload| CoreError::PluginApply(format_panic_message("plugin key", payload)))?;
+    let dependencies = catch_unwind(AssertUnwindSafe(|| plugin.inject())).map_err(|payload| {
+        CoreError::PluginApply(format_panic_message("plugin inject", payload))
+    })?;
+    Ok(PluginMetadata { key, dependencies })
 }
 
 /// 可挂载到 Context 的极简插件实例。

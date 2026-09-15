@@ -4,6 +4,7 @@
 
 use crate::{
     CoreError, ServiceId, Services,
+    callback_context::USER_LIFECYCLE_CALLBACK,
     effect::EffectScope,
     error::format_panic_message,
     registry::{InjectionId, NodeId, Registry},
@@ -59,13 +60,17 @@ async fn invoke_callback(
     services: Services,
     child: EffectScope,
 ) -> Result<(), String> {
-    let future = catch_unwind(AssertUnwindSafe(|| callback(services, child)))
-        .map_err(|payload| format_panic_message("injection callback", payload))?;
-    match AssertUnwindSafe(future).catch_unwind().await {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(error)) => Err(error.to_string()),
-        Err(payload) => Err(format_panic_message("injection callback", payload)),
-    }
+    USER_LIFECYCLE_CALLBACK
+        .scope((), async {
+            let future = catch_unwind(AssertUnwindSafe(|| callback(services, child)))
+                .map_err(|payload| format_panic_message("injection callback", payload))?;
+            match AssertUnwindSafe(future).catch_unwind().await {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(error)) => Err(error.to_string()),
+                Err(payload) => Err(format_panic_message("injection callback", payload)),
+            }
+        })
+        .await
 }
 
 impl Registry {

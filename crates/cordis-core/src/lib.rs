@@ -3,6 +3,7 @@
 //! Core 不含网关、HTTP、数据库、Redis、持久化配置或插件发现；
 //! 宿主围绕 [`Runtime`] 组装这些能力。
 
+mod callback_context;
 mod config;
 mod context;
 mod diagnostics;

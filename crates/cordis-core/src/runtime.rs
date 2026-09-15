@@ -5,6 +5,7 @@
 
 use crate::{
     Context, CoreError, PluginKey,
+    callback_context::{SHUTDOWN_COORDINATOR, in_shutdown_coordinator, in_user_lifecycle_callback},
     context::ContextInner,
     diagnostics::RuntimeSnapshot,
     effect::EffectScope,
@@ -130,6 +131,9 @@ impl Runtime {
     /// 这是宿主应使用的正常关闭路径。释放错误仍会完成 settle 与停调度器后返回。
     /// 并发与后续调用共享同一轮 completion 与同一结果。
     pub async fn shutdown(&self) -> Result<(), CoreError> {
+        if in_user_lifecycle_callback() || in_shutdown_coordinator() {
+            return Err(CoreError::ShutdownReentrant);
+        }
         let (completion, start_coordinator) = {
             let mut slot = self.inner.shutdown.lock().expect("shutdown slot");
             if let Some(existing) = slot.as_ref() {
@@ -144,13 +148,16 @@ impl Runtime {
         if start_coordinator {
             let inner = self.inner.clone();
             let completion_for_task = completion.clone();
-            let coordinator = self.inner.handle.spawn(async move {
-                let dispose_result = inner.root.inner.scope.dispose_wait().await;
-                inner.registry.settle().await;
-                inner.registry.stop_scheduler().await;
-                inner.scheduler_awaited.store(true, Ordering::Release);
-                completion_for_task.finish(dispose_result);
-            });
+            let coordinator = self
+                .inner
+                .handle
+                .spawn(SHUTDOWN_COORDINATOR.scope((), async move {
+                    let dispose_result = inner.root.inner.scope.dispose_wait().await;
+                    inner.registry.settle().await;
+                    inner.registry.stop_scheduler().await;
+                    inner.scheduler_awaited.store(true, Ordering::Release);
+                    completion_for_task.finish(dispose_result);
+                }));
             completion.attach_coordinator(coordinator);
         }
 

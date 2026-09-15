@@ -6,6 +6,7 @@
 use super::{Context, InjectionHandle};
 use crate::{
     ConfigKey, CoreError, ServiceId, ServiceKey, Services,
+    callback_context::USER_LIFECYCLE_CALLBACK,
     effect::EffectHandle,
     event::{EventKey, ListenOptions, Next, ParallelKey, SerialKey, Unsubscribe, WaterfallKey},
 };
@@ -234,7 +235,8 @@ impl EffectContext {
             return Err(CoreError::ContextDisposed);
         }
         let cancellation = self.cancellation_token();
-        let handle: JoinHandle<()> = tokio::spawn(task(cancellation));
+        let future = task(cancellation);
+        let handle: JoinHandle<()> = tokio::spawn(USER_LIFECYCLE_CALLBACK.scope((), future));
         self.context.inner.scope.push_task(handle);
         Ok(())
     }

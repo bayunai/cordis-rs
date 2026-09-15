@@ -96,6 +96,48 @@ async fn injection_callback_panic_fails_only_that_injection_and_scheduler_contin
 }
 
 #[tokio::test]
+async fn injection_shutdown_fails_fast_and_other_ready_work_continues() {
+    let runtime = runtime();
+    let root = runtime.root();
+    let rejected_runtime = runtime.clone();
+    let rejected = root
+        .inject([NUMBER.id()], move |_services, _effect| {
+            let runtime = rejected_runtime.clone();
+            async move { runtime.shutdown().await }
+        })
+        .unwrap();
+    let healthy_runs = Arc::new(AtomicUsize::new(0));
+    let counter = healthy_runs.clone();
+    let healthy = root
+        .inject([NUMBER.id()], move |_services, _effect| {
+            let counter = counter.clone();
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        })
+        .unwrap();
+
+    root.effect().unwrap().provide(NUMBER, Number(1)).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        wait_injection(&rejected, InjectionState::Failed).await;
+        wait_injection(&healthy, InjectionState::Active).await;
+    })
+    .await
+    .expect("scheduler must not deadlock on injection shutdown");
+    assert_eq!(healthy_runs.load(Ordering::SeqCst), 1);
+    let failure = runtime
+        .diagnostics()
+        .inject_fibers
+        .into_iter()
+        .find(|item| item.phase == cordis_core::FiberStateSnapshot::Failed)
+        .and_then(|item| item.last_error)
+        .expect("failed injection diagnostic");
+    assert!(failure.contains("shutdown 只能由宿主"));
+    runtime.shutdown().await.expect("host shutdown");
+}
+
+#[tokio::test]
 async fn provider_removal_disposes_consumer_and_reactivation_rebuilds_it() {
     let runtime = runtime();
     let root = runtime.root();

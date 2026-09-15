@@ -18,7 +18,7 @@ use crate::{
     },
     fiber::{Fiber, FiberInner, FiberState},
     isolation::IsolationLabel,
-    plugin::Plugin,
+    plugin::{Plugin, read_metadata},
     registry::{NodeId, Registry},
     service::ErasedService,
 };
@@ -238,9 +238,10 @@ impl Context {
     /// 挂载插件：返回可重启 / 可替换的 [`Fiber`]。
     pub async fn plugin(&self, plugin: Arc<dyn Plugin>) -> Result<Fiber, CoreError> {
         self.ensure_alive()?;
-        let plugin_key = plugin.key();
+        let metadata = read_metadata(plugin.as_ref())?;
+        let plugin_key = metadata.key;
         let id = self.inner.registry.allocate_id();
-        let dependencies = plugin.inject();
+        let dependencies = metadata.dependencies;
         let inner = Arc::new(FiberInner {
             id,
             plugin_key,

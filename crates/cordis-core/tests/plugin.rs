@@ -167,6 +167,151 @@ async fn plugin_apply_panic_fails_only_its_fiber_and_scheduler_continues() {
     runtime.shutdown().await.expect("shutdown");
 }
 
+struct ShutdownInApplyPlugin {
+    runtime: Runtime,
+}
+
+#[async_trait]
+impl Plugin for ShutdownInApplyPlugin {
+    fn key(&self) -> cordis_core::PluginKey {
+        cordis_core::PluginKey::new("test.shutdown-in-apply")
+    }
+
+    fn inject(&self) -> Vec<cordis_core::ServiceId> {
+        vec![NUMBER.id()]
+    }
+
+    async fn apply(&self, _ctx: &Context) -> Result<(), CoreError> {
+        self.runtime.shutdown().await
+    }
+}
+
+#[tokio::test]
+async fn plugin_apply_shutdown_fails_fast_and_scheduler_continues() {
+    let runtime = runtime();
+    let root = runtime.root();
+    let rejected = root
+        .plugin(Arc::new(ShutdownInApplyPlugin {
+            runtime: runtime.clone(),
+        }))
+        .await
+        .unwrap();
+    let healthy_runs = Arc::new(AtomicUsize::new(0));
+    let healthy = root
+        .plugin(Arc::new(HealthyAfterPanicPlugin {
+            runs: healthy_runs.clone(),
+        }))
+        .await
+        .unwrap();
+    root.effect().unwrap().provide(NUMBER, Number(1)).unwrap();
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        wait_until(|| {
+            rejected.state() == FiberState::Failed && healthy.state() == FiberState::Active
+        }),
+    )
+    .await
+    .expect("scheduler must not deadlock on plugin shutdown");
+    assert_eq!(healthy_runs.load(Ordering::SeqCst), 1);
+    assert!(
+        rejected
+            .last_error()
+            .is_some_and(|error| error.contains("shutdown 只能由宿主"))
+    );
+    runtime.shutdown().await.expect("host shutdown");
+}
+
+static METADATA_KEY: cordis_core::PluginKey = cordis_core::PluginKey::new("test.metadata");
+
+struct ValuePlugin(usize);
+
+#[async_trait]
+impl Plugin for ValuePlugin {
+    fn key(&self) -> cordis_core::PluginKey {
+        METADATA_KEY
+    }
+
+    async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
+        ctx.provide(NUMBER, Number(self.0))
+    }
+}
+
+struct KeyPanicPlugin;
+
+#[async_trait]
+impl Plugin for KeyPanicPlugin {
+    fn key(&self) -> cordis_core::PluginKey {
+        panic!("key boom");
+    }
+
+    async fn apply(&self, _ctx: &Context) -> Result<(), CoreError> {
+        Ok(())
+    }
+}
+
+struct InjectPanicPlugin;
+
+#[async_trait]
+impl Plugin for InjectPanicPlugin {
+    fn key(&self) -> cordis_core::PluginKey {
+        METADATA_KEY
+    }
+
+    fn inject(&self) -> Vec<cordis_core::ServiceId> {
+        panic!("inject boom");
+    }
+
+    async fn apply(&self, _ctx: &Context) -> Result<(), CoreError> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn initial_plugin_metadata_panics_leave_no_runtime_residue() {
+    let runtime = runtime();
+    let root = runtime.root();
+    for plugin in [
+        Arc::new(KeyPanicPlugin) as Arc<dyn Plugin>,
+        Arc::new(InjectPanicPlugin) as Arc<dyn Plugin>,
+    ] {
+        let error = match root.plugin(plugin).await {
+            Ok(_) => panic!("metadata panic must reject mount"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, CoreError::PluginApply(_)));
+    }
+    let snapshot = runtime.diagnostics();
+    assert!(snapshot.plugin_fibers.is_empty());
+    assert!(snapshot.plugin_registry.is_empty());
+    assert!(snapshot.effects.is_empty());
+    runtime.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn replace_metadata_panics_keep_old_active_plugin_and_release_busy() {
+    let runtime = runtime();
+    let root = runtime.root();
+    let mut fiber = root.plugin(Arc::new(ValuePlugin(1))).await.unwrap();
+    assert_eq!(fiber.state(), FiberState::Active);
+    assert_eq!(root.get(NUMBER).unwrap().0, 1);
+
+    for plugin in [
+        Arc::new(KeyPanicPlugin) as Arc<dyn Plugin>,
+        Arc::new(InjectPanicPlugin) as Arc<dyn Plugin>,
+    ] {
+        let error = fiber.replace(plugin).await.expect_err("metadata panic");
+        assert!(matches!(error, CoreError::PluginApply(_)));
+        assert_eq!(fiber.state(), FiberState::Active);
+        assert_eq!(root.get(NUMBER).unwrap().0, 1);
+    }
+
+    fiber.replace(Arc::new(ValuePlugin(2))).await.unwrap();
+    assert_eq!(fiber.state(), FiberState::Active);
+    assert_eq!(root.get(NUMBER).unwrap().0, 2);
+    runtime.shutdown().await.expect("shutdown");
+}
+
 #[tokio::test]
 async fn plugin_remount_does_not_accumulate_child_scopes() {
     let runtime = runtime();

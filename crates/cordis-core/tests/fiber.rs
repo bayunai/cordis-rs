@@ -770,6 +770,70 @@ async fn provider_recompute_marks_failed_when_async_dispose_errors() {
 }
 
 #[tokio::test]
+async fn cancelled_restart_releases_busy_and_allows_later_lifecycle_work() {
+    use cordis_core::PluginKey;
+
+    static KEY: PluginKey = PluginKey::new("test.cancelled-restart");
+    let runtime = runtime();
+    let root = runtime.root();
+    let (cancelled_tx, mut cancelled_rx) = oneshot::channel::<()>();
+    let (release_tx, release_rx) = oneshot::channel::<()>();
+    let cancelled_tx = Arc::new(Mutex::new(Some(cancelled_tx)));
+    let release_rx = Arc::new(Mutex::new(Some(release_rx)));
+
+    struct GatedDisposePlugin {
+        cancelled: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+        release: Arc<Mutex<Option<oneshot::Receiver<()>>>>,
+    }
+
+    #[async_trait]
+    impl Plugin for GatedDisposePlugin {
+        fn key(&self) -> PluginKey {
+            KEY
+        }
+
+        async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
+            let cancelled = self.cancelled.clone();
+            let release = self.release.clone();
+            let effect = ctx.effect()?;
+            effect.spawn(move |cancel| async move {
+                cancel.cancelled().await;
+                if let Some(tx) = cancelled.lock().expect("cancelled").take() {
+                    let _ = tx.send(());
+                }
+                let receiver = release.lock().expect("release").take();
+                if let Some(rx) = receiver {
+                    let _ = rx.await;
+                }
+            })?;
+            Ok(())
+        }
+    }
+
+    let mut fiber = root
+        .plugin(Arc::new(GatedDisposePlugin {
+            cancelled: cancelled_tx,
+            release: release_rx,
+        }))
+        .await
+        .unwrap();
+    let mut restart = Box::pin(fiber.restart());
+    tokio::select! {
+        result = &mut restart => panic!("restart completed unexpectedly: {result:?}"),
+        _ = &mut cancelled_rx => {}
+    }
+    drop(restart);
+    let _ = release_tx.send(());
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), fiber.restart())
+        .await
+        .expect("later restart must not remain FiberBusy")
+        .expect("later restart");
+    assert_eq!(fiber.state(), FiberState::Active);
+    runtime.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
 async fn fiber_dispose_then_dispose_wait_preserves_async_errors() {
     use cordis_core::PluginKey;
 

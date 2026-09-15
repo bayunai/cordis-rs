@@ -3,8 +3,27 @@
 //! 编排卸载与等待；状态机规则在 `state`，依赖就绪后的 apply 在 `activate`。
 
 use super::{Fiber, FiberInner, FiberState};
-use crate::{CoreError, effect::EffectScope, plugin::Plugin};
+use crate::{
+    CoreError,
+    effect::EffectScope,
+    plugin::{Plugin, PluginMetadata, read_metadata},
+};
 use std::sync::{Arc, atomic::Ordering};
+
+/// 生命周期操作期间独占 Fiber；无论正常返回、panic unwind 还是 Future 被取消，
+/// Drop 都会解除 Busy 并触发一次重新收敛。
+struct FiberBusyGuard {
+    inner: Arc<FiberInner>,
+}
+
+impl Drop for FiberBusyGuard {
+    fn drop(&mut self) {
+        *self.inner.busy.lock().expect("busy") = false;
+        if let Some(registry) = self.inner.registry.upgrade() {
+            registry.mark_dirty_public();
+        }
+    }
+}
 
 impl Fiber {
     pub fn dispose(&mut self) {
@@ -20,19 +39,8 @@ impl Fiber {
         if self.is_disposed() {
             return Err(CoreError::FiberDisposed);
         }
-        {
-            let mut busy = self.inner.busy.lock().expect("busy");
-            if *busy {
-                return Err(CoreError::FiberBusy);
-            }
-            *busy = true;
-        }
-        let result = self.restart_inner().await;
-        *self.inner.busy.lock().expect("busy") = false;
-        if let Some(registry) = self.inner.registry.upgrade() {
-            registry.mark_dirty_public();
-        }
-        result
+        let _busy = self.inner.acquire_busy()?;
+        self.restart_inner().await
     }
 
     async fn restart_inner(&mut self) -> Result<(), CoreError> {
@@ -49,46 +57,55 @@ impl Fiber {
         if self.is_disposed() {
             return Err(CoreError::FiberDisposed);
         }
-        {
-            let mut busy = self.inner.busy.lock().expect("busy");
-            if *busy {
-                return Err(CoreError::FiberBusy);
-            }
-            *busy = true;
+        let _busy = self.inner.acquire_busy()?;
+        // 候选元数据必须在旧实例开始卸载前全部读取；panic 或不匹配不影响旧实例。
+        let metadata = read_metadata(plugin.as_ref())?;
+        if metadata.key != self.inner.plugin_key {
+            return Err(CoreError::PluginKeyMismatch {
+                expected: self.inner.plugin_key,
+                actual: metadata.key,
+            });
         }
-        let result = async {
-            let actual = plugin.key();
-            if actual != self.inner.plugin_key {
-                return Err(CoreError::PluginKeyMismatch {
-                    expected: self.inner.plugin_key,
-                    actual,
-                });
-            }
-            self.inner.unload_effect_to_pending().await?;
-            let deps = plugin.inject();
-            *self.inner.plugin.lock().expect("plugin") = plugin;
-            *self.inner.dependencies.lock().expect("deps") = deps;
-            self.inner
-                .resolved_providers
-                .lock()
-                .expect("providers")
-                .clear();
-            *self.inner.last_error.lock().expect("error") = None;
-            if !self.inner.transition_if_alive(FiberState::Pending) {
-                return Err(CoreError::FiberDisposed);
-            }
-            self.inner.try_activate().await
+        self.replace_inner(plugin, metadata).await
+    }
+
+    async fn replace_inner(
+        &mut self,
+        plugin: Arc<dyn Plugin>,
+        metadata: PluginMetadata,
+    ) -> Result<(), CoreError> {
+        self.inner.unload_effect_to_pending().await?;
+        *self.inner.plugin.lock().expect("plugin") = plugin;
+        *self.inner.dependencies.lock().expect("deps") = metadata.dependencies;
+        self.inner
+            .resolved_providers
+            .lock()
+            .expect("providers")
+            .clear();
+        *self.inner.last_error.lock().expect("error") = None;
+        if !self.inner.transition_if_alive(FiberState::Pending) {
+            return Err(CoreError::FiberDisposed);
         }
-        .await;
-        *self.inner.busy.lock().expect("busy") = false;
-        if let Some(registry) = self.inner.registry.upgrade() {
-            registry.mark_dirty_public();
-        }
-        result
+        self.inner.try_activate().await
     }
 }
 
 impl FiberInner {
+    fn acquire_busy(self: &Arc<Self>) -> Result<FiberBusyGuard, CoreError> {
+        if self.disposed.load(Ordering::Acquire) {
+            return Err(CoreError::FiberDisposed);
+        }
+        let mut busy = self.busy.lock().expect("busy");
+        if *busy {
+            return Err(CoreError::FiberBusy);
+        }
+        *busy = true;
+        drop(busy);
+        Ok(FiberBusyGuard {
+            inner: self.clone(),
+        })
+    }
+
     fn begin_dispose(&self) -> Option<Option<EffectScope>> {
         if self.disposed.swap(true, Ordering::AcqRel) {
             return None;
@@ -170,22 +187,9 @@ impl FiberInner {
         }
     }
 
-    pub(crate) async fn unload_to_pending_wait(&self) -> Result<(), CoreError> {
-        if self.disposed.load(Ordering::Acquire) {
-            return Err(CoreError::FiberDisposed);
-        }
-        {
-            let Ok(mut busy) = self.busy.lock() else {
-                return Err(CoreError::FiberDisposed);
-            };
-            if *busy {
-                return Err(CoreError::FiberBusy);
-            }
-            *busy = true;
-        }
-        let result = self.unload_effect_to_pending().await;
-        *self.busy.lock().expect("busy") = false;
-        result
+    pub(crate) async fn unload_to_pending_wait(self: &Arc<Self>) -> Result<(), CoreError> {
+        let _busy = self.acquire_busy()?;
+        self.unload_effect_to_pending().await
     }
 }
 

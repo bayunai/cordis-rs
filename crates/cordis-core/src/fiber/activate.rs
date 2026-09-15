@@ -3,7 +3,10 @@
 //! 认领 Pending→Loading，解析依赖并调用 Plugin::apply；生命周期入口在 `lifecycle`。
 
 use super::{ActivateClaim, FiberInner, FiberState};
-use crate::{Context, CoreError, ServiceId, effect::EffectScope, error::format_panic_message};
+use crate::{
+    Context, CoreError, ServiceId, callback_context::USER_LIFECYCLE_CALLBACK, effect::EffectScope,
+    error::format_panic_message,
+};
 use futures_util::FutureExt;
 use std::{
     panic::{AssertUnwindSafe, catch_unwind},
@@ -14,13 +17,17 @@ async fn invoke_plugin_apply(
     plugin: &Arc<dyn crate::plugin::Plugin>,
     context: &Context,
 ) -> Result<(), String> {
-    let future = catch_unwind(AssertUnwindSafe(|| plugin.apply(context)))
-        .map_err(|payload| format_panic_message("plugin apply", payload))?;
-    match AssertUnwindSafe(future).catch_unwind().await {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(error)) => Err(error.to_string()),
-        Err(payload) => Err(format_panic_message("plugin apply", payload)),
-    }
+    USER_LIFECYCLE_CALLBACK
+        .scope((), async {
+            let future = catch_unwind(AssertUnwindSafe(|| plugin.apply(context)))
+                .map_err(|payload| format_panic_message("plugin apply", payload))?;
+            match AssertUnwindSafe(future).catch_unwind().await {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(error)) => Err(error.to_string()),
+                Err(payload) => Err(format_panic_message("plugin apply", payload)),
+            }
+        })
+        .await
 }
 
 impl FiberInner {

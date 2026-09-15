@@ -8,7 +8,7 @@ use std::{
     sync::{Arc, Weak, atomic::Ordering},
 };
 
-use crate::{CoreError, error::format_panic_message};
+use crate::{CoreError, callback_context::USER_LIFECYCLE_CALLBACK, error::format_panic_message};
 
 use super::{
     EffectScope, EffectScopeInner,
@@ -87,13 +87,17 @@ fn run_sync_cleanup_collect(cleanup: Box<dyn FnOnce() + Send>, errors: &mut Vec<
 }
 
 async fn run_async_disposer(disposer: AsyncDisposer) -> Result<(), String> {
-    let future = catch_unwind(AssertUnwindSafe(disposer))
-        .map_err(|payload| format_panic_message("dispose callback", payload))?;
-    match AssertUnwindSafe(future).catch_unwind().await {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(error)) => Err(error.to_string()),
-        Err(payload) => Err(format_panic_message("dispose callback", payload)),
-    }
+    USER_LIFECYCLE_CALLBACK
+        .scope((), async move {
+            let future = catch_unwind(AssertUnwindSafe(disposer))
+                .map_err(|payload| format_panic_message("dispose callback", payload))?;
+            match AssertUnwindSafe(future).catch_unwind().await {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(error)) => Err(error.to_string()),
+                Err(payload) => Err(format_panic_message("dispose callback", payload)),
+            }
+        })
+        .await
 }
 
 impl EffectScope {

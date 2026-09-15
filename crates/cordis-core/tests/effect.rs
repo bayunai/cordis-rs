@@ -883,3 +883,51 @@ async fn shutdown_coordinator_survives_first_waiter_abort() {
         .expect("shutdown result");
     assert!(runtime.scheduler_stopped());
 }
+
+#[tokio::test]
+async fn controlled_task_shutdown_fails_fast_and_host_can_still_shutdown() {
+    let runtime = runtime();
+    let effect = runtime.root().effect().unwrap();
+    let (result_tx, result_rx) = oneshot::channel();
+    let task_runtime = runtime.clone();
+    effect
+        .spawn(move |_cancel| async move {
+            let _ = result_tx.send(task_runtime.shutdown().await);
+        })
+        .unwrap();
+
+    let result = tokio::time::timeout(std::time::Duration::from_secs(2), result_rx)
+        .await
+        .expect("controlled task shutdown must not hang")
+        .expect("task result");
+    assert!(matches!(result, Err(CoreError::ShutdownReentrant)));
+    runtime.shutdown().await.expect("host shutdown");
+}
+
+#[tokio::test]
+async fn async_disposer_shutdown_fails_fast_without_blocking_coordinator() {
+    let runtime = runtime();
+    let effect = runtime.root().effect().unwrap();
+    let disposer_runtime = runtime.clone();
+    effect
+        .on_dispose_async(move || {
+            let runtime = disposer_runtime.clone();
+            async move { runtime.shutdown().await }
+        })
+        .unwrap();
+
+    let error = tokio::time::timeout(std::time::Duration::from_secs(2), runtime.shutdown())
+        .await
+        .expect("shutdown coordinator must not self-wait")
+        .expect_err("disposer shutdown rejection is aggregated");
+    match error {
+        CoreError::DisposeFailed { errors } => assert!(
+            errors
+                .iter()
+                .any(|item| item.contains("shutdown 只能由宿主")),
+            "missing shutdown rejection: {errors:?}"
+        ),
+        other => panic!("unexpected: {other:?}"),
+    }
+    assert!(runtime.scheduler_stopped());
+}

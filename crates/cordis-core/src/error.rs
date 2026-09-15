@@ -40,6 +40,8 @@ pub enum CoreError {
     EmptyInjection,
     #[error("运行时调度器不可用；请在 Tokio Runtime 中创建 Runtime")]
     SchedulerUnavailable,
+    #[error("shutdown 只能由宿主生命周期外部调用")]
+    ShutdownReentrant,
     #[error("事件监听器失败: {0}")]
     EventListener(String),
     #[error("并行事件 {event} 分发失败: {errors:?}")]
