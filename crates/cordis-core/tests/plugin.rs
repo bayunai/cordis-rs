@@ -721,6 +721,98 @@ async fn unmount_rejects_concurrent_mount_and_replace_requires_same_key() {
     assert!(fiber.is_disposed());
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancelled_unmount_waiter_does_not_leave_plugin_group_locked() {
+    use cordis_core::PluginKey;
+
+    static KEY: PluginKey = PluginKey::new("test.unmount-cancel-safe");
+
+    struct GatePlugin {
+        entered: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+        release: Arc<Mutex<Option<oneshot::Receiver<()>>>>,
+    }
+
+    #[async_trait]
+    impl Plugin for GatePlugin {
+        fn key(&self) -> PluginKey {
+            KEY
+        }
+
+        async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
+            let entered = self.entered.clone();
+            let release = self.release.clone();
+            ctx.effect()?.on_dispose_async(move || async move {
+                if let Some(sender) = entered.lock().expect("entered").take() {
+                    let _ = sender.send(());
+                }
+                let receiver = { release.lock().expect("release").take() };
+                if let Some(receiver) = receiver {
+                    let _ = receiver.await;
+                }
+                Ok(())
+            })?;
+            Ok(())
+        }
+    }
+
+    struct ReplacementPlugin;
+    #[async_trait]
+    impl Plugin for ReplacementPlugin {
+        fn key(&self) -> PluginKey {
+            KEY
+        }
+
+        async fn apply(&self, _ctx: &Context) -> Result<(), CoreError> {
+            Ok(())
+        }
+    }
+
+    let runtime = runtime();
+    let root = runtime.root();
+    let (entered_tx, entered_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    let _original = root
+        .plugin(Arc::new(GatePlugin {
+            entered: Arc::new(Mutex::new(Some(entered_tx))),
+            release: Arc::new(Mutex::new(Some(release_rx))),
+        }))
+        .await
+        .expect("mount");
+
+    let waiter = {
+        let runtime = runtime.clone();
+        tokio::spawn(async move { runtime.unmount(KEY).await })
+    };
+    entered_rx.await.expect("unmount disposer entered");
+    waiter.abort();
+    let _ = waiter.await;
+    let _ = release_tx.send(());
+
+    wait_until(|| {
+        runtime
+            .diagnostics()
+            .plugin_registry
+            .iter()
+            .all(|group| group.plugin_key != KEY.as_str())
+            && runtime
+                .diagnostics()
+                .plugin_fibers
+                .iter()
+                .all(|fiber| fiber.plugin_key != KEY.as_str())
+    })
+    .await;
+
+    let mut replacement = root
+        .plugin(Arc::new(ReplacementPlugin))
+        .await
+        .expect("unmount coordinator must release the key after waiter cancellation");
+    replacement
+        .dispose_wait()
+        .await
+        .expect("dispose replacement");
+    runtime.shutdown().await.expect("shutdown");
+}
+
 #[tokio::test]
 async fn plugin_dispose_clears_registry_index() {
     use cordis_core::PluginKey;

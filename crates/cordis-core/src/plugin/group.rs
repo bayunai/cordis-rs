@@ -8,12 +8,62 @@ use crate::{
     plugin::PluginKey,
     registry::Registry,
 };
-use std::sync::{Arc, Weak};
-use tokio::sync::broadcast;
+use std::sync::{Arc, Mutex, Weak};
+use tokio::{
+    sync::{Notify, broadcast},
+    task::JoinHandle,
+};
+
+/// 单次按 Key 卸载的共享完成结果。
+///
+/// 协调器独立于首个 `Runtime::unmount()` 调用者；等待者取消不影响实际释放。
+pub(crate) struct UnmountCompletion {
+    notify: Notify,
+    result: Mutex<Option<Result<usize, CoreError>>>,
+    retain: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl UnmountCompletion {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            notify: Notify::new(),
+            result: Mutex::new(None),
+            retain: Mutex::new(None),
+        })
+    }
+
+    pub(crate) fn attach_coordinator(&self, handle: JoinHandle<()>) {
+        *self.retain.lock().expect("unmount retain") = Some(handle);
+    }
+
+    pub(crate) fn finish(&self, result: Result<usize, CoreError>) {
+        {
+            let mut slot = self.result.lock().expect("unmount completion");
+            if slot.is_some() {
+                return;
+            }
+            *slot = Some(result);
+        }
+        self.notify.notify_waiters();
+    }
+
+    pub(crate) async fn wait(self: &Arc<Self>) -> Result<usize, CoreError> {
+        loop {
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if let Some(result) = self.result.lock().expect("unmount completion").as_ref() {
+                return result.clone();
+            }
+            notified.await;
+        }
+    }
+}
 
 pub(crate) struct PluginGroup {
     pub(crate) fibers: Vec<Weak<FiberInner>>,
     pub(crate) unmounting: bool,
+    pub(crate) unmount_completion: Option<Arc<UnmountCompletion>>,
 }
 
 impl Registry {
@@ -46,6 +96,7 @@ impl Registry {
                 .or_insert_with(|| PluginGroup {
                     fibers: Vec::new(),
                     unmounting: false,
+                    unmount_completion: None,
                 });
             group.fibers.push(Arc::downgrade(&fiber));
         }
@@ -89,7 +140,7 @@ impl Registry {
     pub(crate) fn begin_plugin_unmount(
         &self,
         key: PluginKey,
-    ) -> Result<Vec<Arc<FiberInner>>, CoreError> {
+    ) -> Result<(Vec<Arc<FiberInner>>, Arc<UnmountCompletion>), CoreError> {
         let mut state = self.state.lock().map_err(|_| CoreError::ContextDisposed)?;
         let group = state
             .plugin_index
@@ -97,22 +148,37 @@ impl Registry {
             .or_insert_with(|| PluginGroup {
                 fibers: Vec::new(),
                 unmounting: false,
+                unmount_completion: None,
             });
         if group.unmounting {
             return Err(CoreError::PluginUnmounting { plugin: key });
         }
         group.unmounting = true;
+        let completion = UnmountCompletion::new();
+        group.unmount_completion = Some(completion.clone());
         group.fibers.retain(|weak| weak.strong_count() > 0);
-        Ok(group
+        let fibers = group
             .fibers
             .iter()
             .filter_map(Weak::upgrade)
             .filter(|fiber| fiber.needs_unmount_wait())
-            .collect())
+            .collect();
+        Ok((fibers, completion))
     }
 
-    pub(crate) fn finish_plugin_unmount(&self, key: PluginKey) {
-        if let Ok(mut state) = self.state.lock() {
+    pub(crate) fn finish_plugin_unmount(
+        &self,
+        key: PluginKey,
+        completion: &Arc<UnmountCompletion>,
+    ) {
+        if let Ok(mut state) = self.state.lock()
+            && state.plugin_index.get(&key).is_some_and(|group| {
+                group
+                    .unmount_completion
+                    .as_ref()
+                    .is_some_and(|current| Arc::ptr_eq(current, completion))
+            })
+        {
             state.plugin_index.remove(&key);
         }
     }

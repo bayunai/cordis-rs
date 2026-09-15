@@ -13,6 +13,7 @@ use crate::{
     diagnostics::RuntimeSnapshot,
     effect::EffectScope,
     fiber::{Fiber, FiberStateChange},
+    plugin::group::UnmountCompletion,
     registry::Registry,
 };
 use std::sync::{
@@ -110,6 +111,46 @@ async fn run_shutdown_worker(inner: Arc<RuntimeInner>) -> Result<(), CoreError> 
     inner.registry.stop_scheduler().await;
     inner.scheduler_awaited.store(true, Ordering::Release);
     dispose_result
+}
+
+struct UnmountFinishGuard {
+    registry: Arc<Registry>,
+    key: PluginKey,
+    completion: Arc<UnmountCompletion>,
+    finished: bool,
+}
+
+impl Drop for UnmountFinishGuard {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.registry
+                .finish_plugin_unmount(self.key, &self.completion);
+            self.completion.finish(Err(CoreError::CoordinatorAborted {
+                reason: "unmount supervisor dropped".into(),
+            }));
+        }
+    }
+}
+
+async fn run_unmount_worker(
+    fibers: Vec<Arc<crate::fiber::FiberInner>>,
+) -> Result<usize, CoreError> {
+    let count = fibers.len();
+    let mut errors = Vec::new();
+    for fiber in fibers {
+        let mut handle = Fiber { inner: fiber };
+        if let Err(error) = handle.dispose_wait().await {
+            match error {
+                CoreError::DisposeFailed { errors: mut nested } => errors.append(&mut nested),
+                other => errors.push(other.to_string()),
+            }
+        }
+    }
+    if errors.is_empty() {
+        Ok(count)
+    } else {
+        Err(CoreError::DisposeFailed { errors })
+    }
 }
 
 impl Runtime {
@@ -238,24 +279,23 @@ impl Runtime {
                 }
             }
         }
-        let fibers = self.inner.registry.begin_plugin_unmount(key)?;
-        let count = fibers.len();
-        let mut errors = Vec::new();
-        for fiber in fibers {
-            let mut handle = Fiber { inner: fiber };
-            if let Err(error) = handle.dispose_wait().await {
-                match error {
-                    CoreError::DisposeFailed { errors: mut nested } => errors.append(&mut nested),
-                    other => errors.push(other.to_string()),
-                }
-            }
-        }
-        self.inner.registry.finish_plugin_unmount(key);
-        if errors.is_empty() {
-            Ok(count)
-        } else {
-            Err(CoreError::DisposeFailed { errors })
-        }
+        let (fibers, completion) = self.inner.registry.begin_plugin_unmount(key)?;
+        let registry = self.inner.registry.clone();
+        let completion_for_task = completion.clone();
+        let supervisor = self.inner.handle.spawn(async move {
+            let mut guard = UnmountFinishGuard {
+                registry: registry.clone(),
+                key,
+                completion: completion_for_task.clone(),
+                finished: false,
+            };
+            let result = run_unmount_worker(fibers).await;
+            registry.finish_plugin_unmount(key, &completion_for_task);
+            completion_for_task.finish(result);
+            guard.finished = true;
+        });
+        completion.attach_coordinator(supervisor);
+        completion.wait().await
     }
 }
 
@@ -352,5 +392,36 @@ mod shutdown_supervisor_tests {
             }
             other => panic!("unexpected: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn unmount_supervisor_drop_releases_group_and_finishes_waiters() {
+        let runtime = Runtime::new().expect("runtime");
+        let key = PluginKey::new("test.unmount-supervisor-drop");
+        let (_, completion) = runtime
+            .inner
+            .registry
+            .begin_plugin_unmount(key)
+            .expect("begin unmount");
+
+        {
+            let _guard = UnmountFinishGuard {
+                registry: runtime.inner.registry.clone(),
+                key,
+                completion: completion.clone(),
+                finished: false,
+            };
+        }
+
+        let error = completion.wait().await.expect_err("coordinator aborted");
+        assert!(matches!(error, CoreError::CoordinatorAborted { .. }));
+        assert!(
+            runtime
+                .diagnostics()
+                .plugin_registry
+                .iter()
+                .all(|group| group.plugin_key != key.as_str())
+        );
+        runtime.shutdown().await.expect("shutdown");
     }
 }

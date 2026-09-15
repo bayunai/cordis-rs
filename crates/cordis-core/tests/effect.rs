@@ -23,6 +23,34 @@ async fn shutdown_cancels_and_waits_for_controlled_tasks() {
     assert!(stopped.load(Ordering::SeqCst));
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn controlled_task_spawn_from_std_thread_uses_scope_runtime() {
+    let runtime = runtime();
+    let effect = runtime.root().effect().unwrap();
+    let started = Arc::new(AtomicBool::new(false));
+    let stopped = Arc::new(AtomicBool::new(false));
+    let thread_effect = effect.clone();
+    let thread_started = started.clone();
+    let thread_stopped = stopped.clone();
+
+    let thread = std::thread::spawn(move || {
+        thread_effect.spawn(move |cancel| async move {
+            thread_started.store(true, Ordering::SeqCst);
+            cancel.cancelled().await;
+            thread_stopped.store(true, Ordering::SeqCst);
+        })
+    });
+    thread
+        .join()
+        .expect("spawn must not panic outside Tokio context")
+        .expect("spawn must use the scope runtime handle");
+
+    wait_until(|| started.load(Ordering::SeqCst)).await;
+    effect.dispose_wait().await.expect("dispose_wait");
+    assert!(stopped.load(Ordering::SeqCst));
+    runtime.shutdown().await.expect("shutdown");
+}
+
 #[tokio::test]
 async fn diagnostics_do_not_leak_service_payloads() {
     let runtime = runtime();

@@ -236,12 +236,17 @@ impl EffectContext {
         }
         let cancellation = self.cancellation_token();
         let future = task(cancellation);
-        let handle: JoinHandle<()> = tokio::spawn(USER_LIFECYCLE_CALLBACK.scope(
-            LifecycleFrame {
-                scope: self.context.inner.scope.clone(),
-            },
-            future,
-        ));
+        let handle: JoinHandle<()> =
+            self.context
+                .inner
+                .scope
+                .runtime_handle()
+                .spawn(USER_LIFECYCLE_CALLBACK.scope(
+                    LifecycleFrame {
+                        scope: self.context.inner.scope.clone(),
+                    },
+                    future,
+                ));
         self.context.inner.scope.push_task(handle);
         Ok(())
     }
