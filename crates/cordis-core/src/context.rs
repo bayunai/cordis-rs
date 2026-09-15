@@ -796,18 +796,27 @@ impl EffectContext {
         self.context.inner.scope.on_dispose(callback);
     }
 
+    /// 注册仅在 Scope 首次释放时执行一次的异步收尾；不接收取消令牌。
+    pub fn on_dispose_async<F, Fut>(&self, disposer: F) -> Result<(), CoreError>
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: Future<Output = Result<(), CoreError>> + Send + 'static,
+    {
+        self.context.inner.scope.on_dispose_async(disposer)
+    }
+
     pub fn cancellation_token(&self) -> CancellationToken {
         self.context.inner.scope.cancellation()
     }
 
-    /// 释放当前 Effect 及其全部子资源。
+    /// 释放当前 Effect 及其全部子资源（fire-and-forget；异步 disposer 上收至父 Scope）。
     pub fn dispose(&self) {
         self.context.inner.scope.dispose();
     }
 
-    /// 释放并等待本 Effect 树上的受控任务（不上收；无超时）。
-    pub async fn dispose_wait(&self) {
-        self.context.inner.scope.dispose_wait().await;
+    /// 释放并等待本 Effect 树上的受控任务与异步 disposer（不上收；无超时）。
+    pub async fn dispose_wait(&self) -> Result<(), CoreError> {
+        self.context.inner.scope.dispose_wait().await
     }
 
     pub fn spawn<F, Fut>(&self, task: F) -> Result<(), CoreError>

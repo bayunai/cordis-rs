@@ -52,4 +52,6 @@ pub enum CoreError {
         expected: crate::plugin::PluginKey,
         actual: crate::plugin::PluginKey,
     },
+    #[error("释放失败: {errors:?}")]
+    DisposeFailed { errors: Vec<String> },
 }

@@ -175,7 +175,7 @@ async fn shutdown_cancels_and_waits_for_controlled_tasks() {
             observed.store(true, Ordering::SeqCst);
         })
         .unwrap();
-    runtime.shutdown().await;
+    runtime.shutdown().await.expect("shutdown");
     assert!(stopped.load(Ordering::SeqCst));
 }
 
@@ -536,7 +536,7 @@ async fn scope_dispose_interleaved_with_child_cleanup_and_spawn() {
     disposer.await.expect("disposer");
     assert_eq!(cleanups.load(Ordering::SeqCst), 16);
     assert_eq!(effect.child_scope_count(), 0);
-    runtime.shutdown().await;
+    runtime.shutdown().await.expect("shutdown");
 }
 
 #[tokio::test]
@@ -544,7 +544,7 @@ async fn shutdown_stops_scheduler_and_rejects_root_ops() {
     let runtime = runtime();
     let root = runtime.root();
     root.provide(NUMBER, Number(1)).unwrap();
-    runtime.shutdown().await;
+    runtime.shutdown().await.expect("shutdown");
     assert!(runtime.scheduler_stopped());
     tokio::time::timeout(std::time::Duration::from_millis(200), runtime.settle())
         .await
@@ -628,7 +628,7 @@ async fn plugin_remount_does_not_accumulate_child_scopes() {
         );
     }
     assert_eq!(root.child_scope_count(), baseline);
-    runtime.shutdown().await;
+    runtime.shutdown().await.expect("shutdown");
     assert_eq!(finished.load(Ordering::SeqCst), 8);
 }
 
@@ -676,15 +676,15 @@ async fn plugin_dispose_wait_awaits_owned_tasks() {
         }))
         .await
         .unwrap();
-    handle.dispose_wait().await;
+    handle.dispose_wait().await.expect("dispose_wait");
     cancelled_rx.await.expect("task observed cancel");
     assert!(
         finished.load(Ordering::SeqCst),
         "dispose_wait must return only after plugin tasks finish"
     );
-    handle.dispose_wait().await;
+    handle.dispose_wait().await.expect("dispose_wait");
     assert!(handle.is_disposed());
-    runtime.shutdown().await;
+    runtime.shutdown().await.expect("shutdown");
 }
 
 #[tokio::test]
@@ -735,7 +735,7 @@ async fn plugin_hot_replace_after_dispose_wait() {
         .unwrap();
     assert_eq!(root.get(NUMBER).unwrap().0, 1);
 
-    old.dispose_wait().await;
+    old.dispose_wait().await.expect("dispose_wait");
     assert!(
         a_finished.load(Ordering::SeqCst),
         "old plugin task must finish before remount"
@@ -743,8 +743,8 @@ async fn plugin_hot_replace_after_dispose_wait() {
 
     let mut neu = root.plugin(Arc::new(PluginB)).await.unwrap();
     assert_eq!(root.get(NUMBER).unwrap().0, 2);
-    neu.dispose_wait().await;
-    runtime.shutdown().await;
+    neu.dispose_wait().await.expect("dispose_wait");
+    runtime.shutdown().await.expect("shutdown");
 }
 
 #[tokio::test]
@@ -872,7 +872,7 @@ async fn dispose_cancels_without_abort_shutdown_waits() {
         !finished.load(Ordering::SeqCst),
         "task should still be running after dispose"
     );
-    runtime.shutdown().await;
+    runtime.shutdown().await.expect("shutdown");
     assert!(finished.load(Ordering::SeqCst));
 }
 
@@ -941,7 +941,7 @@ async fn drop_runtime_without_shutdown_allows_new_runtime() {
     }
     let again = runtime();
     assert!(!again.scheduler_stopped());
-    again.shutdown().await;
+    again.shutdown().await.expect("shutdown");
     assert!(again.scheduler_stopped());
 }
 
@@ -961,7 +961,7 @@ async fn effect_dispose_then_drop_parent_shutdown_waits_task() {
         .unwrap();
     child.dispose();
     drop(child);
-    runtime.shutdown().await;
+    runtime.shutdown().await.expect("shutdown");
     assert!(
         finished.load(Ordering::SeqCst),
         "task should be hoisted to parent and awaited on shutdown"
@@ -1114,7 +1114,7 @@ async fn fiber_restart_and_replace_wait_for_tasks() {
     assert_eq!(root.get(NUMBER).unwrap().0, 2);
     assert_eq!(fiber.state(), FiberState::Active);
     assert_ne!(fiber.state(), FiberState::Loading);
-    fiber.dispose_wait().await;
+    fiber.dispose_wait().await.expect("dispose_wait");
     assert!(finished2.load(Ordering::SeqCst));
     assert!(fiber.is_disposed());
 }
@@ -1272,7 +1272,7 @@ async fn provider_rebind_waits_for_old_plugin_effect_before_reactivation() {
     runtime.settle().await;
     wait_until(|| fiber.state() == FiberState::Active).await;
     assert_eq!(apply_count.load(Ordering::SeqCst), 2);
-    fiber.dispose_wait().await;
+    fiber.dispose_wait().await.expect("dispose_wait");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1362,8 +1362,8 @@ async fn concurrent_mount_and_scheduler_apply_once() {
             .count(),
         1
     );
-    fiber.dispose_wait().await;
-    runtime.shutdown().await;
+    fiber.dispose_wait().await.expect("dispose_wait");
+    runtime.shutdown().await.expect("shutdown");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1423,7 +1423,7 @@ async fn provider_revoked_during_loading_does_not_stick_active() {
     wait_until(|| fiber.state() == FiberState::Pending).await;
     assert!(fiber.missing_dependencies().contains(&NUMBER.id()));
     fiber.dispose();
-    runtime.shutdown().await;
+    runtime.shutdown().await.expect("shutdown");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1494,7 +1494,7 @@ async fn provider_replaced_during_loading_reactivates_with_fresh() {
     assert_eq!(root.get(NUMBER).unwrap().0, 99);
     assert_eq!(seen.load(Ordering::SeqCst), 99);
     fiber.dispose();
-    runtime.shutdown().await;
+    runtime.shutdown().await.expect("shutdown");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1554,7 +1554,7 @@ async fn restart_during_parent_dispose_keeps_disposed() {
                 || item.state == cordis_core::FiberStateSnapshot::Disposed)
             || snap.plugin_fibers.iter().all(|item| item.id != fiber.id())
     );
-    runtime.shutdown().await;
+    runtime.shutdown().await.expect("shutdown");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1637,7 +1637,7 @@ async fn replace_during_parent_dispose_keeps_disposed_and_skips_new_plugin() {
     assert_eq!(fiber.state(), FiberState::Disposed);
     assert!(fiber.is_disposed());
     assert_eq!(replacement_applied.load(Ordering::SeqCst), 0);
-    runtime.shutdown().await;
+    runtime.shutdown().await.expect("shutdown");
 }
 
 #[tokio::test]
@@ -2189,4 +2189,376 @@ async fn effect_tree_appears_in_diagnostics_and_clears() {
     effect.dispose();
     assert_eq!(runtime.diagnostics().effects.len(), before);
     assert!(runtime.diagnostics().providers.is_empty());
+}
+
+#[tokio::test]
+async fn on_dispose_async_runs_once_on_first_dispose_only() {
+    let runtime = runtime();
+    let root = runtime.root();
+    let effect = root.effect().unwrap();
+    let runs = Arc::new(AtomicUsize::new(0));
+    let counter = runs.clone();
+    effect
+        .on_dispose_async(move || {
+            let counter = counter.clone();
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        })
+        .unwrap();
+    assert_eq!(runs.load(Ordering::SeqCst), 0);
+    effect.dispose_wait().await.expect("dispose_wait");
+    assert_eq!(runs.load(Ordering::SeqCst), 1);
+    effect.dispose_wait().await.expect("dispose_wait");
+    assert_eq!(runs.load(Ordering::SeqCst), 1);
+    runtime.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn dispose_runs_sync_cleanup_immediately_and_hoists_async_to_parent_wait() {
+    let runtime = runtime();
+    let root = runtime.root();
+    let parent = root.effect().unwrap();
+    let child = parent.extend().unwrap().effect().unwrap();
+    let sync_done = Arc::new(AtomicBool::new(false));
+    let async_done = Arc::new(AtomicBool::new(false));
+    let (started_tx, started_rx) = oneshot::channel::<()>();
+    let (release_tx, release_rx) = oneshot::channel::<()>();
+    let started_tx = Arc::new(Mutex::new(Some(started_tx)));
+    let release_rx = Arc::new(Mutex::new(Some(release_rx)));
+    let sync_flag = sync_done.clone();
+    child.on_dispose(move || {
+        sync_flag.store(true, Ordering::SeqCst);
+    });
+    let async_flag = async_done.clone();
+    child
+        .on_dispose_async(move || {
+            let started_tx = started_tx.clone();
+            let release_rx = release_rx.clone();
+            let async_flag = async_flag.clone();
+            async move {
+                if let Some(tx) = started_tx.lock().expect("started").take() {
+                    let _ = tx.send(());
+                }
+                let receiver = release_rx.lock().expect("release").take();
+                if let Some(rx) = receiver {
+                    let _ = rx.await;
+                }
+                async_flag.store(true, Ordering::SeqCst);
+                Ok(())
+            }
+        })
+        .unwrap();
+
+    child.dispose();
+    assert!(sync_done.load(Ordering::SeqCst));
+    assert!(!async_done.load(Ordering::SeqCst));
+    started_rx.await.expect("async disposer started");
+    let _ = release_tx.send(());
+    parent.dispose_wait().await.expect("parent wait");
+    assert!(async_done.load(Ordering::SeqCst));
+    runtime.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn dispose_wait_respects_lifo_for_sync_and_async_cleanups() {
+    let runtime = runtime();
+    let root = runtime.root();
+    let effect = root.effect().unwrap();
+    let order = Arc::new(Mutex::new(Vec::new()));
+
+    for label in ["sync-a", "sync-b"] {
+        let order = order.clone();
+        let label = label.to_string();
+        effect.on_dispose(move || {
+            order.lock().expect("order").push(label);
+        });
+    }
+    for label in ["async-a", "async-b"] {
+        let order = order.clone();
+        let label = label.to_string();
+        effect
+            .on_dispose_async(move || {
+                let order = order.clone();
+                let label = label.clone();
+                async move {
+                    order.lock().expect("order").push(label);
+                    Ok(())
+                }
+            })
+            .unwrap();
+    }
+
+    effect.dispose_wait().await.expect("dispose_wait");
+    assert_eq!(
+        *order.lock().expect("order"),
+        vec![
+            "sync-b".to_string(),
+            "sync-a".to_string(),
+            "async-b".to_string(),
+            "async-a".to_string()
+        ]
+    );
+    runtime.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn dispose_wait_aggregates_async_disposer_errors_and_continues() {
+    let runtime = runtime();
+    let root = runtime.root();
+    let effect = root.effect().unwrap();
+    let ran = Arc::new(AtomicUsize::new(0));
+
+    let counter = ran.clone();
+    effect
+        .on_dispose_async(move || {
+            let counter = counter.clone();
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Err(CoreError::EventListener("first".into()))
+            }
+        })
+        .unwrap();
+    let counter = ran.clone();
+    effect
+        .on_dispose_async(move || {
+            let counter = counter.clone();
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Err(CoreError::EventListener("second".into()))
+            }
+        })
+        .unwrap();
+    let counter = ran.clone();
+    effect
+        .on_dispose_async(move || {
+            let counter = counter.clone();
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        })
+        .unwrap();
+
+    let error = effect.dispose_wait().await.expect_err("aggregated");
+    assert_eq!(ran.load(Ordering::SeqCst), 3);
+    match error {
+        CoreError::DisposeFailed { errors } => {
+            assert_eq!(errors.len(), 2);
+            assert!(errors.iter().any(|item| item.contains("first")));
+            assert!(errors.iter().any(|item| item.contains("second")));
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+    runtime.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn on_dispose_async_rejects_after_scope_disposed() {
+    let runtime = runtime();
+    let root = runtime.root();
+    let effect = root.effect().unwrap();
+    effect.dispose();
+    let error = effect
+        .on_dispose_async(|| async move { Ok(()) })
+        .expect_err("disposed");
+    assert!(matches!(error, CoreError::ContextDisposed));
+    runtime.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn fiber_restart_stops_on_async_dispose_failure() {
+    use cordis_core::PluginKey;
+
+    static KEY: PluginKey = PluginKey::new("test.async.dispose.restart");
+    let runtime = runtime();
+    let root = runtime.root();
+    let apply_count = Arc::new(AtomicUsize::new(0));
+
+    struct FlakyDisposePlugin {
+        apply_count: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Plugin for FlakyDisposePlugin {
+        fn key(&self) -> PluginKey {
+            KEY
+        }
+        async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
+            self.apply_count.fetch_add(1, Ordering::SeqCst);
+            let effect = ctx.effect()?;
+            effect.on_dispose_async(|| async move {
+                Err(CoreError::EventListener("dispose boom".into()))
+            })?;
+            Ok(())
+        }
+    }
+
+    let mut fiber = root
+        .plugin(Arc::new(FlakyDisposePlugin {
+            apply_count: apply_count.clone(),
+        }))
+        .await
+        .unwrap();
+    assert_eq!(apply_count.load(Ordering::SeqCst), 1);
+    let error = fiber.restart().await.expect_err("restart failed");
+    assert!(matches!(error, CoreError::DisposeFailed { .. }));
+    assert_eq!(fiber.state(), FiberState::Failed);
+    assert_eq!(apply_count.load(Ordering::SeqCst), 1);
+    runtime.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn fiber_replace_stops_on_async_dispose_failure() {
+    use cordis_core::PluginKey;
+
+    static KEY: PluginKey = PluginKey::new("test.async.dispose.replace");
+    let runtime = runtime();
+    let root = runtime.root();
+    let apply_count = Arc::new(AtomicUsize::new(0));
+
+    struct FlakyDisposePlugin {
+        apply_count: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Plugin for FlakyDisposePlugin {
+        fn key(&self) -> PluginKey {
+            KEY
+        }
+        async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
+            self.apply_count.fetch_add(1, Ordering::SeqCst);
+            let effect = ctx.effect()?;
+            effect.on_dispose_async(|| async move {
+                Err(CoreError::EventListener("replace dispose boom".into()))
+            })?;
+            Ok(())
+        }
+    }
+
+    struct ReplacementPlugin {
+        apply_count: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Plugin for ReplacementPlugin {
+        fn key(&self) -> PluginKey {
+            KEY
+        }
+        async fn apply(&self, _ctx: &Context) -> Result<(), CoreError> {
+            self.apply_count.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    let mut fiber = root
+        .plugin(Arc::new(FlakyDisposePlugin {
+            apply_count: apply_count.clone(),
+        }))
+        .await
+        .unwrap();
+    let error = fiber
+        .replace(Arc::new(ReplacementPlugin {
+            apply_count: apply_count.clone(),
+        }))
+        .await
+        .expect_err("replace failed");
+    assert!(matches!(error, CoreError::DisposeFailed { .. }));
+    assert_eq!(fiber.state(), FiberState::Failed);
+    assert_eq!(apply_count.load(Ordering::SeqCst), 1);
+    runtime.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn provider_recompute_marks_failed_when_async_dispose_errors() {
+    use cordis_core::PluginKey;
+
+    static KEY: PluginKey = PluginKey::new("test.async.dispose.provider");
+    let runtime = runtime();
+    let root = runtime.root();
+    let apply_count = Arc::new(AtomicUsize::new(0));
+    let provider = root.effect_named("provider").unwrap();
+    provider.provide(NUMBER, Number(1)).unwrap();
+
+    struct DependentPlugin {
+        apply_count: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Plugin for DependentPlugin {
+        fn key(&self) -> PluginKey {
+            KEY
+        }
+        fn inject(&self) -> Vec<cordis_core::ServiceId> {
+            vec![NUMBER.id()]
+        }
+        async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
+            self.apply_count.fetch_add(1, Ordering::SeqCst);
+            let effect = ctx.effect()?;
+            effect.on_dispose_async(|| async move {
+                Err(CoreError::EventListener("provider dispose boom".into()))
+            })?;
+            Ok(())
+        }
+    }
+
+    let fiber = root
+        .plugin(Arc::new(DependentPlugin {
+            apply_count: apply_count.clone(),
+        }))
+        .await
+        .unwrap();
+    assert_eq!(fiber.state(), FiberState::Active);
+    assert_eq!(apply_count.load(Ordering::SeqCst), 1);
+
+    provider.dispose();
+    let replacement = root.effect_named("replacement").unwrap();
+    replacement.provide(NUMBER, Number(2)).unwrap();
+    wait_until(|| fiber.state() == FiberState::Failed).await;
+    assert_eq!(apply_count.load(Ordering::SeqCst), 1);
+    runtime.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn unmount_and_shutdown_return_dispose_errors_after_cleanup() {
+    use cordis_core::PluginKey;
+
+    static KEY: PluginKey = PluginKey::new("test.async.dispose.unmount");
+    let runtime = runtime();
+    let root = runtime.root();
+
+    struct BoomPlugin;
+    #[async_trait]
+    impl Plugin for BoomPlugin {
+        fn key(&self) -> PluginKey {
+            KEY
+        }
+        async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
+            let effect = ctx.effect()?;
+            effect.on_dispose_async(|| async move {
+                Err(CoreError::EventListener("unmount boom".into()))
+            })?;
+            Ok(())
+        }
+    }
+
+    let _fiber = root.plugin(Arc::new(BoomPlugin)).await.unwrap();
+    let error = runtime.unmount(KEY).await.expect_err("unmount");
+    assert!(matches!(error, CoreError::DisposeFailed { .. }));
+    assert!(
+        runtime
+            .diagnostics()
+            .plugin_registry
+            .iter()
+            .all(|group| group.plugin_key != KEY.as_str())
+    );
+
+    let effect = runtime.root().effect().unwrap();
+    effect
+        .on_dispose_async(|| async move { Err(CoreError::EventListener("shutdown boom".into())) })
+        .unwrap();
+    let shutdown_error = runtime.shutdown().await.expect_err("shutdown");
+    assert!(matches!(shutdown_error, CoreError::DisposeFailed { .. }));
+    assert!(runtime.scheduler_stopped());
 }

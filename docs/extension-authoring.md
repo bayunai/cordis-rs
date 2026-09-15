@@ -28,6 +28,7 @@ impl Plugin for Greeter {
         ctx.inject([GREETER.id()], |services, effect| async move {
             let _ = services.get(GREETER)?;
             effect.on_dispose(|| {});
+            effect.on_dispose_async(|| async move { Ok(()) })?;
             Ok(())
         })?;
         Ok(())
@@ -39,8 +40,8 @@ async fn main() -> Result<(), CoreError> {
     let runtime = Runtime::new()?;
     let root = runtime.root();
     let mut fiber = root.plugin(Arc::new(Greeter)).await?;
-    fiber.dispose_wait().await;
-    runtime.shutdown().await;
+    fiber.dispose_wait().await?;
+    runtime.shutdown().await?;
     Ok(())
 }
 ```
@@ -87,8 +88,11 @@ async fn main() -> Result<(), CoreError> {
 
 ## 任务与取消
 
-- 长任务用 `EffectContext::spawn` 并响应 `CancellationToken`。
-- `dispose` 上收任务；热路径用 `dispose_wait` / `replace`。
+- 长期监听、循环和后台刷新用 `EffectContext::spawn`，并响应 `CancellationToken`。
+- 连接关闭、flush、注销等一次性收尾用 `on_dispose_async`（Scope 已进入释放阶段，不接收取消令牌）。
+- 需要确认资源真实释放或获取失败时必须 `await dispose_wait()` / `unmount()` / `shutdown()`。
+- 单纯 `dispose()` 是 fire-and-forget；异步释放失败只能由后续父 Scope 或 Runtime 的等待路径返回。
+- `dispose` 上收托管任务与异步 disposer；热路径用 `dispose_wait` / `replace`。
 
 ## 禁止事项
 

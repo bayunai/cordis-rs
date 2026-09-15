@@ -1,6 +1,10 @@
-use std::sync::{
-    Arc, Mutex, Weak,
-    atomic::{AtomicBool, AtomicU64, Ordering},
+use crate::CoreError;
+use std::{
+    future::Future,
+    sync::{
+        Arc, Mutex, Weak,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
 };
 
 use tokio::task::JoinHandle;
@@ -8,11 +12,19 @@ use tokio_util::sync::CancellationToken;
 
 static NEXT_EFFECT_ID: AtomicU64 = AtomicU64::new(1);
 
+enum ManagedWork {
+    Task(JoinHandle<()>),
+    Disposer(JoinHandle<Result<(), CoreError>>),
+}
+
+type AsyncDisposer = Box<dyn FnOnce() -> JoinHandle<Result<(), CoreError>> + Send>;
+
 #[derive(Default)]
 struct Resources {
     children: Vec<EffectScope>,
     cleanups: Vec<Box<dyn FnOnce() + Send>>,
-    tasks: Vec<JoinHandle<()>>,
+    async_disposers: Vec<AsyncDisposer>,
+    work: Vec<ManagedWork>,
 }
 
 struct EffectScopeInner {
@@ -111,7 +123,13 @@ impl EffectScope {
         self.inner
             .resources
             .lock()
-            .map(|resources| resources.tasks.len())
+            .map(|resources| {
+                resources
+                    .work
+                    .iter()
+                    .filter(|item| matches!(item, ManagedWork::Task(_)))
+                    .count()
+            })
             .unwrap_or(0)
     }
 
@@ -136,6 +154,23 @@ impl EffectScope {
         resources.cleanups.push(Box::new(cleanup));
     }
 
+    pub(crate) fn on_dispose_async<F, Fut>(&self, disposer: F) -> Result<(), CoreError>
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: Future<Output = Result<(), CoreError>> + Send + 'static,
+    {
+        let Ok(mut resources) = self.inner.resources.lock() else {
+            return Err(CoreError::ContextDisposed);
+        };
+        if self.inner.disposed.load(Ordering::Acquire) {
+            return Err(CoreError::ContextDisposed);
+        }
+        resources.async_disposers.push(Box::new(move || {
+            tokio::spawn(async move { disposer().await })
+        }));
+        Ok(())
+    }
+
     pub(crate) fn push_task(&self, task: JoinHandle<()>) {
         let Ok(mut resources) = self.inner.resources.lock() else {
             task.abort();
@@ -146,21 +181,19 @@ impl EffectScope {
             task.abort();
             return;
         }
-        resources.tasks.push(task);
+        resources.work.push(ManagedWork::Task(task));
     }
 
     pub(crate) fn dispose(&self) {
         let _ = self.dispose_with(TaskPolicy::HoistToParent);
     }
 
-    pub(crate) async fn dispose_wait(&self) {
-        let tasks = self.dispose_with(TaskPolicy::AwaitLocal);
-        for task in tasks {
-            let _ = task.await;
-        }
+    pub(crate) async fn dispose_wait(&self) -> Result<(), CoreError> {
+        let work = self.dispose_with(TaskPolicy::AwaitLocal);
+        Self::await_managed_work(work).await
     }
 
-    fn dispose_with(&self, policy: TaskPolicy) -> Vec<JoinHandle<()>> {
+    fn dispose_with(&self, policy: TaskPolicy) -> Vec<ManagedWork> {
         if self.inner.disposed.swap(true, Ordering::AcqRel) {
             self.detach_from_parent();
             return Vec::new();
@@ -172,6 +205,7 @@ impl EffectScope {
         };
         let children = std::mem::take(&mut resources.children);
         let cleanups = std::mem::take(&mut resources.cleanups);
+        let async_disposers = std::mem::take(&mut resources.async_disposers);
         drop(resources);
 
         for child in children.into_iter().rev() {
@@ -181,35 +215,68 @@ impl EffectScope {
             cleanup();
         }
 
-        let tasks = self.take_tasks_shallow();
+        {
+            let Ok(mut resources) = self.inner.resources.lock() else {
+                self.detach_from_parent();
+                return Vec::new();
+            };
+            for disposer in async_disposers.into_iter().rev() {
+                resources.work.push(ManagedWork::Disposer(disposer()));
+            }
+        }
+
+        let work = self.take_work_shallow();
         match policy {
             TaskPolicy::HoistToParent => {
                 if let Some(parent) = self.parent_inner() {
                     if let Ok(mut resources) = parent.resources.lock() {
-                        resources.tasks.extend(tasks);
+                        resources.work.extend(work);
                     } else {
-                        Self::abort_tasks(tasks);
+                        Self::abort_work(work);
                     }
                 } else if let Ok(mut resources) = self.inner.resources.lock() {
-                    resources.tasks.extend(tasks);
+                    resources.work.extend(work);
                 } else {
-                    Self::abort_tasks(tasks);
+                    Self::abort_work(work);
                 }
                 self.detach_from_parent();
                 Vec::new()
             }
             TaskPolicy::AwaitLocal => {
                 self.detach_from_parent();
-                tasks
+                work
             }
         }
     }
 
-    fn take_tasks_shallow(&self) -> Vec<JoinHandle<()>> {
+    fn take_work_shallow(&self) -> Vec<ManagedWork> {
         let Ok(mut resources) = self.inner.resources.lock() else {
             return Vec::new();
         };
-        std::mem::take(&mut resources.tasks)
+        std::mem::take(&mut resources.work)
+    }
+
+    async fn await_managed_work(work: Vec<ManagedWork>) -> Result<(), CoreError> {
+        let mut errors = Vec::new();
+        for item in work {
+            match item {
+                ManagedWork::Task(handle) => {
+                    if let Err(error) = handle.await {
+                        errors.push(format!("managed task join failed: {error}"));
+                    }
+                }
+                ManagedWork::Disposer(handle) => match handle.await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => errors.push(error.to_string()),
+                    Err(error) => errors.push(format!("async disposer join failed: {error}")),
+                },
+            }
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(CoreError::DisposeFailed { errors })
+        }
     }
 
     fn parent_inner(&self) -> Option<Arc<EffectScopeInner>> {
@@ -238,10 +305,21 @@ impl EffectScope {
         }
     }
 
-    fn abort_tasks(tasks: Vec<JoinHandle<()>>) {
-        for task in tasks {
-            task.abort();
+    fn abort_work(work: Vec<ManagedWork>) {
+        for item in work {
+            match item {
+                ManagedWork::Task(handle) => handle.abort(),
+                ManagedWork::Disposer(handle) => handle.abort(),
+            }
         }
+    }
+
+    fn start_async_disposers(async_disposers: Vec<AsyncDisposer>) -> Vec<ManagedWork> {
+        async_disposers
+            .into_iter()
+            .rev()
+            .map(|disposer| ManagedWork::Disposer(disposer()))
+            .collect()
     }
 }
 
@@ -258,7 +336,8 @@ impl Drop for EffectScopeInner {
             if let Ok(mut resources) = self.resources.lock() {
                 let children = std::mem::take(&mut resources.children);
                 let cleanups = std::mem::take(&mut resources.cleanups);
-                let tasks = std::mem::take(&mut resources.tasks);
+                let async_disposers = std::mem::take(&mut resources.async_disposers);
+                let mut work = std::mem::take(&mut resources.work);
                 drop(resources);
                 for child in children.into_iter().rev() {
                     child.dispose();
@@ -266,10 +345,24 @@ impl Drop for EffectScopeInner {
                 for cleanup in cleanups.into_iter().rev() {
                     cleanup();
                 }
-                EffectScope::abort_tasks(tasks);
+                work.extend(EffectScope::start_async_disposers(async_disposers));
+                let parent = self
+                    .parent
+                    .lock()
+                    .ok()
+                    .and_then(|slot| slot.as_ref().and_then(Weak::upgrade));
+                if let Some(parent) = parent {
+                    if let Ok(mut parent_resources) = parent.resources.lock() {
+                        parent_resources.work.extend(work);
+                    } else {
+                        EffectScope::abort_work(work);
+                    }
+                } else {
+                    EffectScope::abort_work(work);
+                }
             }
         } else if let Ok(mut resources) = self.resources.lock() {
-            let tasks = std::mem::take(&mut resources.tasks);
+            let work = std::mem::take(&mut resources.work);
             drop(resources);
             let parent = self
                 .parent
@@ -278,12 +371,12 @@ impl Drop for EffectScopeInner {
                 .and_then(|slot| slot.as_ref().and_then(Weak::upgrade));
             if let Some(parent) = parent {
                 if let Ok(mut parent_resources) = parent.resources.lock() {
-                    parent_resources.tasks.extend(tasks);
+                    parent_resources.work.extend(work);
                 } else {
-                    EffectScope::abort_tasks(tasks);
+                    EffectScope::abort_work(work);
                 }
             } else {
-                EffectScope::abort_tasks(tasks);
+                EffectScope::abort_work(work);
             }
         }
     }

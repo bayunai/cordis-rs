@@ -83,7 +83,9 @@ Provider 变化、`restart()` 与 `replace()` 都先经历 `Active → Unloading
 
 - 具名 `EffectHandle`（`effect()` / `effect_named`）；记录父子、取消状态与资源计数。
 - Provider / 订阅 / 任务 / 子 Fiber 挂在创建它们的 Effect 或 Fiber 上；Context 只是视图，不能单独释放。
-- `dispose` 上收任务；`dispose_wait` 本地 await（热卸载）。
+- `dispose`：取消 Scope，立即执行同步 `on_dispose`（LIFO），再启动 `on_dispose_async`（LIFO）并把 JoinHandle 上收至父/Root，不等待。
+- `dispose_wait`：同样同步 cleanup 后，本地 await 受控任务与异步 disposer；失败聚合为 `DisposeFailed`。
+- 长期后台工作用 `spawn`（带取消令牌）；一次性收尾用 `on_dispose_async`（无取消令牌）。
 
 ## Event
 
@@ -108,8 +110,8 @@ Provider 变化、`restart()` 与 `replace()` 都先经历 `Active → Unloading
 
 ## Plugin Registry
 
-`Plugin::key()` 声明稳定身份。Runtime 按 Key 归组 Fiber；`Runtime::unmount(key)` 标记卸载中、拒绝同 Key 新挂载、`dispose_wait` 全部实例后清分组。`Fiber::replace` 仅允许同 Key。
+`Plugin::key()` 声明稳定身份。Runtime 按 Key 归组 Fiber；`Runtime::unmount(key)` 标记卸载中、拒绝同 Key 新挂载、`dispose_wait` 全部实例后清分组；释放错误聚合返回，但仍完成分组清理。`Fiber::replace` 仅允许同 Key；旧 Effect 释放失败时进入 `Failed`，不启动新 `apply`。
 
 ## 关闭
 
-宿主须 `Runtime::shutdown()`。插件热替换优先 `fiber.replace` 或 `dispose_wait` 后再挂载。
+宿主须 `await Runtime::shutdown()`（返回 `Result`）。插件热替换优先 `fiber.replace` 或 `dispose_wait` 后再挂载。单纯 `dispose()` 为 fire-and-forget，释放失败只能由父 Scope / Fiber / Runtime 的等待路径观察。
