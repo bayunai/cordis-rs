@@ -1,4 +1,8 @@
-use crate::inject::InjectionPhase;
+//! 只读运行时诊断快照。
+//!
+//! 导出 Context / Fiber / Effect 等结构信息；不包含服务载荷。
+
+use crate::registry::InjectionPhase;
 
 /// 非敏感运行时诊断快照。
 #[derive(Debug, Clone, Default)]

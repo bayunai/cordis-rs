@@ -1,3 +1,7 @@
+//! [`IsolationLabel`] 与 Runtime 绑定的隔离令牌。
+//!
+//! 标签不可跨 Runtime 伪造；用于服务解析的隔离边界，不含业务租户语义。
+
 use crate::CoreError;
 use std::sync::{
     Arc,

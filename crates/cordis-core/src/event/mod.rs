@@ -1,3 +1,15 @@
+//! [`EventKey`] 与公开事件 API。
+//!
+//! 暴露 ListenOptions、并行/串行/瀑布 Key 等对外类型；
+//! 监听器存储在 `listener`，分发执行在 `dispatch`。
+
+pub(crate) mod dispatch;
+pub(crate) mod listener;
+
+pub(crate) use listener::{
+    EventFilter, ListenMeta, ParallelHandlerErased, SerialHandlerErased, WaterfallHandler,
+};
+
 use crate::CoreError;
 use std::{any::TypeId, fmt, future::Future, marker::PhantomData, pin::Pin, sync::Arc};
 

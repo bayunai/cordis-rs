@@ -1,3 +1,9 @@
+//! [`ServiceKey`] / [`ServiceId`] 类型安全与 [`Services`] 快照。
+//!
+//! 定义稳定服务标识；层级/隔离解析在 `resolver`，不包含业务作用域语义。
+
+pub(crate) mod resolver;
+
 use crate::CoreError;
 use std::{
     any::{Any, TypeId},

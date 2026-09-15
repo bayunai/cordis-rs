@@ -1,3 +1,7 @@
+//! [`CoreError`]：公开失败契约的错误变体。
+//!
+//! 覆盖 Context、Service、事件、Fiber、注入与调度等失败路径。
+
 use crate::service::ServiceId;
 
 #[derive(Debug, thiserror::Error)]

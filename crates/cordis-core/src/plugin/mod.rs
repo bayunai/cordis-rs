@@ -1,3 +1,9 @@
+//! [`Plugin`] trait：Core 的挂载契约；公开 [`PluginKey`]。
+//!
+//! 配置、Schema、发现与热更新属 Host；子模块 `group` 负责按 Key 归组与统一卸载。
+
+pub(crate) mod group;
+
 use crate::{Context, CoreError, ServiceId};
 use async_trait::async_trait;
 use std::fmt;

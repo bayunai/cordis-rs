@@ -1,3 +1,7 @@
+//! [`ConfigKey`] / [`ConfigId`]：可拦截配置身份。
+//!
+//! 与 ServiceKey 分表；仅标识与类型绑定，不持久化配置内容。
+
 use std::{any::TypeId, fmt, marker::PhantomData, sync::Arc};
 
 /// 稳定的配置标识。扩展应只通过 [`ConfigKey`] 创建它。

@@ -1,10 +1,15 @@
+//! Runtime、根 Context 与全局关闭入口。
+//!
+//! 拥有根 EffectScope / Registry，并对外暴露挂载与诊断；
+//! 不是业务宿主，不承担应用协议或外部基础设施职责。
+
 use crate::{
     Context, CoreError, PluginKey,
     context::ContextInner,
     diagnostics::RuntimeSnapshot,
     effect::EffectScope,
     fiber::{Fiber, FiberStateChange},
-    inject::Registry,
+    registry::Registry,
 };
 use std::sync::{
     Arc,

@@ -1,7 +1,7 @@
-//! Minimal Cordis-style runtime primitives for Rust.
+//! Cordis 风格运行时原语的公开 crate 表面。
 //!
-//! The crate deliberately has no gateway, HTTP, persistence, configuration, or
-//! package-loading concepts. A host assembles those concerns around [`Runtime`].
+//! Core 不含网关、HTTP、数据库、Redis、持久化配置或插件发现；
+//! 宿主围绕 [`Runtime`] 组装这些能力。
 
 mod config;
 mod context;
@@ -10,9 +10,9 @@ mod effect;
 mod error;
 mod event;
 mod fiber;
-mod inject;
 mod isolation;
 mod plugin;
+mod registry;
 mod runtime;
 mod service;
 
