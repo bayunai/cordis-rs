@@ -932,10 +932,8 @@ async fn async_disposer_shutdown_fails_fast_without_blocking_coordinator() {
     assert!(runtime.scheduler_stopped());
 }
 
-// P1-4: 期望子 AwaitLocal（dispose_wait）进行中时，父 dispose_wait 不得先结束。
-// 现状：子 detach 后父可能在子 async disposer 完成前返回。
+// P1-4: 子 AwaitLocal（dispose_wait）进行中时，父 dispose_wait 必须等待子 async disposer。
 #[tokio::test]
-#[ignore = "P1: AwaitLocal child detach races parent dispose_wait"]
 async fn p1_parent_dispose_wait_awaits_await_local_child_async_disposer() {
     let runtime = runtime();
     let root = runtime.root();
@@ -993,5 +991,155 @@ async fn p1_parent_dispose_wait_awaits_await_local_child_async_disposer() {
         .expect("parent dispose_wait timed out")
         .expect("parent dispose_wait");
     assert!(async_done.load(Ordering::SeqCst));
+    runtime.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn p1_parent_dispose_wait_aggregates_await_local_child_disposer_error() {
+    let runtime = runtime();
+    let root = runtime.root();
+    let parent = root.effect().unwrap();
+    let child = parent.extend().unwrap().effect().unwrap();
+    let (entered_tx, entered_rx) = oneshot::channel::<()>();
+    let (release_tx, release_rx) = oneshot::channel::<()>();
+    let entered_tx = Arc::new(Mutex::new(Some(entered_tx)));
+    let release_rx = Arc::new(Mutex::new(Some(release_rx)));
+
+    child
+        .on_dispose_async(move || {
+            let entered_tx = entered_tx.clone();
+            let release_rx = release_rx.clone();
+            async move {
+                if let Some(tx) = entered_tx.lock().expect("entered").take() {
+                    let _ = tx.send(());
+                }
+                let receiver = release_rx.lock().expect("release").take();
+                if let Some(rx) = receiver {
+                    let _ = rx.await;
+                }
+                Err(CoreError::PluginApply("await-local child boom".into()))
+            }
+        })
+        .unwrap();
+
+    let child_task = tokio::spawn(async move { child.dispose_wait().await });
+    entered_rx.await.expect("child disposer entered");
+    let parent_task = tokio::spawn(async move { parent.dispose_wait().await });
+    let _ = release_tx.send(());
+
+    let child_error = tokio::time::timeout(std::time::Duration::from_secs(2), child_task)
+        .await
+        .expect("child dispose_wait timed out")
+        .expect("join")
+        .expect_err("child disposer error");
+    match child_error {
+        CoreError::DisposeFailed { errors } => assert!(
+            errors
+                .iter()
+                .any(|item| item.contains("await-local child boom")),
+            "{errors:?}"
+        ),
+        other => panic!("unexpected child error: {other:?}"),
+    }
+
+    let parent_error = tokio::time::timeout(std::time::Duration::from_secs(2), parent_task)
+        .await
+        .expect("parent dispose_wait timed out")
+        .expect("join")
+        .expect_err("parent must aggregate child error");
+    match parent_error {
+        CoreError::DisposeFailed { errors } => {
+            let hits = errors
+                .iter()
+                .filter(|item| item.contains("await-local child boom"))
+                .count();
+            assert_eq!(
+                hits, 1,
+                "child error must aggregate exactly once: {errors:?}"
+            );
+        }
+        other => panic!("unexpected parent error: {other:?}"),
+    }
+    runtime.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn parent_dispose_races_child_error_aggregates_once() {
+    let runtime = runtime();
+    let root = runtime.root();
+    let parent = root.effect().unwrap();
+    let child = parent.extend().unwrap().effect().unwrap();
+    let (entered_tx, entered_rx) = oneshot::channel::<()>();
+    let (release_tx, release_rx) = oneshot::channel::<()>();
+    let entered_tx = Arc::new(Mutex::new(Some(entered_tx)));
+    let release_rx = Arc::new(Mutex::new(Some(release_rx)));
+
+    child
+        .on_dispose_async(move || {
+            let entered_tx = entered_tx.clone();
+            let release_rx = release_rx.clone();
+            async move {
+                if let Some(tx) = entered_tx.lock().expect("entered").take() {
+                    let _ = tx.send(());
+                }
+                let receiver = release_rx.lock().expect("release").take();
+                if let Some(rx) = receiver {
+                    let _ = rx.await;
+                }
+                Err(CoreError::PluginApply("race child boom".into()))
+            }
+        })
+        .unwrap();
+
+    // 子先进入 async disposer，再与父 dispose_wait 交错释放。
+    let child_for_wait = child.clone();
+    let child_task = tokio::spawn(async move { child_for_wait.dispose_wait().await });
+    entered_rx.await.expect("child disposer entered");
+
+    // 交错：父开始释放；子仍在 gate 内。释放后父必须等到子 Completion，错误恰好一次。
+    let parent_task = tokio::spawn(async move { parent.dispose_wait().await });
+    for _ in 0..32 {
+        tokio::task::yield_now().await;
+    }
+    let _ = release_tx.send(());
+
+    let child_err = tokio::time::timeout(std::time::Duration::from_secs(2), child_task)
+        .await
+        .expect("child timed out")
+        .expect("join")
+        .expect_err("child error");
+    match child_err {
+        CoreError::DisposeFailed { errors } => {
+            assert_eq!(
+                errors
+                    .iter()
+                    .filter(|item| item.contains("race child boom"))
+                    .count(),
+                1,
+                "{errors:?}"
+            );
+        }
+        other => panic!("unexpected child: {other:?}"),
+    }
+
+    let parent_err = tokio::time::timeout(std::time::Duration::from_secs(2), parent_task)
+        .await
+        .expect("parent timed out")
+        .expect("join")
+        .expect_err("parent must see child error");
+    match parent_err {
+        CoreError::DisposeFailed { errors } => {
+            assert_eq!(
+                errors
+                    .iter()
+                    .filter(|item| item.contains("race child boom"))
+                    .count(),
+                1,
+                "must not double-aggregate: {errors:?}"
+            );
+        }
+        other => panic!("unexpected parent: {other:?}"),
+    }
+    // 子已自行完成；父不得因丢子而提前 Ok。
     runtime.shutdown().await.expect("shutdown");
 }

@@ -252,9 +252,7 @@ impl Context {
             parent_scope: self.inner.scope.clone(),
             plugin: Mutex::new(plugin),
             dependencies: Mutex::new(dependencies),
-            effect: Mutex::new(None),
-            pending_effect: Mutex::new(None),
-            pending_wait: Mutex::new(None),
+            ownership: Mutex::new(crate::fiber::EffectOwnership::Empty),
             dispose_result: Mutex::new(None),
             state: Mutex::new(FiberState::Pending),
             last_error: Mutex::new(None),
@@ -263,36 +261,42 @@ impl Context {
             busy: Mutex::new(false),
             lifecycle: Mutex::new(None),
             mount_ctx: Mutex::new(Some(self.clone())),
+            handoff: Mutex::new(crate::fiber::HandleHandoff::Preparing),
         });
-        self.inner.registry.register_plugin_fiber(inner.clone())?;
-        inner.publish_initial_state();
+        // 先挂父释放钩子，再以 Preparing 状态登记到分组。登记会先拒绝同 Key
+        // 的 unmounting；只有成功后才能启动用户 apply。scheduler 会跳过
+        // Preparing Fiber，因此首次协调器仍是唯一的 Pending→Loading 所有者。
         let weak = Arc::downgrade(&inner);
         self.inner.scope.on_dispose(move || {
             if let Some(fiber) = weak.upgrade() {
                 fiber.dispose_now();
             }
         });
-        let completion = inner.start_lifecycle(crate::fiber::LifecycleOp::Activate {
+        self.inner.registry.register_plugin_fiber(inner.clone())?;
+        inner.publish_initial_state();
+        let completion = match inner.start_lifecycle(crate::fiber::LifecycleOp::Activate {
             initial_mount: true,
-        })?;
+        }) {
+            Ok(completion) => completion,
+            Err(error) => {
+                let _ = inner.dispose_wait_inner().await;
+                return Err(error);
+            }
+        };
         let mut guard = crate::fiber::InitialMountWaitGuard {
-            completion: completion.clone(),
+            fiber: inner.clone(),
             completed: false,
         };
         let result = completion.wait().await;
+        let claimed = inner.claim_handle();
         guard.completed = true;
-        // 插件 apply 失败是 Fiber 的可观测失败状态，不等同于挂载操作本身无法
-        // 返回句柄；调用者仍须能读取 `Failed` 与诊断并执行后续 dispose/restart。
-        // 只有首次挂载的调用者明确取消，才撤销实例并不返回 Handle。
+        let disposed = inner.disposed.load(std::sync::atomic::Ordering::Acquire);
+        if !claimed || disposed {
+            return Err(CoreError::FiberDisposed);
+        }
         match result {
             Ok(()) | Err(CoreError::PluginApply(_)) => {}
-            Err(CoreError::FiberDisposed) if !completion.abandon_handle_requested() => {}
             Err(error) => return Err(error),
-        }
-        if inner.disposed.load(std::sync::atomic::Ordering::Acquire)
-            && completion.abandon_handle_requested()
-        {
-            return Err(CoreError::FiberDisposed);
         }
         Ok(Fiber { inner })
     }

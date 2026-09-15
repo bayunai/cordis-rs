@@ -74,4 +74,6 @@ pub enum CoreError {
     },
     #[error("释放失败: {errors:?}")]
     DisposeFailed { errors: Vec<String> },
+    #[error("生命周期协调器异常终止: {reason}")]
+    CoordinatorAborted { reason: String },
 }

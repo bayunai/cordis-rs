@@ -343,6 +343,78 @@ async fn concurrent_mount_and_scheduler_apply_once() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn initial_mount_not_preempted_by_inflight_scheduler() {
+    let runtime = runtime();
+    let root = runtime.root();
+    let apply_count = Arc::new(AtomicUsize::new(0));
+    let count = apply_count.clone();
+
+    struct CountingDepPlugin {
+        apply_count: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Plugin for CountingDepPlugin {
+        fn key(&self) -> cordis_core::PluginKey {
+            cordis_core::PluginKey::new("test.initial-mount-no-preempt")
+        }
+        fn inject(&self) -> Vec<cordis_core::ServiceId> {
+            vec![NUMBER.id()]
+        }
+        async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
+            self.apply_count.fetch_add(1, Ordering::SeqCst);
+            let _ = ctx.get(NUMBER)?;
+            Ok(())
+        }
+    }
+
+    // 持续脏调度，制造「在飞 recompute 可见新 Fiber」的窗口。
+    let noise = {
+        let root = root.clone();
+        let runtime = runtime.clone();
+        tokio::spawn(async move {
+            for i in 0..64u64 {
+                let effect = root.effect_named("noise").unwrap();
+                let _ = effect.provide(NUMBER, Number(i as usize));
+                runtime.settle().await;
+                effect.dispose();
+            }
+        })
+    };
+
+    let mut last_ok = None;
+    for _ in 0..32 {
+        let provider = root.effect_named("provider").unwrap();
+        provider.provide(NUMBER, Number(1)).unwrap();
+        let result = root
+            .plugin(Arc::new(CountingDepPlugin {
+                apply_count: count.clone(),
+            }))
+            .await;
+        match result {
+            Ok(fiber) => {
+                last_ok = Some(fiber);
+                break;
+            }
+            Err(CoreError::FiberBusy) => {
+                panic!("initial mount must not lose to scheduler FiberBusy")
+            }
+            Err(CoreError::FiberDisposed) | Err(CoreError::PluginUnmounting { .. }) => {
+                // 噪声卸载竞态可忽略，继续重试
+            }
+            Err(other) => panic!("unexpected mount error: {other:?}"),
+        }
+    }
+    let mut fiber = last_ok.expect("mount should succeed");
+    wait_until(|| fiber.state() == FiberState::Active).await;
+    assert_eq!(apply_count.load(Ordering::SeqCst), 1);
+    noise.abort();
+    let _ = noise.await;
+    fiber.dispose_wait().await.expect("dispose_wait");
+    runtime.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn provider_revoked_during_loading_does_not_stick_active() {
     let runtime = runtime();
     let root = runtime.root();
@@ -1343,10 +1415,8 @@ async fn dispose_during_unload_keeps_registry_until_release_finishes() {
     runtime.shutdown().await.expect("shutdown");
 }
 
-// P1-1: 期望 Loading 期 unmount/dispose 等待 pending_effect 的 DisposeCompletion，
-// 完成前保留 plugin_registry；现状对 pending_effect 只 dispose() 后立即 unregister。
+// P1-1: Loading 期 unmount 等待 Activating Scope 的 DisposeCompletion，完成前保留 plugin_registry。
 #[tokio::test]
-#[ignore = "P1: Loading pending_effect dispose does not await completion"]
 async fn p1_unmount_during_loading_waits_for_pending_effect_disposer() {
     use cordis_core::PluginKey;
 
@@ -1393,7 +1463,9 @@ async fn p1_unmount_during_loading_waits_for_pending_effect_disposer() {
                         let _ = rx.await;
                     }
                     disposer_ran.store(true, Ordering::SeqCst);
-                    Ok(())
+                    Err(CoreError::PluginApply(
+                        "pending-effect disposer boom".into(),
+                    ))
                 }
             })?;
             if let Some(tx) = self.apply_entered.lock().expect("apply entered").take() {
@@ -1446,9 +1518,18 @@ async fn p1_unmount_during_loading_waits_for_pending_effect_disposer() {
     );
     let _ = disp_release_tx.send(());
     let _ = apply_release_tx.send(());
-    unmount
+    let unmount_error = unmount
         .await
-        .expect("unmount should succeed after disposer");
+        .expect_err("unmount must surface pending-effect disposer error");
+    match unmount_error {
+        CoreError::DisposeFailed { errors } => assert!(
+            errors
+                .iter()
+                .any(|item| item.contains("pending-effect disposer boom")),
+            "missing disposer error: {errors:?}"
+        ),
+        other => panic!("unexpected unmount error: {other:?}"),
+    }
     assert!(disposer_ran.load(Ordering::SeqCst));
     wait_until(|| {
         runtime
@@ -1456,8 +1537,14 @@ async fn p1_unmount_during_loading_waits_for_pending_effect_disposer() {
             .plugin_registry
             .iter()
             .all(|group| group.plugin_key != KEY.as_str())
+            && runtime
+                .diagnostics()
+                .plugin_fibers
+                .iter()
+                .all(|fiber| fiber.plugin_key != KEY.as_str())
     })
     .await;
+    assert_service_unavailable(&root, NUMBER);
     let _ = mount.await;
     runtime.shutdown().await.expect("shutdown");
 }

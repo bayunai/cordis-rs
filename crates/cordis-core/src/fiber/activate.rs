@@ -2,7 +2,7 @@
 //!
 //! 认领 Pending→Loading，解析依赖并调用 Plugin::apply；生命周期入口在 `lifecycle` / `coordinator`。
 
-use super::{ActivateClaim, FiberInner, FiberState};
+use super::{ActivateClaim, EffectOwnership, FiberInner, FiberState, HandleHandoff};
 use crate::{
     Context, CoreError, ServiceId,
     callback_context::{LifecycleFrame, USER_LIFECYCLE_CALLBACK},
@@ -76,11 +76,36 @@ impl FiberInner {
         Some(providers)
     }
 
+    fn install_activating(&self, scope: EffectScope) -> Result<EffectScope, CoreError> {
+        if self.disposed.load(Ordering::Acquire) {
+            scope.dispose();
+            return Err(CoreError::FiberDisposed);
+        }
+        let mut ownership = self.ownership.lock().expect("ownership");
+        if self.disposed.load(Ordering::Acquire)
+            || matches!(*ownership, EffectOwnership::Releasing(_))
+        {
+            drop(ownership);
+            scope.dispose();
+            return Err(CoreError::FiberDisposed);
+        }
+        *ownership = EffectOwnership::Activating(scope.clone());
+        Ok(scope)
+    }
+
     fn abandon_loading_to_pending(&self, effect_scope: Option<&EffectScope>, mark_dirty: bool) {
         if let Some(scope) = effect_scope {
             scope.dispose();
         }
-        let _ = self.pending_effect.lock().expect("pending_effect").take();
+        let mut ownership = self.ownership.lock().expect("ownership");
+        match std::mem::replace(&mut *ownership, EffectOwnership::Empty) {
+            EffectOwnership::Activating(scope) => {
+                if effect_scope.is_none_or(|expected| !scope.ptr_eq(expected)) {
+                    scope.dispose();
+                }
+            }
+            other => *ownership = other,
+        }
         self.resolved_providers.lock().expect("providers").clear();
         *self.last_error.lock().expect("error") = None;
         let _ = self.transition_if_alive(FiberState::Pending);
@@ -89,35 +114,54 @@ impl FiberInner {
         }
     }
 
-    /// 首次挂载被调用方取消：撤销临时 Scope、注销 Fiber，视为从未成功。
-    fn revoke_initial_mount(&self, effect_scope: Option<EffectScope>) {
-        if let Some(scope) = effect_scope {
-            scope.dispose();
+    async fn revoke_abandoned_mount(self: &Arc<Self>) -> CoreError {
+        self.dispose_wait_inner()
+            .await
+            .err()
+            .filter(|error| !matches!(error, CoreError::DisposeFailed { .. }))
+            .unwrap_or(CoreError::FiberDisposed)
+    }
+
+    fn mark_ready_for_handle_if_preparing(&self, initial_mount: bool) {
+        if !initial_mount {
+            return;
         }
-        if let Some(scope) = self.pending_effect.lock().expect("pending_effect").take() {
-            scope.dispose();
-        }
-        if let Some(scope) = self.effect.lock().expect("effect").take() {
-            scope.dispose();
-        }
-        self.resolved_providers.lock().expect("providers").clear();
-        *self.last_error.lock().expect("error") = None;
-        self.disposed.store(true, Ordering::Release);
-        self.transition_disposed();
-        if let Some(registry) = self.registry.upgrade() {
-            registry.unregister_plugin_fiber(self.id);
+        let mut handoff = self.handoff.lock().expect("handoff");
+        if *handoff == HandleHandoff::Preparing {
+            *handoff = HandleHandoff::ReadyForHandle;
         }
     }
 
-    fn should_revoke_initial_mount(&self, initial_mount: bool) -> bool {
-        if !initial_mount {
-            return false;
+    fn should_revoke_abandoned_mount(&self) -> bool {
+        self.handoff_abandoned()
+    }
+
+    fn try_commit_active(
+        &self,
+        scope: EffectScope,
+        providers: Vec<u64>,
+        initial_mount: bool,
+    ) -> Result<(), CoreError> {
+        let mut ownership = self.ownership.lock().expect("ownership");
+        let mut handoff = self.handoff.lock().expect("handoff");
+        if self.disposed.load(Ordering::Acquire)
+            || matches!(*ownership, EffectOwnership::Releasing(_))
+        {
+            return Err(CoreError::FiberDisposed);
         }
-        self.lifecycle
-            .lock()
-            .ok()
-            .and_then(|slot| slot.as_ref().map(|c| c.abandon_handle_requested()))
-            .unwrap_or(false)
+        match *handoff {
+            HandleHandoff::Abandoned => return Err(CoreError::FiberDisposed),
+            _ if initial_mount => match *handoff {
+                HandleHandoff::Preparing => *handoff = HandleHandoff::ReadyForHandle,
+                HandleHandoff::ReadyForHandle | HandleHandoff::HandleClaimed => {}
+                HandleHandoff::Abandoned => unreachable!("handled above"),
+            },
+            _ => {}
+        }
+        *ownership = EffectOwnership::Active(scope);
+        *self.resolved_providers.lock().expect("providers") = providers;
+        *self.last_error.lock().expect("error") = None;
+        Ok(())
     }
 
     /// 协调器内激活主体；`initial_mount` 时尊重调用方取消撤销。
@@ -128,11 +172,11 @@ impl FiberInner {
         if self.disposed.load(Ordering::Acquire) {
             return Err(CoreError::FiberDisposed);
         }
-        if self.should_revoke_initial_mount(initial_mount) {
-            self.revoke_initial_mount(None);
-            return Err(CoreError::FiberDisposed);
+        if self.should_revoke_abandoned_mount() {
+            return Err(self.revoke_abandoned_mount().await);
         }
         if self.claim_activation() != ActivateClaim::Claimed {
+            self.mark_ready_for_handle_if_preparing(initial_mount);
             return Ok(());
         }
 
@@ -143,12 +187,15 @@ impl FiberInner {
         let deps = self.dependencies.lock().expect("deps").clone();
         let Some(providers) = self.resolve_provider_ids(&registry, &deps) else {
             self.abandon_loading_to_pending(None, false);
+            if self.should_revoke_abandoned_mount() {
+                return Err(self.revoke_abandoned_mount().await);
+            }
+            self.mark_ready_for_handle_if_preparing(initial_mount);
             return Ok(());
         };
 
-        if self.should_revoke_initial_mount(initial_mount) {
-            self.revoke_initial_mount(None);
-            return Err(CoreError::FiberDisposed);
+        if self.should_revoke_abandoned_mount() {
+            return Err(self.revoke_abandoned_mount().await);
         }
 
         let plugin = self.plugin.lock().expect("plugin").clone();
@@ -160,7 +207,10 @@ impl FiberInner {
             return Err(CoreError::ContextDisposed);
         }
         let effect_scope = parent_scope.child_named("plugin");
-        *self.pending_effect.lock().expect("pending_effect") = Some(effect_scope.clone());
+        let effect_scope = match self.install_activating(effect_scope) {
+            Ok(scope) => scope,
+            Err(error) => return Err(error),
+        };
         let mount = match self.mount_ctx.lock().expect("mount").clone() {
             Some(ctx) => ctx,
             None => {
@@ -187,19 +237,11 @@ impl FiberInner {
         );
         match invoke_plugin_apply(&plugin, &apply_ctx, &effect_scope).await {
             Ok(()) => {
-                if self.should_revoke_initial_mount(initial_mount) {
-                    self.revoke_initial_mount(Some(effect_scope));
-                    return Err(CoreError::FiberDisposed);
-                }
-                if self.disposed.load(Ordering::Acquire) {
-                    let _ = self.pending_effect.lock().expect("pending_effect").take();
-                    effect_scope.dispose();
-                    self.transition_disposed();
-                    return Err(CoreError::FiberDisposed);
+                if self.should_revoke_abandoned_mount() || self.disposed.load(Ordering::Acquire) {
+                    return Err(self.revoke_abandoned_mount().await);
                 }
                 if effect_scope.is_disposed() || parent_scope.is_disposed() {
-                    let _ = self.pending_effect.lock().expect("pending_effect").take();
-                    effect_scope.dispose();
+                    self.abandon_loading_to_pending(Some(&effect_scope), true);
                     *self.last_error.lock().expect("error") =
                         Some("plugin scope was disposed during apply".into());
                     let _ = self.transition_if_alive(FiberState::Failed);
@@ -209,39 +251,44 @@ impl FiberInner {
                 }
                 let Some(fresh) = self.resolve_provider_ids(&registry, &deps) else {
                     self.abandon_loading_to_pending(Some(&effect_scope), true);
+                    self.mark_ready_for_handle_if_preparing(initial_mount);
                     return Ok(());
                 };
                 if fresh != providers {
                     self.abandon_loading_to_pending(Some(&effect_scope), true);
+                    self.mark_ready_for_handle_if_preparing(initial_mount);
                     return Ok(());
                 }
-                let _ = self.pending_effect.lock().expect("pending_effect").take();
-                *self.effect.lock().expect("effect") = Some(effect_scope);
-                *self.resolved_providers.lock().expect("providers") = providers;
-                *self.last_error.lock().expect("error") = None;
+                if let Err(error) =
+                    self.try_commit_active(effect_scope.clone(), providers, initial_mount)
+                {
+                    let _ = self.revoke_abandoned_mount().await;
+                    return Err(error);
+                }
                 if !self.transition_if_alive(FiberState::Active) {
-                    if let Some(scope) = self.effect.lock().expect("effect").take() {
-                        scope.dispose();
-                    }
+                    let _ = self.revoke_abandoned_mount().await;
                     self.resolved_providers.lock().expect("providers").clear();
                     return Err(CoreError::FiberDisposed);
                 }
                 registry.mark_dirty_public();
+                #[cfg(test)]
+                if initial_mount {
+                    self.hit_ready_for_handle_gate().await;
+                    if self.should_revoke_abandoned_mount() || self.disposed.load(Ordering::Acquire)
+                    {
+                        return Err(self.revoke_abandoned_mount().await);
+                    }
+                }
                 Ok(())
             }
             Err(error) => {
-                let _ = self.pending_effect.lock().expect("pending_effect").take();
-                effect_scope.dispose();
-                if self.should_revoke_initial_mount(initial_mount) {
-                    self.revoke_initial_mount(None);
-                    return Err(CoreError::FiberDisposed);
+                if self.should_revoke_abandoned_mount() || self.disposed.load(Ordering::Acquire) {
+                    return Err(self.revoke_abandoned_mount().await);
                 }
-                if self.disposed.load(Ordering::Acquire) {
-                    self.transition_disposed();
-                    return Err(CoreError::FiberDisposed);
-                }
+                self.abandon_loading_to_pending(Some(&effect_scope), false);
                 *self.last_error.lock().expect("error") = Some(error.to_string());
                 let _ = self.transition_if_alive(FiberState::Failed);
+                self.mark_ready_for_handle_if_preparing(initial_mount);
                 Err(CoreError::PluginApply(error.to_string()))
             }
         }
@@ -263,7 +310,7 @@ impl FiberInner {
 mod initial_mount_revoke_tests {
     use crate::{
         Context, CoreError,
-        fiber::{FiberInner, FiberState, coordinator::LifecycleCompletion},
+        fiber::{EffectOwnership, FiberInner, FiberState, coordinator::HandleHandoff},
         plugin::{Plugin, PluginKey},
     };
     use async_trait::async_trait;
@@ -294,8 +341,6 @@ mod initial_mount_revoke_tests {
             .expect("runtime");
         let handle = runtime.handle().clone();
         std::mem::forget(runtime);
-        let completion = LifecycleCompletion::new();
-        completion.request_abandon_handle();
         Arc::new(FiberInner {
             id: 1,
             plugin_key: PluginKey::new("test.unit-abandon-before-apply"),
@@ -304,17 +349,16 @@ mod initial_mount_revoke_tests {
             parent_scope: crate::effect::EffectScope::root(handle),
             plugin: Mutex::new(Arc::new(CountingPlugin { applies })),
             dependencies: Mutex::new(Vec::new()),
-            effect: Mutex::new(None),
-            pending_effect: Mutex::new(None),
-            pending_wait: Mutex::new(None),
+            ownership: Mutex::new(EffectOwnership::Empty),
             dispose_result: Mutex::new(None),
             state: Mutex::new(FiberState::Pending),
             last_error: Mutex::new(None),
             resolved_providers: Mutex::new(Vec::new()),
             disposed: AtomicBool::new(false),
             busy: Mutex::new(false),
-            lifecycle: Mutex::new(Some(completion)),
+            lifecycle: Mutex::new(None),
             mount_ctx: Mutex::new(None),
+            handoff: Mutex::new(HandleHandoff::Abandoned),
         })
     }
 
@@ -329,5 +373,68 @@ mod initial_mount_revoke_tests {
         assert!(matches!(error, CoreError::FiberDisposed));
         assert_eq!(applies.load(Ordering::SeqCst), 0);
         assert!(fiber.disposed.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn abandoned_initial_mount_cannot_be_reactivated_by_scheduler_path() {
+        let applies = Arc::new(AtomicUsize::new(0));
+        let fiber = fiber_with_abandon(applies.clone());
+        let error = fiber
+            .activate_with_policy(false)
+            .await
+            .expect_err("abandoned mount must not reactivate");
+        assert!(matches!(error, CoreError::FiberDisposed));
+        assert_eq!(applies.load(Ordering::SeqCst), 0);
+        assert!(fiber.disposed.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn p1_ready_for_handle_abandon_leaves_no_orphan() {
+        use crate::{PluginKey, Runtime, ServiceKey};
+
+        static KEY: PluginKey = PluginKey::new("test.p1.ready-for-handle");
+        static VALUE: ServiceKey<u64> = ServiceKey::new("test.p1.ready-for-handle.n@1");
+
+        struct ProvidePlugin;
+        #[async_trait]
+        impl Plugin for ProvidePlugin {
+            fn key(&self) -> PluginKey {
+                KEY
+            }
+            async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
+                ctx.provide(VALUE, 7)?;
+                Ok(())
+            }
+        }
+
+        let runtime = Runtime::new().expect("runtime");
+        let root = runtime.root();
+        let gate = FiberInner::arm_ready_for_handle_gate(KEY);
+        let mount = tokio::spawn({
+            let root = root.clone();
+            async move { root.plugin(Arc::new(ProvidePlugin)).await }
+        });
+        gate.entered.await.expect("ready for handle");
+        mount.abort();
+        assert!(matches!(mount.await, Err(error) if error.is_cancelled()));
+        let _ = gate.release.send(());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            let snap = runtime.diagnostics();
+            let gone = snap
+                .plugin_registry
+                .iter()
+                .all(|group| group.plugin_key != KEY.as_str())
+                && snap
+                    .plugin_fibers
+                    .iter()
+                    .all(|fiber| fiber.plugin_key != KEY.as_str());
+            if gone && root.get(VALUE).is_err() {
+                runtime.shutdown().await.expect("shutdown");
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("orphan Active fiber or service remained after ReadyForHandle abandon");
     }
 }

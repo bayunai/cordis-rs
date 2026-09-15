@@ -33,8 +33,7 @@ impl HttpCaller {
         url: &str,
         body: Option<&str>,
     ) -> Result<HttpResponse, String> {
-        self.logger
-            .info(format!("http → {method} {url}"));
+        self.logger.info(format!("http → {method} {url}"));
         let method = method
             .parse::<reqwest::Method>()
             .map_err(|e| format!("bad method: {e}"))?;
@@ -87,13 +86,7 @@ impl Plugin for HttpPlugin {
             .timeout(Duration::from_secs(15))
             .build()
             .map_err(|e| CoreError::PluginApply(e.to_string()))?;
-        ctx.provide(
-            HTTP,
-            HttpCaller {
-                logger,
-                client,
-            },
-        )?;
+        ctx.provide(HTTP, HttpCaller { logger, client })?;
         bus(&self.bus, "sys: http apply");
         let bus_d = self.bus.clone();
         ctx.effect()?.on_dispose(move || {

@@ -232,6 +232,13 @@ impl Registry {
             if fiber.disposed.load(Ordering::Acquire) {
                 continue;
             }
+            // 首次挂载专属 Context::plugin；Preparing 表示尚未交付，禁止 scheduler 抢占。
+            if matches!(
+                *fiber.handoff.lock().expect("handoff"),
+                crate::fiber::HandleHandoff::Preparing
+            ) {
+                continue;
+            }
             if fiber.busy.lock().map(|guard| *guard).unwrap_or(true) || fiber.lifecycle_in_flight()
             {
                 continue;

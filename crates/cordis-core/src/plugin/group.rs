@@ -8,7 +8,7 @@ use crate::{
     plugin::PluginKey,
     registry::Registry,
 };
-use std::sync::{Arc, Weak, atomic::Ordering};
+use std::sync::{Arc, Weak};
 use tokio::sync::broadcast;
 
 pub(crate) struct PluginGroup {
@@ -49,7 +49,8 @@ impl Registry {
                 });
             group.fibers.push(Arc::downgrade(&fiber));
         }
-        self.mark_dirty();
+        // 此处仅完成分组占位与卸载冲突检查。Fiber 保持 Preparing 时 scheduler
+        // 不会调度它；首次生命周期完成后由 `finish_lifecycle()` 统一标脏。
         Ok(())
     }
 
@@ -106,7 +107,7 @@ impl Registry {
             .fibers
             .iter()
             .filter_map(Weak::upgrade)
-            .filter(|fiber| !fiber.disposed.load(Ordering::Acquire))
+            .filter(|fiber| fiber.needs_unmount_wait())
             .collect())
     }
 

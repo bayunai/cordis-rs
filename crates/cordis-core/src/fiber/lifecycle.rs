@@ -5,6 +5,7 @@
 use super::{
     Fiber, FiberInner, FiberState,
     coordinator::{LifecycleCompletion, LifecycleOp},
+    ownership::{EffectOwnership, FiberRelease},
 };
 use crate::{
     CoreError,
@@ -43,7 +44,6 @@ impl Fiber {
         if self.is_disposed() {
             return Err(CoreError::FiberDisposed);
         }
-        // 候选元数据必须在旧实例开始卸载前全部读取；panic 或不匹配不影响旧实例。
         let metadata = read_metadata(plugin.as_ref())?;
         if metadata.key != self.inner.plugin_key {
             return Err(CoreError::PluginKeyMismatch {
@@ -58,29 +58,17 @@ impl Fiber {
     }
 }
 
-impl FiberInner {
-    fn begin_dispose(&self) -> Option<Option<EffectScope>> {
-        if self.disposed.swap(true, Ordering::AcqRel) {
-            return None;
-        }
-        if let Ok(mut busy) = self.busy.lock() {
-            *busy = false;
-        }
-        if let Ok(mut slot) = self.lifecycle.lock() {
-            *slot = None;
-        }
-        if let Some(pending) = self.pending_effect.lock().expect("pending_effect").take() {
-            pending.dispose();
-        }
-        let effect = self.effect.lock().expect("effect").take();
-        if effect.is_some() {
-            self.transition_disposing();
-        } else {
-            self.transition_disposed();
-        }
-        Some(effect)
-    }
+enum TerminalRelease {
+    Run {
+        scope: EffectScope,
+        start_dispose: bool,
+    },
+    Join(EffectScope),
+    Vacant,
+    Observe,
+}
 
+impl FiberInner {
     fn store_dispose_result(&self, result: Result<(), CoreError>) {
         let mut slot = self.dispose_result.lock().expect("dispose_result");
         if slot.is_none() {
@@ -92,81 +80,110 @@ impl FiberInner {
         self.dispose_result.lock().expect("dispose_result").clone()
     }
 
-    /// 等待释放完成，写入 `dispose_result`，再 unregister 并清 `pending_wait`。
-    ///
-    /// `started_by_us`：本次从 Active 槽取出 Scope，需先 `dispose()`；否则仅 join
-    /// 已在途的 unload/`pending_wait` 同一 `DisposeCompletion`。
-    async fn finalize_dispose(
+    fn mark_release_started(&self, scope: &EffectScope) {
+        let mut ownership = self.ownership.lock().expect("ownership");
+        if let EffectOwnership::Releasing(release) = &mut *ownership
+            && release.scope.ptr_eq(scope)
+        {
+            release.dispose_started = true;
+        }
+    }
+
+    fn begin_terminal_release(&self) -> TerminalRelease {
+        let first = !self.disposed.swap(true, Ordering::AcqRel);
+        if let Ok(mut busy) = self.busy.lock() {
+            *busy = false;
+        }
+        if first && let Ok(mut slot) = self.lifecycle.lock() {
+            *slot = None;
+        }
+        let mut ownership = self.ownership.lock().expect("ownership");
+        if !first {
+            return match &*ownership {
+                EffectOwnership::Releasing(release) => TerminalRelease::Join(release.scope.clone()),
+                EffectOwnership::Activating(scope) | EffectOwnership::Active(scope) => {
+                    let scope = scope.clone();
+                    *ownership = EffectOwnership::Releasing(FiberRelease {
+                        scope: scope.clone(),
+                        dispose_started: false,
+                    });
+                    TerminalRelease::Run {
+                        scope,
+                        start_dispose: true,
+                    }
+                }
+                EffectOwnership::Empty => TerminalRelease::Observe,
+            };
+        }
+        match std::mem::replace(&mut *ownership, EffectOwnership::Empty) {
+            EffectOwnership::Activating(scope) | EffectOwnership::Active(scope) => {
+                *ownership = EffectOwnership::Releasing(FiberRelease {
+                    scope: scope.clone(),
+                    dispose_started: false,
+                });
+                TerminalRelease::Run {
+                    scope,
+                    start_dispose: true,
+                }
+            }
+            EffectOwnership::Releasing(release) => {
+                *ownership = EffectOwnership::Releasing(release.clone());
+                TerminalRelease::Join(release.scope)
+            }
+            EffectOwnership::Empty => TerminalRelease::Vacant,
+        }
+    }
+
+    fn clear_release_if_matching(&self, scope: &EffectScope) {
+        let mut ownership = self.ownership.lock().expect("ownership");
+        if let EffectOwnership::Releasing(release) = &*ownership
+            && release.scope.ptr_eq(scope)
+        {
+            *ownership = EffectOwnership::Empty;
+        }
+    }
+
+    async fn finalize_terminal_release(
         self: &Arc<Self>,
         scope: EffectScope,
-        started_by_us: bool,
+        start_dispose: bool,
     ) -> Result<(), CoreError> {
-        if started_by_us {
-            scope.dispose();
+        if start_dispose {
+            scope.dispose_owned();
+            self.mark_release_started(&scope);
         }
         let result = scope.dispose_wait().await;
         self.store_dispose_result(result.clone());
         self.transition_disposed();
+        self.clear_release_if_matching(&scope);
         if let Some(registry) = self.registry.upgrade() {
             registry.unregister_plugin_fiber(self.id);
         }
-        let _ = self.pending_wait.lock().expect("pending_wait").take();
         result
     }
 
-    /// 已 dispose 后观察同一轮结果：优先 join `pending_wait`，否则读落盘结果。
     async fn observe_dispose_result(self: &Arc<Self>) -> Result<(), CoreError> {
-        loop {
-            if let Some(result) = self.read_dispose_result() {
-                return result;
-            }
-            let pending = self.pending_wait.lock().expect("pending_wait").clone();
-            if let Some(scope) = pending {
-                let result = scope.dispose_wait().await;
-                self.store_dispose_result(result.clone());
-                // 不在此 unregister / take：由首次 dispose 路径的 finalize 收口，
-                // 避免与后台任务或 unload 抢归属。若 finalize 已跑完，结果已落盘。
-                if let Some(stored) = self.read_dispose_result() {
-                    return stored;
-                }
-                return result;
-            }
-            // 释放可能正在 finalize 落盘与清 pending_wait 之间；让出后再读。
-            tokio::task::yield_now().await;
-            if let Some(result) = self.read_dispose_result() {
-                return result;
-            }
-            // 无 Effect 的空释放：dispose_now 会同步写 Ok(())。
-            if !self.disposed.load(Ordering::Acquire) {
-                return Ok(());
-            }
-            // 仍可能是极短窗口：再读一次后默认 Ok（无 scope 的 dispose）。
-            if self.pending_wait.lock().expect("pending_wait").is_none() {
-                return self.read_dispose_result().unwrap_or(Ok(()));
-            }
+        if let Some(result) = self.read_dispose_result() {
+            return result;
         }
+        let scope = self
+            .ownership
+            .lock()
+            .expect("ownership")
+            .live_scope()
+            .cloned();
+        if let Some(scope) = scope {
+            let result = scope.dispose_wait().await;
+            if let Some(stored) = self.read_dispose_result() {
+                return stored;
+            }
+            self.store_dispose_result(result.clone());
+            return result;
+        }
+        self.read_dispose_result().unwrap_or(Ok(()))
     }
 
-    /// 启动释放；Effect 的 DisposeCompletion 完成前保留 `pending_wait` 与 plugin 索引。
-    pub(crate) fn dispose_now(self: &Arc<Self>) {
-        let Some(taken) = self.begin_dispose() else {
-            return;
-        };
-        let started_by_us = taken.is_some();
-        let scope = taken.or_else(|| self.pending_wait.lock().expect("pending_wait").clone());
-        if let Some(scope) = scope {
-            *self.pending_wait.lock().expect("pending_wait") = Some(scope.clone());
-            self.transition_disposed();
-            // fire-and-forget：同步 cleanup 必须在调用方线程立刻执行。
-            if started_by_us {
-                scope.dispose();
-            }
-            let fiber = self.clone();
-            scope.runtime_handle().spawn(async move {
-                let _ = fiber.finalize_dispose(scope, false).await;
-            });
-            return;
-        }
+    fn complete_vacant_dispose(&self) {
         self.store_dispose_result(Ok(()));
         self.transition_disposed();
         if let Some(registry) = self.registry.upgrade() {
@@ -174,41 +191,93 @@ impl FiberInner {
         }
     }
 
-    pub(crate) async fn dispose_wait_inner(self: &Arc<Self>) -> Result<(), CoreError> {
-        if let Some(taken) = self.begin_dispose() {
-            let started_by_us = taken.is_some();
-            let scope = taken.or_else(|| self.pending_wait.lock().expect("pending_wait").clone());
-            if let Some(scope) = scope {
-                *self.pending_wait.lock().expect("pending_wait") = Some(scope.clone());
-                return self.finalize_dispose(scope, started_by_us).await;
+    /// 启动释放；Effect 的 DisposeCompletion 完成前保留 Releasing 与 plugin 索引。
+    pub(crate) fn dispose_now(self: &Arc<Self>) {
+        match self.begin_terminal_release() {
+            TerminalRelease::Run {
+                scope,
+                start_dispose,
+            } => {
+                self.transition_disposing();
+                if start_dispose {
+                    scope.dispose_owned();
+                    self.mark_release_started(&scope);
+                }
+                let fiber = self.clone();
+                scope.runtime_handle().spawn(async move {
+                    let _ = fiber.finalize_terminal_release(scope, false).await;
+                });
             }
-            self.store_dispose_result(Ok(()));
-            self.transition_disposed();
-            if let Some(registry) = self.registry.upgrade() {
-                registry.unregister_plugin_fiber(self.id);
+            TerminalRelease::Join(scope) => {
+                let fiber = self.clone();
+                scope.runtime_handle().spawn(async move {
+                    let _ = fiber.finalize_terminal_release(scope, false).await;
+                });
             }
-            return Ok(());
+            TerminalRelease::Vacant => self.complete_vacant_dispose(),
+            TerminalRelease::Observe => {}
         }
-        self.observe_dispose_result().await
+    }
+
+    pub(crate) async fn dispose_wait_inner(self: &Arc<Self>) -> Result<(), CoreError> {
+        match self.begin_terminal_release() {
+            TerminalRelease::Run {
+                scope,
+                start_dispose,
+            } => self.finalize_terminal_release(scope, start_dispose).await,
+            TerminalRelease::Join(scope) => self.finalize_terminal_release(scope, false).await,
+            TerminalRelease::Vacant => {
+                self.complete_vacant_dispose();
+                Ok(())
+            }
+            TerminalRelease::Observe => self.observe_dispose_result().await,
+        }
+    }
+
+    pub(crate) fn discard_activating_to_pending(&self) {
+        let mut ownership = self.ownership.lock().expect("ownership");
+        match std::mem::replace(&mut *ownership, EffectOwnership::Empty) {
+            EffectOwnership::Activating(scope) => scope.dispose(),
+            other => *ownership = other,
+        }
     }
 
     pub(crate) async fn unload_effect_to_pending(&self) -> Result<(), CoreError> {
-        let effect = self.effect.lock().expect("effect").take();
-        if let Some(effect) = effect {
-            // 释放完成前登记归属，供 unmount 重入与并发 dispose 可见。
-            *self.pending_wait.lock().expect("pending_wait") = Some(effect.clone());
+        let scope = {
+            let mut ownership = self.ownership.lock().expect("ownership");
+            match std::mem::replace(&mut *ownership, EffectOwnership::Empty) {
+                EffectOwnership::Active(scope) => {
+                    *ownership = EffectOwnership::Releasing(FiberRelease {
+                        scope: scope.clone(),
+                        dispose_started: false,
+                    });
+                    Some(scope)
+                }
+                EffectOwnership::Releasing(release) => {
+                    *ownership = EffectOwnership::Releasing(release.clone());
+                    Some(release.scope)
+                }
+                EffectOwnership::Activating(scope) => {
+                    *ownership = EffectOwnership::Releasing(FiberRelease {
+                        scope: scope.clone(),
+                        dispose_started: false,
+                    });
+                    Some(scope)
+                }
+                EffectOwnership::Empty => None,
+            }
+        };
+        if let Some(scope) = scope {
             if !self.transition_if_alive(FiberState::Unloading) {
-                // 已 disposed：保留 pending_wait，由 dispose finalize 收口。
                 if self.disposed.load(Ordering::Acquire) {
-                    let _ = effect.dispose_wait().await;
+                    let _ = scope.dispose_wait().await;
                     return Err(CoreError::FiberDisposed);
                 }
-                let _ = self.pending_wait.lock().expect("pending_wait").take();
+                self.clear_release_if_matching(&scope);
                 return Err(CoreError::FiberDisposed);
             }
-            let dispose_result = effect.dispose_wait().await;
+            let dispose_result = scope.dispose_wait().await;
             if self.disposed.load(Ordering::Acquire) {
-                // dispose 路径负责 unregister / 清 pending_wait / 落盘结果。
                 if let Err(ref error) = dispose_result {
                     self.store_dispose_result(Err(error.clone()));
                 } else {
@@ -219,7 +288,7 @@ impl FiberInner {
                     Err(error) => Err(error),
                 };
             }
-            let _ = self.pending_wait.lock().expect("pending_wait").take();
+            self.clear_release_if_matching(&scope);
             if let Err(error) = dispose_result {
                 *self.last_error.lock().expect("error") = Some(error.to_string());
                 let _ = self.transition_if_alive(FiberState::Failed);

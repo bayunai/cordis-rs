@@ -146,12 +146,7 @@ fn build_state(app: &AppState) -> StateJson {
 }
 
 fn err(status: StatusCode, msg: impl Into<String>) -> (StatusCode, Json<ErrJson>) {
-    (
-        status,
-        Json(ErrJson {
-            error: msg.into(),
-        }),
-    )
+    (status, Json(ErrJson { error: msg.into() }))
 }
 
 async fn index() -> Html<&'static str> {
@@ -167,17 +162,13 @@ async fn api_logs(
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let rx = app.bus.subscribe();
     let stream = unfold(rx, |mut rx| async move {
-        loop {
-            match rx.recv().await {
-                Ok(msg) => return Some((Ok(Event::default().data(msg)), rx)),
-                Err(broadcast::error::RecvError::Closed) => return None,
-                Err(broadcast::error::RecvError::Lagged(_)) => {
-                    return Some((
-                        Ok(Event::default().data("(bus lagged; skipped some lines)")),
-                        rx,
-                    ));
-                }
-            }
+        match rx.recv().await {
+            Ok(msg) => Some((Ok(Event::default().data(msg)), rx)),
+            Err(broadcast::error::RecvError::Closed) => None,
+            Err(broadcast::error::RecvError::Lagged(_)) => Some((
+                Ok(Event::default().data("(bus lagged; skipped some lines)")),
+                rx,
+            )),
         }
     });
     Sse::new(stream).keep_alive(KeepAlive::default())

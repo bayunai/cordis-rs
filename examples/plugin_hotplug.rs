@@ -159,9 +159,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ticks = Arc::new(AtomicU64::new(0));
 
     // 1) 先挂 Logger；Counter 依赖未齐，保持 Pending。
-    let mut logger = root
-        .plugin(Arc::new(LoggerPlugin { label: "v1" }))
-        .await?;
+    let mut logger = root.plugin(Arc::new(LoggerPlugin { label: "v1" })).await?;
     println!("logger state: {:?}", logger.state());
 
     let mut counter = root
@@ -217,9 +215,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 5) 再插一版 Greeter，Counter 重新 Active。
     greeter = root
-        .plugin(Arc::new(GreeterPlugin {
-            name: "Bob".into(),
-        }))
+        .plugin(Arc::new(GreeterPlugin { name: "Bob".into() }))
         .await?;
     runtime.settle().await;
     println!("counter after greeter replug: {:?}", counter.state());

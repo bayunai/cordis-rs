@@ -15,13 +15,13 @@ pub(super) type AsyncDisposer = Box<dyn FnOnce() -> BoxFuture + Send>;
 
 pub(super) enum ManagedWork {
     Task(JoinHandle<()>),
-    /// 等待子 Scope `DisposeCompletion`，并把聚合错误带回父协调任务。
-    ChildWait(JoinHandle<Result<(), Vec<String>>>),
 }
 
 #[derive(Default)]
 pub(super) struct Resources {
     pub(super) children: Vec<EffectScope>,
+    /// 已独立完成释放的子 Scope 错误；父 Scope 日后释放时仍需向上聚合。
+    pub(super) child_errors: Vec<String>,
     pub(super) cleanups: Vec<Box<dyn FnOnce() + Send>>,
     pub(super) async_disposers: Vec<AsyncDisposer>,
     pub(super) work: Vec<ManagedWork>,
@@ -31,7 +31,6 @@ impl ManagedWork {
     pub(super) fn abort(self) {
         match self {
             Self::Task(handle) => handle.abort(),
-            Self::ChildWait(handle) => handle.abort(),
         }
     }
 }

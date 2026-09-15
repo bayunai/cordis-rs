@@ -89,6 +89,29 @@ impl ShutdownCompletion {
     }
 }
 
+struct ShutdownFinishGuard {
+    completion: Arc<ShutdownCompletion>,
+    finished: bool,
+}
+
+impl Drop for ShutdownFinishGuard {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.completion.finish(Err(CoreError::CoordinatorAborted {
+                reason: "shutdown supervisor dropped".into(),
+            }));
+        }
+    }
+}
+
+async fn run_shutdown_worker(inner: Arc<RuntimeInner>) -> Result<(), CoreError> {
+    let dispose_result = inner.root.inner.scope.dispose_wait().await;
+    inner.registry.settle().await;
+    inner.registry.stop_scheduler().await;
+    inner.scheduler_awaited.store(true, Ordering::Release);
+    dispose_result
+}
+
 impl Runtime {
     pub fn new() -> Result<Self, CoreError> {
         let registry = Registry::new();
@@ -153,17 +176,31 @@ impl Runtime {
         if start_coordinator {
             let inner = self.inner.clone();
             let completion_for_task = completion.clone();
-            let coordinator = self
+            let supervisor = self
                 .inner
                 .handle
                 .spawn(SHUTDOWN_COORDINATOR.scope((), async move {
-                    let dispose_result = inner.root.inner.scope.dispose_wait().await;
-                    inner.registry.settle().await;
-                    inner.registry.stop_scheduler().await;
-                    inner.scheduler_awaited.store(true, Ordering::Release);
-                    completion_for_task.finish(dispose_result);
+                    let mut guard = ShutdownFinishGuard {
+                        completion: completion_for_task.clone(),
+                        finished: false,
+                    };
+                    let worker = tokio::spawn(run_shutdown_worker(inner.clone()));
+                    let result = match worker.await {
+                        Ok(result) => result,
+                        Err(error) => {
+                            // shutdown 已经对外可见；即使 worker 异常，也不能留下
+                            // 仍在运行的 scheduler 或永远未完成的 Completion。
+                            inner.registry.stop_scheduler().await;
+                            inner.scheduler_awaited.store(true, Ordering::Release);
+                            Err(CoreError::CoordinatorAborted {
+                                reason: format!("shutdown worker: {error}"),
+                            })
+                        }
+                    };
+                    completion_for_task.finish(result);
+                    guard.finished = true;
                 }));
-            completion.attach_coordinator(coordinator);
+            completion.attach_coordinator(supervisor);
         }
 
         completion.wait().await
@@ -231,5 +268,89 @@ impl Drop for RuntimeInner {
         // 尽力同步关闭：不启动 async disposer，abort 调度器以释放 Registry。
         self.root.inner.scope.abandon();
         self.registry.abort_scheduler();
+    }
+}
+
+#[cfg(test)]
+mod shutdown_supervisor_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn shutdown_worker_abort_finishes_waiters_with_coordinator_aborted() {
+        let completion = ShutdownCompletion::new();
+        let mut waiters = Vec::new();
+        for _ in 0..8 {
+            let completion = completion.clone();
+            waiters.push(tokio::spawn(async move {
+                tokio::time::timeout(Duration::from_secs(2), completion.wait())
+                    .await
+                    .expect("shutdown wait timed out")
+            }));
+        }
+
+        let completion_for_supervisor = completion.clone();
+        let supervisor = tokio::spawn(async move {
+            let mut guard = ShutdownFinishGuard {
+                completion: completion_for_supervisor.clone(),
+                finished: false,
+            };
+            let worker =
+                tokio::spawn(async { std::future::pending::<Result<(), CoreError>>().await });
+            worker.abort();
+            let result = match worker.await {
+                Ok(result) => result,
+                Err(error) => Err(CoreError::CoordinatorAborted {
+                    reason: format!("shutdown worker: {error}"),
+                }),
+            };
+            completion_for_supervisor.finish(result);
+            guard.finished = true;
+        });
+        supervisor.await.expect("supervisor join");
+
+        for waiter in waiters {
+            let error = waiter.await.expect("join").expect_err("must be aborted");
+            assert!(
+                matches!(error, CoreError::CoordinatorAborted { .. }),
+                "{error:?}"
+            );
+        }
+
+        let late = tokio::time::timeout(Duration::from_secs(1), completion.wait())
+            .await
+            .expect("late waiter timed out")
+            .expect_err("late waiter must share abort");
+        assert!(matches!(late, CoreError::CoordinatorAborted { .. }));
+    }
+
+    #[tokio::test]
+    async fn shutdown_supervisor_drop_finishes_waiters() {
+        let completion = ShutdownCompletion::new();
+        let waiter = {
+            let completion = completion.clone();
+            tokio::spawn(async move {
+                tokio::time::timeout(Duration::from_secs(2), completion.wait())
+                    .await
+                    .expect("wait timed out")
+            })
+        };
+        {
+            let _guard = ShutdownFinishGuard {
+                completion: completion.clone(),
+                finished: false,
+            };
+            // Drop without finished=true → CoordinatorAborted
+        }
+        let error = waiter.await.expect("join").expect_err("aborted");
+        match error {
+            CoreError::CoordinatorAborted { reason } => {
+                assert!(
+                    reason.contains("supervisor dropped"),
+                    "unexpected reason: {reason}"
+                );
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
     }
 }

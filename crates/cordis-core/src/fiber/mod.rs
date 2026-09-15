@@ -7,9 +7,11 @@
 mod activate;
 mod coordinator;
 mod lifecycle;
+mod ownership;
 mod state;
 
-pub(crate) use coordinator::{InitialMountWaitGuard, LifecycleOp};
+pub(crate) use coordinator::{HandleHandoff, InitialMountWaitGuard, LifecycleOp};
+pub(crate) use ownership::EffectOwnership;
 pub(crate) use state::ActivateClaim;
 pub use state::{FiberState, FiberStateChange};
 
@@ -39,11 +41,7 @@ pub(crate) struct FiberInner {
     pub(crate) parent_scope: EffectScope,
     pub(crate) plugin: Mutex<Arc<dyn Plugin>>,
     pub(crate) dependencies: Mutex<Vec<ServiceId>>,
-    pub(crate) effect: Mutex<Option<EffectScope>>,
-    /// 激活中尚未提交的临时 Plugin Scope。
-    pub(crate) pending_effect: Mutex<Option<EffectScope>>,
-    /// 在途 Effect 释放：unload / dispose 登记后可见，直至 DisposeCompletion 结束。
-    pub(crate) pending_wait: Mutex<Option<EffectScope>>,
+    pub(crate) ownership: Mutex<EffectOwnership>,
     /// 本轮 Fiber 释放的最终结果；供延迟 `dispose_wait` 读取同一错误。
     pub(crate) dispose_result: Mutex<Option<Result<(), crate::CoreError>>>,
     pub(crate) state: Mutex<FiberState>,
@@ -53,6 +51,7 @@ pub(crate) struct FiberInner {
     pub(crate) busy: Mutex<bool>,
     pub(crate) lifecycle: Mutex<Option<Arc<LifecycleCompletion>>>,
     pub(crate) mount_ctx: Mutex<Option<Context>>,
+    pub(crate) handoff: Mutex<HandleHandoff>,
 }
 
 impl Fiber {
@@ -112,12 +111,20 @@ impl FiberInner {
             missing_dependencies: missing.iter().map(|d| d.as_str()).collect(),
             last_error: self.last_error.lock().expect("fiber error").clone(),
             root_effect: self
-                .effect
+                .ownership
                 .lock()
-                .expect("effect")
-                .as_ref()
+                .expect("ownership")
+                .live_scope()
                 .map(|scope| scope.id()),
         }
+    }
+
+    pub(crate) fn needs_unmount_wait(&self) -> bool {
+        self.ownership
+            .lock()
+            .map(|guard| guard.needs_unmount_wait())
+            .unwrap_or(true)
+            || !self.disposed.load(Ordering::Acquire)
     }
 }
 
@@ -156,9 +163,7 @@ mod claim_tests {
             parent_scope: EffectScope::root(handle),
             plugin: Mutex::new(Arc::new(NoopPlugin)),
             dependencies: Mutex::new(Vec::new()),
-            effect: Mutex::new(None),
-            pending_effect: Mutex::new(None),
-            pending_wait: Mutex::new(None),
+            ownership: Mutex::new(EffectOwnership::Empty),
             dispose_result: Mutex::new(None),
             state: Mutex::new(FiberState::Pending),
             last_error: Mutex::new(None),
@@ -167,6 +172,7 @@ mod claim_tests {
             busy: Mutex::new(false),
             lifecycle: Mutex::new(None),
             mount_ctx: Mutex::new(None),
+            handoff: Mutex::new(HandleHandoff::Preparing),
         })
     }
 

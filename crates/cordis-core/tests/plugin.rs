@@ -516,8 +516,8 @@ async fn plugin_apply_races_parent_dispose_returns_no_handle() {
     entered_rx.await.expect("plugin entered apply");
     parent_owner.dispose();
     let _ = gate_tx.send(());
-    let result = mount.await.expect("join").expect("fiber handle");
-    assert_eq!(result.state(), cordis_core::FiberState::Disposed);
+    let result = mount.await.expect("join");
+    assert!(matches!(result, Err(CoreError::FiberDisposed)));
     assert_service_unavailable(&root, NUMBER);
 }
 
@@ -633,6 +633,7 @@ async fn unmount_rejects_concurrent_mount_and_replace_requires_same_key() {
 
     struct PluginA {
         gate: Arc<Mutex<Option<oneshot::Receiver<()>>>>,
+        applies: Arc<AtomicUsize>,
     }
     struct PluginB;
     #[async_trait]
@@ -641,6 +642,7 @@ async fn unmount_rejects_concurrent_mount_and_replace_requires_same_key() {
             KEY_A
         }
         async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
+            self.applies.fetch_add(1, Ordering::SeqCst);
             let gate = self.gate.clone();
             let effect = ctx.effect()?;
             effect.spawn(move |cancel| async move {
@@ -668,8 +670,12 @@ async fn unmount_rejects_concurrent_mount_and_replace_requires_same_key() {
 
     let runtime = runtime();
     let root = runtime.root();
+    let initial_applies = Arc::new(AtomicUsize::new(0));
     let mut fiber = root
-        .plugin(Arc::new(PluginA { gate: gate_rx }))
+        .plugin(Arc::new(PluginA {
+            gate: gate_rx,
+            applies: initial_applies,
+        }))
         .await
         .unwrap();
     assert!(matches!(
@@ -689,12 +695,27 @@ async fn unmount_rejects_concurrent_mount_and_replace_requires_same_key() {
             .any(|item| item.plugin_key == KEY_A.as_str() && item.unmounting)
     })
     .await;
+    let rejected_applies = Arc::new(AtomicUsize::new(0));
     let rejected = root
         .plugin(Arc::new(PluginA {
             gate: Arc::new(Mutex::new(None)),
+            applies: rejected_applies.clone(),
         }))
         .await;
     assert!(matches!(rejected, Err(CoreError::PluginUnmounting { .. })));
+    assert_eq!(
+        rejected_applies.load(Ordering::SeqCst),
+        0,
+        "被卸载分组拒绝的候选插件不得执行 apply"
+    );
+    assert!(
+        runtime
+            .diagnostics()
+            .plugin_fibers
+            .iter()
+            .all(|item| item.plugin_key != KEY_A.as_str() || item.id == fiber.id()),
+        "被拒绝候选不得残留 Fiber"
+    );
     let _ = gate_tx.send(());
     assert_eq!(unmount.await.unwrap().unwrap(), 1);
     assert!(fiber.is_disposed());

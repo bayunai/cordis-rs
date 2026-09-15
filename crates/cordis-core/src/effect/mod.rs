@@ -50,6 +50,9 @@ pub(super) struct EffectScopeInner {
     /// 创建时冻结的逻辑祖先链。`detach_from_parent` 只摘除父子弱引用，不清本链。
     lineage: Option<Arc<AncestorNode>>,
     resources: Mutex<Resources>,
+    /// `completion` 是受控释放的唯一线性化状态：Some 表示已开始释放，且所有
+    /// 并发调用者必须等待同一轮结果。先写入它再置 `disposed`，避免父 Scope
+    /// 观察到“已释放但尚未有 Completion”的中间状态。
     completion: Mutex<Option<Arc<DisposeCompletion>>>,
 }
 
@@ -122,11 +125,15 @@ impl EffectScope {
 
     /// 两 Scope 是否属于同一 Effect 树（自身或互为祖先；不依赖 live parent 弱引用）。
     pub(crate) fn is_same_tree_as(&self, other: &Self) -> bool {
-        if Arc::ptr_eq(&self.inner, &other.inner) {
+        if self.ptr_eq(other) {
             return true;
         }
         lineage_contains(&self.inner.lineage, other.inner.id)
             || lineage_contains(&other.inner.lineage, self.inner.id)
+    }
+
+    pub(crate) fn ptr_eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
     }
 
     pub(crate) fn id(&self) -> u64 {
@@ -162,7 +169,13 @@ impl EffectScope {
         self.inner
             .resources
             .lock()
-            .map(|resources| resources.children.len())
+            .map(|resources| {
+                resources
+                    .children
+                    .iter()
+                    .filter(|child| !child.is_disposed())
+                    .count()
+            })
             .unwrap_or(0)
     }
 
