@@ -4,6 +4,7 @@
 
 use crate::{
     CoreError,
+    callback_context::in_user_lifecycle_callback,
     effect::EffectScope,
     fiber::{FiberInner, FiberState},
     registry::{InjectionId, Registry},
@@ -101,7 +102,7 @@ impl Registry {
 
     pub(crate) async fn settle(self: &Arc<Self>) {
         // 嵌套于本轮 recompute 的用户 Future：已在 flush 中，不可再等待 quiescent。
-        if IN_RECOMPUTE_USER.try_with(|_| ()).is_ok() {
+        if IN_RECOMPUTE_USER.try_with(|_| ()).is_ok() || in_user_lifecycle_callback() {
             return;
         }
 
@@ -231,7 +232,8 @@ impl Registry {
             if fiber.disposed.load(Ordering::Acquire) {
                 continue;
             }
-            if fiber.busy.lock().map(|guard| *guard).unwrap_or(true) {
+            if fiber.busy.lock().map(|guard| *guard).unwrap_or(true) || fiber.lifecycle_in_flight()
+            {
                 continue;
             }
             let deps = fiber.dependencies.lock().expect("deps").clone();

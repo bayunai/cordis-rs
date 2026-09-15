@@ -1,12 +1,15 @@
 //! 插件 Fiber 公开类型与句柄。
 //!
 //! 公开 [`Fiber`]、[`FiberState`]、[`FiberStateChange`]；
-//! 子模块：`state` 合法转换与通知，`lifecycle` 重启/替换/释放，`activate` 依赖就绪后 apply。
+//! 子模块：`state` 合法转换与通知，`lifecycle` 重启/替换/释放，`activate` 依赖就绪后 apply，
+//! `coordinator` 持有可等待的生命周期协调器。
 
 mod activate;
+mod coordinator;
 mod lifecycle;
 mod state;
 
+pub(crate) use coordinator::{InitialMountWaitGuard, LifecycleOp};
 pub(crate) use state::ActivateClaim;
 pub use state::{FiberState, FiberStateChange};
 
@@ -20,6 +23,8 @@ use std::sync::{
     Arc, Mutex, Weak,
     atomic::{AtomicBool, Ordering},
 };
+
+use coordinator::LifecycleCompletion;
 
 /// 已挂载插件的可重启 / 可替换生命周期句柄。
 pub struct Fiber {
@@ -35,6 +40,8 @@ pub(crate) struct FiberInner {
     pub(crate) plugin: Mutex<Arc<dyn Plugin>>,
     pub(crate) dependencies: Mutex<Vec<ServiceId>>,
     pub(crate) effect: Mutex<Option<EffectScope>>,
+    /// 激活中尚未提交的临时 Plugin Scope。
+    pub(crate) pending_effect: Mutex<Option<EffectScope>>,
     /// `dispose_now` 后仍可用于 `dispose_wait` 的 Scope 克隆。
     pub(crate) pending_wait: Mutex<Option<EffectScope>>,
     pub(crate) state: Mutex<FiberState>,
@@ -42,6 +49,9 @@ pub(crate) struct FiberInner {
     pub(crate) resolved_providers: Mutex<Vec<u64>>,
     pub(crate) disposed: AtomicBool,
     pub(crate) busy: Mutex<bool>,
+    pub(crate) lifecycle: Mutex<Option<Arc<LifecycleCompletion>>>,
+    /// 首次挂载调用方取消 wait 时置位。
+    pub(crate) caller_cancelled: AtomicBool,
     pub(crate) mount_ctx: Mutex<Option<Context>>,
 }
 
@@ -147,12 +157,15 @@ mod claim_tests {
             plugin: Mutex::new(Arc::new(NoopPlugin)),
             dependencies: Mutex::new(Vec::new()),
             effect: Mutex::new(None),
+            pending_effect: Mutex::new(None),
             pending_wait: Mutex::new(None),
             state: Mutex::new(FiberState::Pending),
             last_error: Mutex::new(None),
             resolved_providers: Mutex::new(Vec::new()),
             disposed: AtomicBool::new(false),
             busy: Mutex::new(false),
+            lifecycle: Mutex::new(None),
+            caller_cancelled: AtomicBool::new(false),
             mount_ctx: Mutex::new(None),
         })
     }

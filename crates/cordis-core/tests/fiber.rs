@@ -770,7 +770,7 @@ async fn provider_recompute_marks_failed_when_async_dispose_errors() {
 }
 
 #[tokio::test]
-async fn cancelled_restart_releases_busy_and_allows_later_lifecycle_work() {
+async fn cancelled_restart_coordinator_converges_without_second_restart() {
     use cordis_core::PluginKey;
 
     static KEY: PluginKey = PluginKey::new("test.cancelled-restart");
@@ -825,11 +825,173 @@ async fn cancelled_restart_releases_busy_and_allows_later_lifecycle_work() {
     drop(restart);
     let _ = release_tx.send(());
 
-    tokio::time::timeout(std::time::Duration::from_secs(2), fiber.restart())
+    wait_until(|| {
+        let state = fiber.state();
+        state == FiberState::Active || state == FiberState::Pending || state == FiberState::Failed
+    })
+    .await;
+    assert_ne!(fiber.state(), FiberState::Unloading);
+    assert_ne!(fiber.state(), FiberState::Loading);
+    wait_until(|| fiber.state() == FiberState::Active).await;
+    runtime.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn cancelled_replace_coordinator_converges_to_new_plugin() {
+    use cordis_core::PluginKey;
+
+    static KEY: PluginKey = PluginKey::new("test.cancelled-replace");
+    let runtime = runtime();
+    let root = runtime.root();
+    let (gate_tx, gate_rx) = oneshot::channel::<()>();
+    let (release_tx, release_rx) = oneshot::channel::<()>();
+    let gate_tx = Arc::new(Mutex::new(Some(gate_tx)));
+    let release_rx = Arc::new(Mutex::new(Some(release_rx)));
+    let apply_count = Arc::new(AtomicUsize::new(0));
+
+    struct OldPlugin {
+        gate: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+        release: Arc<Mutex<Option<oneshot::Receiver<()>>>>,
+    }
+    struct NewPlugin {
+        applies: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Plugin for OldPlugin {
+        fn key(&self) -> PluginKey {
+            KEY
+        }
+        async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
+            let gate = self.gate.clone();
+            let release = self.release.clone();
+            let effect = ctx.effect()?;
+            effect.spawn(move |cancel| async move {
+                cancel.cancelled().await;
+                if let Some(tx) = gate.lock().expect("gate").take() {
+                    let _ = tx.send(());
+                }
+                let receiver = release.lock().expect("release").take();
+                if let Some(rx) = receiver {
+                    let _ = rx.await;
+                }
+            })?;
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl Plugin for NewPlugin {
+        fn key(&self) -> PluginKey {
+            KEY
+        }
+        async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
+            self.applies.fetch_add(1, Ordering::SeqCst);
+            ctx.provide(NUMBER, Number(42))?;
+            Ok(())
+        }
+    }
+
+    let mut fiber = root
+        .plugin(Arc::new(OldPlugin {
+            gate: gate_tx,
+            release: release_rx,
+        }))
         .await
-        .expect("later restart must not remain FiberBusy")
-        .expect("later restart");
-    assert_eq!(fiber.state(), FiberState::Active);
+        .unwrap();
+    let mut replace = Box::pin(fiber.replace(Arc::new(NewPlugin {
+        applies: apply_count.clone(),
+    })));
+    tokio::select! {
+        result = &mut replace => panic!("replace completed unexpectedly: {result:?}"),
+        _ = gate_rx => {}
+    }
+    drop(replace);
+    let _ = release_tx.send(());
+    wait_until(|| fiber.state() == FiberState::Active).await;
+    assert_eq!(apply_count.load(Ordering::SeqCst), 1);
+    assert_eq!(root.get(NUMBER).unwrap().0, 42);
+    runtime.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn cancelled_initial_plugin_mount_revokes_fiber() {
+    use cordis_core::PluginKey;
+
+    static KEY: PluginKey = PluginKey::new("test.cancelled-initial-mount");
+    let runtime = runtime();
+    let root = runtime.root();
+    let (entered_tx, entered_rx) = oneshot::channel::<()>();
+    let (release_tx, release_rx) = oneshot::channel::<()>();
+    let entered_tx = Arc::new(Mutex::new(Some(entered_tx)));
+    let release_rx = Arc::new(Mutex::new(Some(release_rx)));
+    let apply_count = Arc::new(AtomicUsize::new(0));
+
+    struct GatedApplyPlugin {
+        entered: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+        release: Arc<Mutex<Option<oneshot::Receiver<()>>>>,
+        applies: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Plugin for GatedApplyPlugin {
+        fn key(&self) -> PluginKey {
+            KEY
+        }
+        async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
+            self.applies.fetch_add(1, Ordering::SeqCst);
+            if let Some(tx) = self.entered.lock().expect("entered").take() {
+                let _ = tx.send(());
+            }
+            let receiver = self.release.lock().expect("release").take();
+            if let Some(rx) = receiver {
+                let _ = rx.await;
+            }
+            ctx.provide(NUMBER, Number(1))?;
+            let effect = ctx.effect()?;
+            effect.spawn(|cancel| async move {
+                cancel.cancelled().await;
+            })?;
+            Ok(())
+        }
+    }
+
+    // `plugin()` 返回的 Future 必须先被执行，`apply()` 才会进入门控点。
+    // 用独立任务模拟调用方在首次挂载期间取消 wait。
+    let mount_applies = apply_count.clone();
+    let mount = tokio::spawn({
+        let root = root.clone();
+        async move {
+            root.plugin(Arc::new(GatedApplyPlugin {
+                entered: entered_tx,
+                release: release_rx,
+                applies: mount_applies,
+            }))
+            .await
+        }
+    });
+    entered_rx.await.expect("entered apply");
+    mount.abort();
+    assert!(matches!(mount.await, Err(error) if error.is_cancelled()));
+    let _ = release_tx.send(());
+
+    wait_until(|| {
+        runtime
+            .diagnostics()
+            .plugin_registry
+            .iter()
+            .all(|group| group.plugin_key != KEY.as_str())
+    })
+    .await;
+    assert_eq!(apply_count.load(Ordering::SeqCst), 1);
+    assert_service_unavailable(&root, NUMBER);
+    assert!(
+        runtime
+            .diagnostics()
+            .plugin_fibers
+            .iter()
+            .all(|fiber| fiber.plugin_key != KEY.as_str())
+    );
     runtime.shutdown().await.expect("shutdown");
 }
 

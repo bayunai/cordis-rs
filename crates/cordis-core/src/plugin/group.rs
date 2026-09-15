@@ -74,6 +74,17 @@ impl Registry {
         }
     }
 
+    pub(crate) fn plugin_fibers_for_key(
+        &self,
+        key: PluginKey,
+    ) -> Result<Vec<Arc<FiberInner>>, CoreError> {
+        let state = self.state.lock().map_err(|_| CoreError::ContextDisposed)?;
+        let Some(group) = state.plugin_index.get(&key) else {
+            return Ok(Vec::new());
+        };
+        Ok(group.fibers.iter().filter_map(Weak::upgrade).collect())
+    }
+
     pub(crate) fn begin_plugin_unmount(
         &self,
         key: PluginKey,

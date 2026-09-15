@@ -62,15 +62,19 @@ Context::plugin(Arc<dyn Plugin>)
         │
         ├─ 登记 Fiber（Plugin::inject 声明依赖）
         ├─ 依赖未齐 → Pending；齐则 Loading → apply → Active / Failed
-        └─ 返回 Fiber
+        └─ 返回 Fiber（首次激活由内部协调器完成）
                 ├─ dispose / dispose_wait / Drop
                 ├─ restart()：同 Plugin 强制重跑
                 └─ replace(plugin)：同 PluginKey；dispose_wait 旧任务后再挂
                 跨 Key：Runtime::unmount(key) 后再 plugin(new)
 ```
 
-Provider 变化、`restart()` 与 `replace()` 都先经历 `Active → Unloading → Pending → Loading → Active`：Core 取消并等待旧 Effect 的受控任务退出后，才允许下一次 `apply()`。因此不会出现旧任务与新 Plugin 实例并行运行的窗口。配置更新固定为：宿主读取并校验配置 → 构造新的不可变 Plugin 实例 → `Fiber::replace`（Core **无** `update(json)`）。
+`Loading` / `Unloading` 始终由 **Fiber 内部生命周期协调器** 收敛：调用方 Future 取消只取消 wait，不 abort 协调器。因此不会因取消而残留 Busy、Loading 或 Unloading。
 
+- **首次 `plugin()`**：调用方在返回 Handle 前取消 wait → 协调器撤销临时 Scope、注销 Fiber，视为从未成功挂载。
+- **`restart()` / `replace()`**：一旦开始（`replace` 在候选 `key()`/`inject()` 预检成功后即提交），调用方取消不回滚；协调器继续完成卸载与后续重激活。
+- Provider 变化、`restart()` 与 `replace()` 都先经历 `Active → Unloading → Pending → Loading → Active`：Core 取消并等待旧 Effect 的受控任务退出后，才允许下一次 `apply()`。
+- 配置更新固定为：宿主读取并校验配置 → 构造新的不可变 Plugin 实例 → `Fiber::replace`（Core **无** `update(json)`）。
 - 配置无效：宿主记录配置错误，**不得调用** `replace`；旧 Active 实例继续运行。
 - 新实例 `apply` 失败：旧实例已释放，Fiber 进入 `Failed`；Core 不回滚配置或恢复旧实例。
 - `restart()` 只用于配置未变时的重新执行、依赖变化或人工恢复，禁止作为可变配置更新入口。
@@ -112,7 +116,11 @@ Provider 变化、`restart()` 与 `replace()` 都先经历 `Active → Unloading
 
 ## Plugin Registry
 
-`Plugin::key()` 声明稳定身份。Runtime 按 Key 归组 Fiber；`Runtime::unmount(key)` 标记卸载中、拒绝同 Key 新挂载、`dispose_wait` 全部实例后清分组；释放错误聚合返回，但仍完成分组清理。`Fiber::replace` 仅允许同 Key；旧 Effect 释放失败时进入 `Failed`，不启动新 `apply`。
+`Plugin::key()` 声明稳定身份。Runtime 按 Key 归组 Fiber；`Runtime::unmount(key)` 标记卸载中、拒绝同 Key 新挂载、`dispose_wait` 全部实例后清分组；释放错误聚合返回，但仍完成分组清理。
+
+`unmount` 的重入保护按 **Effect Scope 树**判定，而非粗暴禁止所有生命周期回调：若当前用户回调（`apply` / inject / spawn / async disposer）所属 Scope 与任一待卸载 Fiber 将等待的 Scope 同树，立即返回 `UnmountReentrant`，不 cancel、不等待。卸载无关插件的 Key 仍允许。`shutdown` 的全局 `ShutdownReentrant` 约束不变。
+
+`Fiber::replace` 仅允许同 Key；旧 Effect 释放失败时进入 `Failed`，不启动新 `apply`。
 
 ## 关闭
 

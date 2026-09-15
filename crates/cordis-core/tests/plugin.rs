@@ -778,3 +778,185 @@ async fn unmount_and_shutdown_return_dispose_errors_after_cleanup() {
     assert!(matches!(shutdown_error, CoreError::DisposeFailed { .. }));
     assert!(runtime.scheduler_stopped());
 }
+
+#[tokio::test]
+async fn unmount_self_from_apply_returns_unmount_reentrant() {
+    use cordis_core::PluginKey;
+
+    static KEY: PluginKey = PluginKey::new("test.unmount-self-apply");
+    let runtime = runtime();
+    let root = runtime.root();
+    let runtime_for_plugin = runtime.clone();
+
+    struct SelfUnmountPlugin {
+        runtime: Runtime,
+    }
+    #[async_trait]
+    impl Plugin for SelfUnmountPlugin {
+        fn key(&self) -> PluginKey {
+            KEY
+        }
+        async fn apply(&self, _ctx: &Context) -> Result<(), CoreError> {
+            match self.runtime.unmount(KEY).await {
+                Err(CoreError::UnmountReentrant) => Ok(()),
+                other => Err(CoreError::PluginApply(format!(
+                    "expected UnmountReentrant, got {other:?}"
+                ))),
+            }
+        }
+    }
+
+    let fiber = root
+        .plugin(Arc::new(SelfUnmountPlugin {
+            runtime: runtime_for_plugin,
+        }))
+        .await
+        .unwrap();
+    assert_eq!(fiber.state(), FiberState::Active);
+    runtime.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn unmount_unrelated_key_from_apply_succeeds() {
+    use cordis_core::PluginKey;
+
+    static SELF_KEY: PluginKey = PluginKey::new("test.unmount-unrelated-self");
+    static OTHER_KEY: PluginKey = PluginKey::new("test.unmount-unrelated-other");
+    let runtime = runtime();
+    let root = runtime.root();
+
+    struct OtherPlugin;
+    #[async_trait]
+    impl Plugin for OtherPlugin {
+        fn key(&self) -> PluginKey {
+            OTHER_KEY
+        }
+        async fn apply(&self, _ctx: &Context) -> Result<(), CoreError> {
+            Ok(())
+        }
+    }
+    let _other = root.plugin(Arc::new(OtherPlugin)).await.unwrap();
+
+    let runtime_for_plugin = runtime.clone();
+    struct UnmountOtherPlugin {
+        runtime: Runtime,
+    }
+    #[async_trait]
+    impl Plugin for UnmountOtherPlugin {
+        fn key(&self) -> PluginKey {
+            SELF_KEY
+        }
+        async fn apply(&self, _ctx: &Context) -> Result<(), CoreError> {
+            self.runtime.unmount(OTHER_KEY).await?;
+            Ok(())
+        }
+    }
+
+    let fiber = root
+        .plugin(Arc::new(UnmountOtherPlugin {
+            runtime: runtime_for_plugin,
+        }))
+        .await
+        .unwrap();
+    assert_eq!(fiber.state(), FiberState::Active);
+    assert!(
+        runtime
+            .diagnostics()
+            .plugin_registry
+            .iter()
+            .all(|group| group.plugin_key != OTHER_KEY.as_str())
+    );
+    runtime.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn unmount_self_from_inject_spawn_and_async_disposer_returns_reentrant() {
+    use cordis_core::PluginKey;
+
+    static KEY: PluginKey = PluginKey::new("test.unmount-self-lifecycle");
+    let runtime = runtime();
+    let root = runtime.root();
+    root.provide(NUMBER, Number(1)).unwrap();
+    let runtime_clone = runtime.clone();
+    let seen = Arc::new(AtomicUsize::new(0));
+
+    struct LifecycleUnmountPlugin {
+        runtime: Runtime,
+        seen: Arc<AtomicUsize>,
+    }
+    #[async_trait]
+    impl Plugin for LifecycleUnmountPlugin {
+        fn key(&self) -> PluginKey {
+            KEY
+        }
+        async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
+            let runtime = self.runtime.clone();
+            let seen = self.seen.clone();
+            ctx.inject([NUMBER.id()], move |_services, effect| {
+                let runtime = runtime.clone();
+                let seen = seen.clone();
+                async move {
+                    match runtime.unmount(KEY).await {
+                        Err(CoreError::UnmountReentrant) => {
+                            seen.fetch_add(1, Ordering::SeqCst);
+                        }
+                        other => {
+                            return Err(CoreError::PluginApply(format!(
+                                "inject expected UnmountReentrant: {other:?}"
+                            )));
+                        }
+                    }
+                    let runtime_for_spawn = runtime.clone();
+                    let seen_for_spawn = seen.clone();
+                    effect.spawn(move |_| {
+                        let runtime = runtime_for_spawn.clone();
+                        let seen = seen_for_spawn.clone();
+                        async move {
+                            if matches!(
+                                runtime.unmount(KEY).await,
+                                Err(CoreError::UnmountReentrant)
+                            ) {
+                                seen.fetch_add(1, Ordering::SeqCst);
+                            }
+                        }
+                    })?;
+                    let runtime_for_dispose = runtime.clone();
+                    let seen_for_dispose = seen.clone();
+                    effect.on_dispose_async(move || {
+                        let runtime = runtime_for_dispose.clone();
+                        let seen = seen_for_dispose.clone();
+                        async move {
+                            match runtime.unmount(KEY).await {
+                                Err(CoreError::UnmountReentrant) => {
+                                    seen.fetch_add(1, Ordering::SeqCst);
+                                    Ok(())
+                                }
+                                other => Err(CoreError::EventListener(format!(
+                                    "disposer expected UnmountReentrant: {other:?}"
+                                ))),
+                            }
+                        }
+                    })?;
+                    Ok(())
+                }
+            })?;
+            Ok(())
+        }
+    }
+
+    let mut fiber = root
+        .plugin(Arc::new(LifecycleUnmountPlugin {
+            runtime: runtime_clone,
+            seen: seen.clone(),
+        }))
+        .await
+        .unwrap();
+    wait_until(|| seen.load(Ordering::SeqCst) >= 1).await;
+    fiber.dispose_wait().await.expect("dispose_wait");
+    assert!(
+        seen.load(Ordering::SeqCst) >= 3,
+        "inject+spawn+disposer should each observe UnmountReentrant, got {}",
+        seen.load(Ordering::SeqCst)
+    );
+    runtime.shutdown().await.expect("shutdown");
+}

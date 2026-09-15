@@ -5,7 +5,10 @@
 
 use crate::{
     Context, CoreError, PluginKey,
-    callback_context::{SHUTDOWN_COORDINATOR, in_shutdown_coordinator, in_user_lifecycle_callback},
+    callback_context::{
+        SHUTDOWN_COORDINATOR, current_lifecycle_scope, in_shutdown_coordinator,
+        in_user_lifecycle_callback,
+    },
     context::ContextInner,
     diagnostics::RuntimeSnapshot,
     effect::EffectScope,
@@ -181,8 +184,21 @@ impl Runtime {
 
     /// 按 [`PluginKey`] 统一卸载：拒绝并发新挂载，等待该组全部 Fiber `dispose_wait`。
     ///
+    /// 若在用户生命周期回调内且目标 Fiber 的等待 Scope 与当前回调同树，立即返回
+    /// [`CoreError::UnmountReentrant`]，不取消、不等待任何 Fiber。
+    ///
     /// 即使部分 Fiber 释放失败，仍会尝试释放同组其余实例并清理分组，再返回聚合错误。
     pub async fn unmount(&self, key: PluginKey) -> Result<usize, CoreError> {
+        if let Some(frame_scope) = current_lifecycle_scope() {
+            let targets = self.inner.registry.plugin_fibers_for_key(key)?;
+            for fiber in &targets {
+                for scope in fiber.scopes_awaited_by_unmount() {
+                    if frame_scope.is_same_tree_as(&scope) {
+                        return Err(CoreError::UnmountReentrant);
+                    }
+                }
+            }
+        }
         let fibers = self.inner.registry.begin_plugin_unmount(key)?;
         let count = fibers.len();
         let mut errors = Vec::new();

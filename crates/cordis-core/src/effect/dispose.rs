@@ -8,7 +8,11 @@ use std::{
     sync::{Arc, Weak, atomic::Ordering},
 };
 
-use crate::{CoreError, callback_context::USER_LIFECYCLE_CALLBACK, error::format_panic_message};
+use crate::{
+    CoreError,
+    callback_context::{LifecycleFrame, USER_LIFECYCLE_CALLBACK},
+    error::format_panic_message,
+};
 
 use super::{
     EffectScope, EffectScopeInner,
@@ -86,17 +90,22 @@ fn run_sync_cleanup_collect(cleanup: Box<dyn FnOnce() + Send>, errors: &mut Vec<
     }
 }
 
-async fn run_async_disposer(disposer: AsyncDisposer) -> Result<(), String> {
+async fn run_async_disposer(disposer: AsyncDisposer, scope: &EffectScope) -> Result<(), String> {
     USER_LIFECYCLE_CALLBACK
-        .scope((), async move {
-            let future = catch_unwind(AssertUnwindSafe(disposer))
-                .map_err(|payload| format_panic_message("dispose callback", payload))?;
-            match AssertUnwindSafe(future).catch_unwind().await {
-                Ok(Ok(())) => Ok(()),
-                Ok(Err(error)) => Err(error.to_string()),
-                Err(payload) => Err(format_panic_message("dispose callback", payload)),
-            }
-        })
+        .scope(
+            LifecycleFrame {
+                scope: scope.clone(),
+            },
+            async move {
+                let future = catch_unwind(AssertUnwindSafe(disposer))
+                    .map_err(|payload| format_panic_message("dispose callback", payload))?;
+                match AssertUnwindSafe(future).catch_unwind().await {
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(error)) => Err(error.to_string()),
+                    Err(payload) => Err(format_panic_message("dispose callback", payload)),
+                }
+            },
+        )
         .await
 }
 
@@ -191,6 +200,7 @@ impl EffectScope {
 
         let handle = self.inner.handle.clone();
         let completion_for_task = completion.clone();
+        let scope_for_frame = self.clone();
         let coordinator = handle.spawn(async move {
             let mut errors = sync_errors;
             // 子 Scope 必须先完整释放；父 Scope 的 async disposer 才能安全关闭
@@ -205,7 +215,7 @@ impl EffectScope {
                 }
             }
             for disposer in async_disposers.into_iter().rev() {
-                if let Err(error) = run_async_disposer(disposer).await {
+                if let Err(error) = run_async_disposer(disposer, &scope_for_frame).await {
                     errors.push(error);
                 }
             }

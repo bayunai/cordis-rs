@@ -61,10 +61,12 @@ async fn main() -> Result<(), CoreError> {
 
 ## Fiber
 
-- `plugin()` 返回 `Fiber`（非旧 PluginHandle）。
-- `restart()` 保留 Plugin 对象重跑；`replace(new)` 要求相同 `PluginKey`，先等旧任务结束再挂新实例。
+- `plugin()` 返回 `Fiber`（非旧 PluginHandle）。首次激活由内部协调器完成；调用方在返回前取消 wait 会撤销挂载（无残留 Fiber/诊断/服务）。
+- `restart()` 保留 Plugin 对象重跑；`replace(new)` 要求相同 `PluginKey`，先等旧任务结束再挂新实例。二者一旦开始，调用方取消不中断协调器，无需再手动 restart。
+- `Loading` / `Unloading` 由内部协调器收敛，不会因取消而粘滞。
 - `apply` 失败 → `FiberState::Failed`，句柄仍返回；查 `last_error()`。
 - 热更新：同 Key → `fiber.replace(new)`；跨 Key → `Runtime::unmount(old)` 后再 `plugin(new)`。
+- `unmount(自身 Key)` 不可在该插件的 `apply` / inject / spawn / async disposer 内调用（`UnmountReentrant`）；卸载无关 Key 可以。
 - `restart()`、`replace()` 和依赖 Provider 变更会先进入 `Unloading`，等待旧 Effect 的受控任务退出，再重新激活；不要在任务取消后继续使用旧实例资源。
 - 宿主可通过 `Runtime::subscribe_fiber_states()` 观察状态；这是可能丢失的广播流，收到 `Lagged` 后应使用 `Runtime::diagnostics()` 重建当前状态。
 

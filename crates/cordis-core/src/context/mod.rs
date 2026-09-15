@@ -236,6 +236,8 @@ impl Context {
     }
 
     /// 挂载插件：返回可重启 / 可替换的 [`Fiber`]。
+    ///
+    /// 调用方在首次激活完成前取消 wait：协调器撤销临时 Scope 并注销 Fiber，不返回可用句柄。
     pub async fn plugin(&self, plugin: Arc<dyn Plugin>) -> Result<Fiber, CoreError> {
         self.ensure_alive()?;
         let metadata = read_metadata(plugin.as_ref())?;
@@ -251,12 +253,15 @@ impl Context {
             plugin: Mutex::new(plugin),
             dependencies: Mutex::new(dependencies),
             effect: Mutex::new(None),
+            pending_effect: Mutex::new(None),
             pending_wait: Mutex::new(None),
             state: Mutex::new(FiberState::Pending),
             last_error: Mutex::new(None),
             resolved_providers: Mutex::new(Vec::new()),
             disposed: std::sync::atomic::AtomicBool::new(false),
             busy: Mutex::new(false),
+            lifecycle: Mutex::new(None),
+            caller_cancelled: std::sync::atomic::AtomicBool::new(false),
             mount_ctx: Mutex::new(Some(self.clone())),
         });
         self.inner.registry.register_plugin_fiber(inner.clone())?;
@@ -267,7 +272,33 @@ impl Context {
                 fiber.dispose_now();
             }
         });
-        let _ = inner.try_activate().await;
+        let completion = inner.start_lifecycle(crate::fiber::LifecycleOp::Activate {
+            initial_mount: true,
+        })?;
+        let mut guard = crate::fiber::InitialMountWaitGuard {
+            fiber: inner.clone(),
+            completed: false,
+        };
+        let result = completion.wait().await;
+        guard.completed = true;
+        // 插件 apply 失败是 Fiber 的可观测失败状态，不等同于挂载操作本身无法
+        // 返回句柄；调用者仍须能读取 `Failed` 与诊断并执行后续 dispose/restart。
+        // 只有首次挂载的调用者明确取消，才撤销实例并不返回 Handle。
+        match result {
+            Ok(()) | Err(CoreError::PluginApply(_)) => {}
+            Err(CoreError::FiberDisposed)
+                if !inner
+                    .caller_cancelled
+                    .load(std::sync::atomic::Ordering::Acquire) => {}
+            Err(error) => return Err(error),
+        }
+        if inner.disposed.load(std::sync::atomic::Ordering::Acquire)
+            && inner
+                .caller_cancelled
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(CoreError::FiberDisposed);
+        }
         Ok(Fiber { inner })
     }
 

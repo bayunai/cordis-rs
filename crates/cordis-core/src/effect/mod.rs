@@ -29,6 +29,9 @@ pub(super) struct EffectScopeInner {
     pub(super) cancellation: CancellationToken,
     pub(super) disposed: AtomicBool,
     pub(super) parent: Mutex<Option<Weak<EffectScopeInner>>>,
+    /// 创建时冻结的祖先 Scope ID。释放会解除 `parent` 弱引用，但生命周期
+    /// 回调仍需判断自己是否在被等待的 Effect 树内。
+    ancestors: Vec<u64>,
     resources: Mutex<Resources>,
     completion: Mutex<Option<Arc<DisposeCompletion>>>,
 }
@@ -41,10 +44,15 @@ pub(crate) struct EffectScope {
 
 impl EffectScope {
     pub(crate) fn root(handle: Handle) -> Self {
-        Self::new("root", handle, CancellationToken::new())
+        Self::new("root", handle, CancellationToken::new(), Vec::new())
     }
 
-    fn new(name: impl Into<String>, handle: Handle, cancellation: CancellationToken) -> Self {
+    fn new(
+        name: impl Into<String>,
+        handle: Handle,
+        cancellation: CancellationToken,
+        ancestors: Vec<u64>,
+    ) -> Self {
         Self {
             inner: Arc::new(EffectScopeInner {
                 id: NEXT_EFFECT_ID.fetch_add(1, Ordering::Relaxed),
@@ -53,6 +61,7 @@ impl EffectScope {
                 cancellation,
                 disposed: AtomicBool::new(false),
                 parent: Mutex::new(None),
+                ancestors,
                 resources: Mutex::new(Resources::default()),
                 completion: Mutex::new(None),
             }),
@@ -68,6 +77,12 @@ impl EffectScope {
             name,
             self.inner.handle.clone(),
             self.inner.cancellation.child_token(),
+            self.inner
+                .ancestors
+                .iter()
+                .copied()
+                .chain(std::iter::once(self.inner.id))
+                .collect(),
         );
         if let Ok(mut parent) = child.inner.parent.lock() {
             *parent = Some(Arc::downgrade(&self.inner));
@@ -83,6 +98,19 @@ impl EffectScope {
         }
         resources.children.push(child.clone());
         child
+    }
+
+    pub(crate) fn runtime_handle(&self) -> Handle {
+        self.inner.handle.clone()
+    }
+
+    /// 两 Scope 是否属于同一 Effect 树（自身或互为祖先）。
+    pub(crate) fn is_same_tree_as(&self, other: &Self) -> bool {
+        if Arc::ptr_eq(&self.inner, &other.inner) {
+            return true;
+        }
+        self.inner.ancestors.contains(&other.inner.id)
+            || other.inner.ancestors.contains(&self.inner.id)
     }
 
     pub(crate) fn id(&self) -> u64 {
