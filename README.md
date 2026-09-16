@@ -30,7 +30,7 @@
 ```toml
 [dependencies]
 async-trait = "0.1"
-cordis-core = { git = "https://github.com/bayunai/cordis-rs", rev = "f9d74f9" }
+cordis-core = { git = "https://github.com/bayunai/cordis-rs", rev = "490bef8" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
