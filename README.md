@@ -1,29 +1,40 @@
-# cordis-core workspace
+# cordis-rs
 
-最小 Cordis 风格 Runtime：**Context / Service / inject / Effect / Plugin / Event / Diagnostics**。
+一个面向 Rust 的轻量级、进程内响应式运行时，提供作用域服务、依赖注入、插件生命周期、
+资源归属、事件与运行时诊断。它不是 HTTP 框架、数据库抽象或动态插件加载器；这些能力应由
+应用或独立扩展实现。
 
-不含 HTTP、数据库、缓存、JSON、扩展包加载或网关概念。进程内编排与文件配置由
-[`cordis-host`](crates/cordis-host) 承担。
+> 当前版本为 `0.1.0`，公共 API 尚未稳定。升级 `0.x` 版本前请阅读变更说明并自行评估破坏性变更。
 
-## 包结构
+## 适用场景
+
+- 在一个进程内按服务依赖关系编排模块与插件。
+- 将后台任务、监听器、异步清理等资源绑定到插件生命周期。
+- 在应用宿主中根据明确工厂目录和 TOML 配置启停扩展实例。
+
+不适用：需要跨进程 RPC、数据库/缓存连接管理、动态库发现或浏览器端插件加载的场景；这些不属于
+`cordis-core` 的职责边界。
+
+## Crate
 
 | Crate | 用途 |
 | --- | --- |
-| [`crates/cordis-core`](crates/cordis-core) | 生产可用的 Runtime 内核 |
-| [`crates/cordis-host`](crates/cordis-host) | 进程内宿主：显式工厂目录、文件配置与 reconcile |
-| [`crates/cordis-testkit`](crates/cordis-testkit) | 测试辅助（`TestPlugin`、`wait_injection`、事件记录） |
-
-文档：
-
-- [架构与边界](docs/architecture.md)
-- [Host 编排](docs/host.md)
-- [扩展编写指南](docs/extension-authoring.md)
-
-启动约束：宿主从本地 `bootstrap.toml` 读取 `file` 配置源路径，再校验并编排
-`extensions.toml`。SQLite / PostgreSQL 配置存储与文件热更新尚未实现。详见
-[Bootstrap 配置边界](docs/architecture.md#bootstrap-配置边界) 与 [Host 编排](docs/host.md)。
+| [`cordis-core`](crates/cordis-core) | Runtime 内核：`Context`、`Service`、`inject`、`Effect`、`Plugin`、`Event` 与诊断。 |
+| [`cordis-host`](crates/cordis-host) | 进程内宿主：显式工厂目录、严格 TOML 配置、扩展实例 reconcile。 |
+| [`cordis-testkit`](crates/cordis-testkit) | 测试辅助；不应用于生产宿主。 |
 
 ## 快速开始
+
+在应用的 `Cargo.toml` 中以 Git 依赖接入当前未发布版本：
+
+```toml
+[dependencies]
+async-trait = "0.1"
+cordis-core = { git = "https://github.com/bayunai/cordis-rs", rev = "f9d74f9" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+```
+
+> `rev` 应替换为你实际审计并固定的提交；在发布到 crates.io 前，不建议依赖浮动分支。
 
 ```rust
 use async_trait::async_trait;
@@ -42,6 +53,7 @@ impl Plugin for ClockPlugin {
     fn key(&self) -> cordis_core::PluginKey {
         cordis_core::PluginKey::new("example.clock")
     }
+
     async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
         ctx.provide(CLOCK, Clock)?;
         Ok(())
@@ -61,42 +73,56 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut plugin = root.plugin(Arc::new(ClockPlugin)).await?;
     runtime.settle().await;
-    // 热卸载：await 插件任务与异步 disposer；或 fiber.replace(新实例)
     plugin.dispose_wait().await?;
     runtime.shutdown().await?;
     Ok(())
 }
 ```
 
+## 示例与文档
+
+- [`reactive`](examples/reactive.rs)：最小服务注入与响应式重算。
+- [`plugin_hotplug`](examples/plugin_hotplug.rs)：插件替换与卸载。
+- [`plugin_web`](examples/plugin_web.rs)：将运行时能力接入 HTTP 示例。
+- [`plugin_stack`](examples/plugin_stack/main.rs)：多插件应用栈。
+- [架构与边界](docs/architecture.md)
+- [Host 编排](docs/host.md)
+- [扩展编写指南](docs/extension-authoring.md)
+
 运行示例：
 
 ```bash
-cd cordis-rs
 cargo run -p cordis-core --example reactive
+cargo run -p cordis-core --example plugin_stack
 ```
 
-## 语义摘要
+`cordis-host` 的启动锚点为本地 `bootstrap.toml`，当前仅支持 `file` 配置源；SQLite /
+PostgreSQL 配置存储和文件热更新尚未实现。详情见[架构文档](docs/architecture.md#bootstrap-配置边界)。
 
-- `Runtime::new()` 须在 Tokio 中调用；专用调度器处理 dirty 重算。
-- `Context::extend()`：创建不拥有独立生命周期、也不登记 Runtime 节点的不可变派生视图；无引用后自动回收。
-- `isolate` / `isolate_with`：创建仅对派生视图生效的 ServiceKey 隔离标签（不可跨 Runtime）。
-- `provide_checked` / `ProviderHandle::refresh`：Provider 可保持“已注册但未就绪”；公开 `get`、`inject` 与 Plugin 依赖只接受就绪 Provider，未就绪细节仅通过诊断暴露。
-- Context 不可释放；资源由 `Runtime`、`EffectContext` 或 `Fiber` 持有和释放。Fiber 在重启、替换或依赖变更时会先进入 `Unloading`，旧任务退出后才重新激活。
-- `Context::plugin` 返回 `Fiber`（`restart` / 同 Key `replace` / `dispose_wait`）；跨 Key 用 `Runtime::unmount`。
-- 一次性异步收尾用 `EffectContext::on_dispose_async`（串行 LIFO）；长期后台用 `spawn`。`dispose()` 后再 `dispose_wait()` 仍等待同一轮结果；释放失败由 `dispose_wait` / `unmount` / `shutdown` 观察。
-- `Runtime::subscribe_fiber_states()` 提供 Fiber 只读状态广播；订阅者滞后时使用 `Runtime::diagnostics()` 重建快照。
-- 具名 Effect + 诊断树（plugin_fibers / plugin_registry / inject_fibers / effects）。
-- 事件四模式：Observe / Waterfall / Serial / Parallel；支持 `ListenOptions`（once / prepend / global / filter）。
-- `ConfigKey` + `intercept` / `config`：派生配置覆盖，不影响 Service。
-- Plugin 须声明 `PluginKey`。
-- **受控关闭必须** `Runtime::shutdown()`；仅 Drop 不启动未执行的 async disposer。
-- `Runtime::diagnostics()` 只暴露 ID、状态与标签，无业务载荷。
+## 关键语义
 
-## 开发验证
+- `Runtime::new()` 必须在 Tokio Runtime 内调用；专用调度器处理依赖变更后的重算。
+- `Context::extend()` 是不拥有独立生命周期的派生视图；`isolate` / `isolate_with` 仅隔离指定
+  `ServiceKey` 的可见性。
+- `Plugin` 用 `PluginKey` 标识，并由 Fiber 管理加载、替换、卸载与依赖变更后的重启。
+- `Effect` 统一归属插件的任务、监听器和清理回调；长期任务使用 `spawn`，一次性异步清理使用
+  `on_dispose_async`。
+- 受控退出必须调用 `Runtime::shutdown()`；仅 Drop 不会启动尚未执行的异步清理。
+- `Runtime::diagnostics()` 只输出标识、状态和标签，不暴露服务业务载荷。
+
+## 开发
+
+需要 Rust `1.98.1` 或更高版本：
 
 ```bash
-cd cordis-rs
 cargo fmt --check
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 ```
+
+贡献方式见[贡献指南](CONTRIBUTING.md)。安全问题请按[安全策略](SECURITY.md)私下披露，不要直接公开
+敏感细节。
+
+## 许可证
+
+本项目采用双许可证：你可以任选 [MIT](LICENSE-MIT) 或 [Apache-2.0](LICENSE-APACHE) 的条款使用。
