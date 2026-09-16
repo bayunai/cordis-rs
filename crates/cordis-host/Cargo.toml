@@ -1,0 +1,20 @@
+[package]
+name = "cordis-host"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "In-process extension host: catalog, file config, and reconcile for cordis-core."
+
+[dependencies]
+cordis-core.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "sync"] }
+toml.workspace = true
+
+[dev-dependencies]
+async-trait.workspace = true
+cordis-testkit.workspace = true
+tempfile = "3"
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }

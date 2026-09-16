@@ -1,6 +1,7 @@
 # 扩展编写指南
 
-面向在宿主中挂载的 `Plugin` 作者。Core 只提供挂载与 Fiber 生命周期；宿主负责构造插件实例与配置校验。
+面向在宿主中挂载的 `Plugin` 作者。Core 只提供挂载与 Fiber 生命周期；
+[`cordis-host`](host.md) 负责显式工厂注册、配置校验与 `Fiber::replace` 编排。
 
 ## 最小 Plugin
 
@@ -77,10 +78,35 @@ async fn main() -> Result<(), CoreError> {
 插件实例应持有已经由宿主校验完成的强类型、不可变配置。`cordis-core` 不接收 JSON、
 不执行 Schema 校验，也不提供 `update(config)`。
 
-```text
-宿主读取配置 → 插件 Schema 校验/反序列化 → 构造新实例 → fiber.replace(new_instance)
+进程内宿主通过显式 `ExtensionFactory` 构造实例：
+
+```rust
+use cordis_core::Plugin;
+use cordis_host::{ExtensionFactory, HostError};
+use std::sync::Arc;
+
+struct GreeterFactory;
+
+impl ExtensionFactory for GreeterFactory {
+    fn id(&self) -> &'static str {
+        "demo.greeter"
+    }
+
+    fn build(&self, config: &toml::Value) -> Result<Arc<dyn Plugin>, HostError> {
+        if config.get("name").and_then(|value| value.as_str()).is_none() {
+            return Err(HostError::invalid_config("name is required"));
+        }
+        Ok(Arc::new(Greeter))
+    }
+}
 ```
 
+```text
+Host 读取配置 → factory.build(&toml::Value) → 构造新实例 → fiber.replace(new_instance)
+```
+
+- `build` 必须无副作用；I/O 与任务只出现在 `Plugin::apply`。
+- 工厂由应用调用 `ExtensionCatalog::register` 显式登记，不使用自动注册宏。
 - 校验或反序列化失败时，宿主不得调用 `replace`；旧 Active 实例保持运行。
 - `replace` 开始后旧实例会被释放；新实例的 `apply` 失败使 Fiber 进入 `Failed`，不会自动回滚旧实例。
 - 不得修改已挂载实例的内部配置后调用 `restart()`；`restart()` 仅用于配置未变的重新执行。
@@ -102,5 +128,5 @@ async fn main() -> Result<(), CoreError> {
 ## 禁止事项
 
 - 不要依赖宿主 AppState / HTTP / DB / Redis / 配置文件。
-- 不要实现 Manifest、Loader/HMR、JSON Schema——属宿主层。
+- 不要实现 Manifest、Loader/HMR——属宿主层。插件配置 Schema 由对应 `ExtensionFactory::build` 校验。
 - `intercept` 仅派生配置（`ConfigKey`），不可替代 `provide` / Service。

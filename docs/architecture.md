@@ -5,10 +5,11 @@
 | 层 | 职责 | 本仓库位置 |
 | --- | --- | --- |
 | **Runtime 内核** | Context、Service、inject、Isolation、Fiber、Effect、Event、诊断 | `crates/cordis-core` |
-| **宿主** | 组装 Runtime、构造插件对象、接入网络/配置/持久化 | 应用仓库（例如网关） |
+| **宿主** | 组装 Runtime、显式工厂目录、严格配置与 reconcile | `crates/cordis-host`；应用再接入网络/持久化 |
 | **扩展** | 实现 `Plugin`，`provide` / `inject` / `on`，不触碰宿主内部类型 | 插件 crate |
 
 `cordis-core` **不包含** HTTP、数据库、Redis、JSON 配置、Manifest、WASM 或网关语义。
+`cordis-host` 首版只做进程内编排与文件配置源，不加载动态库、不提供管理后台。
 
 ## Bootstrap 配置边界
 
@@ -16,23 +17,34 @@
 `bootstrap.toml`。它是 Runtime 之外唯一不可由扩展自身替代的配置来源，目的是避免
 “配置扩展需要先读取自身配置”的启动循环。
 
-启动文件只能包含启动锚点：配置存储位置与类型、扩展包目录、信任公钥位置、基础日志
-设置，以及密钥的环境变量或外部引用；不得承载应用、路由、策略或任意插件业务配置，
+启动文件只能包含已实现的启动锚点，不得承载应用、路由、策略或任意插件业务配置，
 也不得保存凭证明文。
+
+当前 `cordis-host` 实现的锚点只有文件配置源：
+
+```toml
+version = 1
+
+[config]
+driver = "file"
+path = "extensions.toml"
+```
 
 ```text
 bootstrap.toml
-  → 宿主创建 Runtime 并挂载配置存储扩展
-  → 配置扩展读取运行期主配置
-  → 宿主校验配置、构造不可变 Plugin 实例
+  → 宿主读取文件配置源
+  → 校验 extensions.toml、经 ExtensionFactory 构造不可变 Plugin 实例
   → 挂载或 replace 已启用扩展
 ```
 
-- 单机一体化部署可用本地 SQLite 作为运行期主配置存储。
-- 多节点部署必须使用 PostgreSQL 等网络数据库；禁止将 SQLite 放在 NFS、SMB 或其他
-  网络文件系统上作为共享配置库。
-- SQLite/PostgreSQL 配置存储、文件热更新和配置发布均是宿主或扩展能力，不进入
-  `cordis-core`。
+- 相对 `path` 相对于 `bootstrap.toml` 所在目录解析；重新加载只能显式 `reload()`。
+- 扩展包目录、信任公钥、基础日志、SQLite/PostgreSQL 配置存储和文件热更新仍是未来
+  宿主或扩展能力，不进入 `cordis-core`。首版 Host 遇到这些字段会因
+  `deny_unknown_fields` 直接失败。
+- 多节点部署若改用网络数据库，禁止将 SQLite 放在 NFS、SMB 或其他网络文件系统上作为
+  共享配置库。
+
+详见 [Host 编排](host.md)。
 
 ## Runtime 与 Tokio
 

@@ -1,0 +1,144 @@
+# cordis-host
+
+进程内扩展宿主：显式工厂目录、严格文件配置与 reconcile。
+
+`cordis-core` 只负责 Plugin、Fiber、Service、Effect 与生命周期。`cordis-host` 负责创建
+Runtime、读取配置、构造不可变插件实例，并按配置差异挂载 / 替换 / 卸载。
+
+首版不加载动态库，不提供管理后台或业务协议。
+
+## 启动链
+
+```text
+应用入口
+  → 读取 bootstrap.toml
+  → 创建 ExtensionCatalog
+  → 创建 CordisHost / Runtime
+  → 读取 extensions.toml
+  → 全量校验并构造插件
+  → reconcile：挂载 / replace / 卸载
+  → diagnostics
+  → shutdown
+```
+
+相对路径相对于 `bootstrap.toml` 所在目录解析。重新加载只能由显式 `reload()` 触发。
+
+## 身份
+
+Host 区分三个身份，Core 只认最后一个：
+
+| 身份 | 含义 | 例子 |
+| --- | --- | --- |
+| `factory` | 插件类型 | `postgres.connector` |
+| `instance` | 配置实例（Host 主键） | `primary-database` |
+| `PluginKey` | 构造后由 `Plugin::key()` 给出的运行时身份 | 常与 factory 相同 |
+
+同一 factory 的多个 instance 通常共享 `PluginKey`。卸载单个 instance 使用
+`Fiber::dispose_wait`，不会调用 `Runtime::unmount(key)`（后者会拆掉该 Key 下全部 Fiber）。
+
+## 显式工厂
+
+```rust
+pub trait ExtensionFactory: Send + Sync {
+    fn id(&self) -> &'static str;
+
+    fn build(
+        &self,
+        config: &toml::Value,
+    ) -> Result<Arc<dyn Plugin>, HostError>;
+}
+```
+
+- 通过 `ExtensionCatalog::register` 显式登记；重复 `id` 失败且不覆盖。
+- 不使用自动注册宏或 `inventory`。
+- `build` 必须无副作用（禁止 I/O / spawn）；副作用只属于 `Plugin::apply`。
+
+## 配置合同
+
+全部结构 `deny_unknown_fields`。必填字段缺失直接失败；禁止默认值掩盖配置错误。
+
+`bootstrap.toml` 只保留已实现的启动锚点：
+
+```toml
+version = 1
+
+[config]
+driver = "file"
+path = "extensions.toml"
+```
+
+- `version` 必须为 `1`
+- `driver` 仅接受 `file`
+- `path` 相对 bootstrap 文件目录解析
+
+运行配置：
+
+```toml
+version = 1
+
+[[extensions]]
+instance = "primary-database"
+factory = "postgres.connector"
+enabled = true
+
+[extensions.config]
+url_env = "DATABASE_URL"
+max_connections = 20
+```
+
+规则：
+
+- `extensions` 字段必填；缺少该字段解析失败，不得默认为空数组
+- 有意清空全部实例时必须显式写 `extensions = []`
+- `instance` / `factory` / `enabled` 必填；`enabled` 无默认
+- `config` 缺省视为空表，由 factory 决定字段是否必填
+- `instance` 必须唯一
+- `factory` 必须已注册（含 `enabled = false` 的条目）
+- 整份配置及全部新增 / 变更插件必须预构造成功，之后才能进入变更阶段
+- 同一 `instance` 不允许更换 `factory`
+- 同一 `instance` 预构造后的 `PluginKey` 若与已挂载 Fiber 不同，视为预检失败
+
+## Reconcile
+
+固定顺序：
+
+1. 解析并验证完整目标配置
+2. 计算 unchanged / remove / replace / add
+3. 构造全部新增和变更插件
+4. 逆序卸载已删除实例（`dispose_wait`）
+5. 对同实例、同 `PluginKey` 执行 `Fiber::replace`
+6. 按配置顺序挂载新增实例
+7. `Runtime::settle`
+8. 生成结果快照
+
+编排由独立于 `apply()` / `reload()` 调用者 Future 的协调器执行：调用方取消只取消等待，
+不中断收敛；Host 的 `instances` / `order` / `config` 在每步完成后提交。同一时刻只允许
+一个 reconcile；并发 `apply` / `reload` 返回 `ReconcileBusy`。`shutdown()` 会先等待在途
+reconcile 收敛，再关闭 Runtime。
+
+约束：
+
+- 预检失败：零修改
+- 生命周期操作失败：立即返回明确错误
+- 不自动回滚旧版本
+- 不自动重试
+- 相同配置 `reload` 不触发 restart / replace
+- `enabled = false` 或从文件中删除：卸载并等待 async disposer
+- `replace` / 首次挂载后 Fiber 进入 `Failed`：视为已提交，旧实例不恢复
+- 缺依赖插件保持 `Pending`，依赖出现后由 Core 调度为 `Active`
+
+## 诊断
+
+`HostSnapshot` 将 `InstanceId`、`factory`、`PluginKey`、Fiber ID 与 `FiberState` 关联起来，
+并嵌入 `Runtime::diagnostics()`。
+
+## 暂不实现
+
+- 原生动态库加载
+- WASM / 子进程插件
+- 扩展包签名和信任公钥
+- SQLite / PostgreSQL 配置源
+- 文件监听和自动热更新
+- HTTP 管理接口
+- Plugin 宏
+- 自动恢复、回滚和兼容配置

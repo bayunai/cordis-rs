@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/cordis-core", "crates/cordis-testkit"]
+members = ["crates/cordis-core", "crates/cordis-host", "crates/cordis-testkit"]
 default-members = ["crates/cordis-core"]
 
 [workspace.package]
@@ -13,6 +13,7 @@ license = "MIT OR Apache-2.0"
 async-trait = "0.1"
 axum = "0.8"
 cordis-core = { path = "crates/cordis-core" }
+cordis-host = { path = "crates/cordis-host" }
 cordis-testkit = { path = "crates/cordis-testkit" }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
@@ -20,4 +21,5 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt", "sync"] }
+toml = { version = "0.8", features = ["parse"] }
 tokio-util = { version = "0.7", features = ["rt"] }

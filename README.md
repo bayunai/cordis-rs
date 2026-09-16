@@ -2,22 +2,26 @@
 
 最小 Cordis 风格 Runtime：**Context / Service / inject / Effect / Plugin / Event / Diagnostics**。
 
-不含 HTTP、数据库、缓存、JSON、扩展包加载或网关概念。宿主应用自行组装这些能力。
+不含 HTTP、数据库、缓存、JSON、扩展包加载或网关概念。进程内编排与文件配置由
+[`cordis-host`](crates/cordis-host) 承担。
 
 ## 包结构
 
 | Crate | 用途 |
 | --- | --- |
 | [`crates/cordis-core`](crates/cordis-core) | 生产可用的 Runtime 内核 |
+| [`crates/cordis-host`](crates/cordis-host) | 进程内宿主：显式工厂目录、文件配置与 reconcile |
 | [`crates/cordis-testkit`](crates/cordis-testkit) | 测试辅助（`TestPlugin`、`wait_injection`、事件记录） |
 
 文档：
 
 - [架构与边界](docs/architecture.md)
+- [Host 编排](docs/host.md)
 - [扩展编写指南](docs/extension-authoring.md)
 
-启动约束：宿主从本地 `bootstrap.toml` 读取配置存储与扩展目录等最小启动锚点；SQLite
-或 PostgreSQL 中的运行期主配置由配置扩展读取。详见[Bootstrap 配置边界](docs/architecture.md#bootstrap-配置边界)。
+启动约束：宿主从本地 `bootstrap.toml` 读取 `file` 配置源路径，再校验并编排
+`extensions.toml`。SQLite / PostgreSQL 配置存储与文件热更新尚未实现。详见
+[Bootstrap 配置边界](docs/architecture.md#bootstrap-配置边界) 与 [Host 编排](docs/host.md)。
 
 ## 快速开始
 
