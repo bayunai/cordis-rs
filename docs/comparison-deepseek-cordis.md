@@ -58,14 +58,14 @@ vendor/
 | --- | --- | --- | --- |
 | Proxy + Reflect | `reflect.ts`：`ctx.foo` 穿透、`mixin` / `accessor`、`internal/get\|set` | 无；显式 `get` / `provide` | **不进核心**（刻意） |
 | 内置 Logger | `logger.ts` 整模块 | 无 | 宿主或扩展接 tracing/log |
-| Service 基类 | `service.ts`：自动 provide、`check`、`invoke` | 仅 `ServiceKey` / `Services` | 扩展层按需封装 |
-| 多形态 Plugin | fn / class / `{apply}`；`@Inject`；`Config` StandardSchema | 单一 `Plugin` trait + `PluginKey` | 可选宏只生成样板 |
+| Service 基类 | `service.ts`：构造时自动 provide、可选 `check`、可调用 Service | `ServiceKey` / `Services` + `provide_checked` / `ProviderHandle` | 不进 Core；扩展层有重复样板后再封装 |
+| 多形态 Plugin | fn / class / `{apply}`；`@Inject`；`Config` StandardSchema | 单一 `Plugin` trait + `PluginKey` | 当前不做宏；待真实插件重复样板稳定后，宏只生成 key / inject |
 | `fiber.update(config)` | 校验后 restart + `internal/update` | 无；宿主校验后 **`Fiber::replace`** | 保持现状 |
-| 事件 `bail` | 同步短路 | 无 | 有需求再评估 |
-| provide 的 `check` 谓词 | 实现「有了但不就绪」 | 只有解析到 / 解析不到 | 语义缺口，可评估 |
-| `get(strict)` | strict 时要求提供方 Fiber 为 ACTIVE | `get` 解析到即返回 | 行为略松 |
+| 事件 `bail` | 同步短路：首个非 `null` / `false` / `undefined` 结果获胜 | 未提供；现有 `serial()` 已提供异步逐个等待、`Some` 短路的等价主路径 | **预留槽位，不实现**；仅出现“必须在同步函数中做首个结果选择”的真实场景时再增加 |
+| provide 的 `check` 谓词 | `check` 在 Fiber 依赖刷新时决定是否可注入 | `provide_checked` + `ProviderHandle::refresh`；支持 Ready / Unavailable | Rust 的就绪语义更统一、显式 |
+| `get(strict)` | `get(name)` 只检查 Provider Fiber 为 ACTIVE；`get(name, false)` 绕过该检查，且不运行 `check` | 公开 `get(key)` 同时要求 Fiber Active 与 Provider Ready；无公开旁路读取 | 刻意收紧，诊断走元数据而非服务实例 |
 | Generator effect | yield 多个 disposer | `on_dispose` / `on_dispose_async` / `spawn` | 手写即可 |
-| Fiber thenable | `await fiber` | `settle` / 显式句柄 | API 风格差异 |
+| Fiber thenable | `await fiber` 等待当前 inertia，不保证依赖最终出现 | `plugin().await`、`restart/replace/dispose_wait().await`、`Runtime::settle()` | API 风格差异；暂不实现 `IntoFuture` |
 
 ### 2.3 Rust 有、TS 核心更弱或没有
 
@@ -90,19 +90,19 @@ vendor/
 **inject（AND）**
 
 - **TS**：`Inject.resolve` → `fiber.inject`；`notify` → `_checkImpl`（strict：提供方须 ACTIVE，可选 `impl.check`）→ `_refresh` 拼 epoch（依赖方 fiber.uid）；缺任一 → `INACTIVE` → unload。
-- **Rust**：`Plugin::inject() -> Vec<ServiceId>`；`mark_dirty` → scheduler；就绪 = `provider_ids.len() == deps.len()`；Active 时 provider id 集合变化 → unload → Pending → 再激活。
+- **Rust**：`Plugin::inject() -> Vec<ServiceId>`；`mark_dirty` → scheduler；就绪 = 每个依赖均解析到 **Ready** Provider；Provider ID 或可用性 revision 变化都会触发 Active → unload → Pending → 再激活。
 
-两边都**没有 AnyOf / OR**。可选依赖用 `get`，不写进 `inject`。数据库等多后端场景用 facade 插件（如 DbPlugin）`get` 选后端再 `provide(DATABASE)`。
+两边都**没有 AnyOf / OR**。可选依赖不可写入 `inject`；未来数据库等多后端场景需要专用 facade / 选择器扩展自行处理状态变化，不能把 MySQL 与 PostgreSQL 同时写入 `inject` 并期待 OR 语义。
 
 **get**
 
-- **TS**：`reflect.get(name, strict=true)`，不入依赖图；未就绪返回 `undefined`。
-- **Rust**：`Context::get(key)`，不入依赖图；解析不到 → `ServiceUnavailable`。不强制提供方 Fiber 为 Active。
+- **TS**：`reflect.get(name, strict=true)`，不入依赖图；只要求提供方 Fiber `ACTIVE`，不执行 `impl.check`。`reflect.get(name, false)` 仅绕过 Active 检查，主要供 Reflect 内部使用。
+- **Rust**：`Context::get(key)`，不入依赖图；只有提供方 Fiber `Active` 且 Provider `Ready` 才返回，否则为 `ServiceUnavailable`。Core 不公开 raw / non-strict 读取；诊断读取 Provider 元数据，不读取服务载荷。
 
 **provide**
 
 - **TS**：包在 `fiber.effect`；写入 `reflect.store[isolateKey]`；ACTIVE 时 `notify`；dispose 删 store 并 `await` 下游 Fiber。
-- **Rust**：`Registry::provide` 挂在 EffectScope；`on_dispose` → `remove_provider` → `mark_dirty`；由 scheduler 驱动下游，不在 provide disposer 里直接 await 依赖方。
+- **Rust**：`Registry::provide` 挂在 EffectScope；`provide_checked` 会保存无阻塞状态检查，并由 `ProviderHandle::refresh()` 在健康状态变化时标脏；`on_dispose` → `remove_provider` → `mark_dirty`。下游由 scheduler 驱动，不在 disposer 内直接 await 依赖方。
 
 ### 3.2 Fiber 生命周期
 
@@ -117,7 +117,7 @@ vendor/
 
 | 主题 | TS | Rust |
 | --- | --- | --- |
-| 事件模式 | 同一 name，调用方选 dispatch；另有 `bail` | 模式分 Key（`EventKey` / `WaterfallKey` / …），无 bail |
+| 事件模式 | 同一 name，调用方选 dispatch；`serial` 为异步短路，另有同步 `bail` | 模式分 Key（`EventKey` / `WaterfallKey` / `SerialKey` / …）；`serial` 为异步短路；同步 `bail` 仅预留 |
 | 过滤 | thisArg + `Context.filter`；内置 `internal/*` | `ListenOptions::filter`；无内置框架事件集 |
 | 配置 | `intercept(serviceName, config)` 进服务 `resolveConfig` | `intercept(ConfigKey<T>, T)` + 祖先链 `config(key)` |
 | 隔离 | `isolate(name, label?: symbol)` | `isolate(key)` / `isolate_with(key, label)` + Runtime 令牌 |
@@ -126,7 +126,7 @@ vendor/
 
 | 主题 | TS | Rust |
 | --- | --- | --- |
-| Context | Proxy；mixin `events`/`logger`/`reflect`/`registry`；每 ctx 绑 `fiber` | 显式方法；Context **不可 dispose**，资源归 Runtime / Effect / Fiber |
+| Context | Proxy；mixin `events`/`logger`/`reflect`/`registry`；每 ctx 绑 `fiber`；Reflect 内部可 non-strict 读取 | 显式方法；Context **不可 dispose**，资源归 Runtime / Effect / Fiber；公开读取始终严格 |
 | Plugin | 多形态 + 可选 schema + inject map | `async apply` + `inject() -> Vec<ServiceId>` + `PluginKey` |
 | Effect | `fiber.effect(execute, label)` 收集 disposer | `effect()` → `EffectContext`；`on_dispose` / `on_dispose_async` / `spawn`；`dispose_wait` |
 | Fiber | `restart` / `update`；无 `replace` | `restart` / **`replace`**；`dispose` / `dispose_wait` |
@@ -137,30 +137,16 @@ vendor/
 
 无同机压测数据；按下表理解相对成本。
 
-### 4.1 Rust 相对更省 / 更可控
+### 4.1 可确认的结构差异
 
-1. **无 Proxy**：TS 每次 `ctx.xxx` 走 Reflect trap + isolate 链；Rust 显式 `get`/`provide`。
-2. **类型化 HashMap 解析**：TS 为 string + Symbol；Rust 为 `ProviderKey` + `ServiceId`，少字符串比较，类型冲突提前拦。
-3. **脏标记批处理**：TS 同步 `notify` 扫全部 fiber，可能立刻 unload/reload；Rust `mark_dirty` → 单一 scheduler 取批，突发变更可合并。
-4. **真并行**：TS 绑 Node 单线程；Rust 业务可在 Tokio 上并行（核心 scheduler 仍串行重算以保证正确性）。
+1. **TS Proxy 与 Rust 显式调用**：TS 服务读取可经过 Proxy / Reflect；Rust 必经类型化 `get` 与 Registry 锁。两者谁更快不能只由“有无 Proxy”判断。
+2. **TS 同步 notify 与 Rust 脏标记批处理**：TS 变更时同步扫描相关 Fiber；Rust 通过单一 scheduler 合并变化后重算。后者更利于控制抖动期的生命周期顺序。
+3. **并发模型不同**：TS 通常运行于 Node 事件循环；Rust 插件业务可在 Tokio 上并行，但 Core scheduler 为保证确定性仍串行。
+4. **资源成本不同**：Rust 有 `Mutex`、`Arc` 与 async 协调成本；TS 有 Proxy、动态属性与字符串 / Symbol 解析成本。
 
-### 4.2 TS 相对更轻的地方
+### 4.2 基准原则
 
-1. **无锁单线程**：Rust Registry / Fiber 状态需 `Mutex`；极高频 provide/get 时锁是额外成本。
-2. **同步激活延迟**：TS 同线程 `_reload`；Rust 经 async `apply` + 协调器，单次挂载调度延迟通常更高（微秒～毫秒级，一般不是吞吐数量级差距）。
-3. **`Arc` 克隆**：Rust 服务以 `Arc<T>` 共享。
-
-### 4.3 场景对照
-
-| 场景 | 相对更优 |
-| --- | --- |
-| 极高频读服务（类 `ctx.prop`） | Rust（无 Proxy） |
-| 单线程、插件少、变更少 | TS（无锁、同步刷新） |
-| 大量插件同时上下线 / 依赖抖动 | Rust（dirty 批处理） |
-| CPU 密集业务挂在插件里 | Rust（真并行） |
-| 嵌入长期运行的网关进程 | Rust（shutdown / 诊断 / 类型边界） |
-
-就绪判定两边都是约 O(依赖数 × 解析深度)；Rust 多一次锁内快照。真正瓶颈通常在插件业务 I/O，不在核心 HashMap/锁。若要量化，可对 `provide` 风暴、`get` 热路径、`plugin` 挂卸载做微基准。
+没有同机 benchmark 前，不宣称任一实现“热路径更快”。真正瓶颈通常是插件业务 I/O。若需量化，应分别测量 `get` 热路径、Provider 状态翻转、批量挂卸载和依赖抖动下的收敛时间。
 
 ---
 
@@ -176,9 +162,9 @@ vendor/
 
 ### 值得评估的薄语义缺口
 
-1. `provide` 可选 `check`（或等价「可见但不就绪」）
-2. 事件 `bail`（若确有同步短路需求）
-3. 可选 `cordis-macros`：只生成 `PluginKey` / `inject` / `ServiceKey` 样板，**不**把 Fiber/scheduler 宏化
+1. 同步事件 `bail`（**已预留，暂不实现**）：现有 `serial()` 已覆盖异步“首个结果获胜”。仅在同步函数中必须完成首个结果选择时，新增独立 `BailKey` / `bail()`；不得用它替代异步插件、生命周期或服务依赖处理。
+2. `AnyOf` / 替代依赖表达式（需要独立设计，不把多个候选直接塞进 `Plugin::inject()`）
+3. 可选 `cordis-macros`：仅在多个真实插件出现稳定重复样板后生成 `PluginKey` / `inject` / `ServiceKey`，**不**把 Fiber、scheduler、配置或健康检查宏化
 
 ### 跨项目复用方式
 
@@ -188,10 +174,10 @@ cordis-macros        ← 可选糖：声明样板
 宿主 / 扩展          ← loader、日志、HMR、业务插件
 ```
 
-核心以 crate 复用；宏只减轻样板。热插拔就绪语义必须留在库里。
+核心以 crate 复用；宏只减轻已稳定的样板。热插拔、Provider 就绪语义与依赖重算必须留在库里。
 
 ---
 
 ## 6. 一句话
 
-概念层（Context 树、isolate/intercept、provide/get/inject、Plugin Fiber、事件多模式、Effect 清理）对齐；TS 强在 Proxy/Reflect/Logger/多形态插件与 `update(config)`；Rust 强在显式 Runtime、类型化 Key、`replace`、隔离令牌、结构化 diagnostics 与 async 协调关闭。效率上无结构性「慢一个数量级」问题；抖动场景 Rust 批调度更稳，单线程微操作 TS 更轻。
+概念层（Context 树、isolate/intercept、provide/get/inject、Plugin Fiber、事件多模式、Effect 清理）对齐。TS 强在 Proxy / Reflect、Logger、多形态插件与 `update(config)`；Rust 强在显式 Runtime、类型化 Key、`replace`、隔离令牌、结构化 diagnostics、Provider Ready 语义与 async 协调关闭。性能结论必须以同机基准为准，不能只凭抽象结构下定论。

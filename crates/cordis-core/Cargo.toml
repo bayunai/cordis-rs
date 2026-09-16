@@ -16,6 +16,7 @@ tokio-util.workspace = true
 [dev-dependencies]
 axum.workspace = true
 cordis-testkit.workspace = true
+criterion = { version = "0.5", features = ["async_tokio"] }
 reqwest.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
@@ -36,3 +37,11 @@ path = "../../examples/plugin_web.rs"
 [[example]]
 name = "plugin_stack"
 path = "../../examples/plugin_stack/main.rs"
+
+[[bench]]
+name = "core_hot_paths"
+harness = false
+
+[[bench]]
+name = "contention_tail"
+harness = false
