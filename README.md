@@ -67,7 +67,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 运行示例：
 
 ```bash
-cd backend-cordis
+cd cordis-rs
 cargo run -p cordis-core --example reactive
 ```
 
@@ -91,7 +91,7 @@ cargo run -p cordis-core --example reactive
 ## 开发验证
 
 ```bash
-cd backend-cordis
+cd cordis-rs
 cargo fmt --check
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
