@@ -185,7 +185,7 @@ impl FiberInner {
             let result = match worker.await {
                 Ok(result) => result,
                 Err(error) => {
-                    fiber.converge_after_coordinator_abort();
+                    fiber.converge_after_coordinator_abort().await;
                     Err(CoreError::CoordinatorAborted {
                         reason: format!("lifecycle worker: {error}"),
                     })
@@ -198,15 +198,26 @@ impl FiberInner {
         Ok(completion)
     }
 
-    fn converge_after_coordinator_abort(&self) {
+    /// worker 被取消后必须先收敛它可能遗留的 Scope；对外错误仍由调用方保持
+    /// `CoordinatorAborted`，不能让取消留下可见 Provider 或 Releasing 所有权。
+    async fn converge_after_coordinator_abort(&self) {
         if self.disposed.load(Ordering::Acquire) {
             return;
         }
         let state = *self.state.lock().expect("state");
-        if matches!(
-            state,
-            crate::fiber::FiberState::Loading | crate::fiber::FiberState::Unloading
-        ) {
+        match state {
+            crate::fiber::FiberState::Loading => {
+                self.abandon_loading_to_pending(None, false);
+            }
+            crate::fiber::FiberState::Unloading => {
+                // `dispose_wait()` 已经开始时，重新取得同一轮 Completion 并等待它。
+                // 若 disposer 失败，`unload_effect_to_pending()` 会记录诊断错误；本轮
+                // 生命周期仍保持 CoordinatorAborted 的公共错误语义。
+                let _ = self.unload_effect_to_pending().await;
+            }
+            _ => {}
+        }
+        if !self.disposed.load(Ordering::Acquire) {
             let _ = self.transition_if_alive(crate::fiber::FiberState::Failed);
         }
     }
@@ -328,7 +339,40 @@ impl FiberInner {
 #[cfg(test)]
 mod lifecycle_completion_tests {
     use super::*;
-    use std::time::Duration;
+    use crate::{
+        Context, Runtime, ServiceKey,
+        fiber::{EffectOwnership, FiberState, ownership::FiberRelease},
+        plugin::{Plugin, PluginKey},
+    };
+    use async_trait::async_trait;
+    use std::{
+        sync::{Arc, Mutex},
+        time::Duration,
+    };
+
+    static WORKER_ABORT_SERVICE: ServiceKey<u64> =
+        ServiceKey::new("test.coordinator-abort-service@1");
+
+    struct NoopPlugin;
+
+    #[async_trait]
+    impl Plugin for NoopPlugin {
+        fn key(&self) -> PluginKey {
+            PluginKey::new("test.coordinator-abort")
+        }
+
+        async fn apply(&self, _ctx: &Context) -> Result<(), CoreError> {
+            Ok(())
+        }
+    }
+
+    async fn mounted_fiber(runtime: &Runtime) -> crate::Fiber {
+        runtime
+            .root()
+            .plugin(Arc::new(NoopPlugin))
+            .await
+            .expect("mount noop plugin")
+    }
 
     #[tokio::test]
     async fn lifecycle_completion_multi_waiter_observes_finish_without_timeout() {
@@ -380,6 +424,127 @@ mod lifecycle_completion_tests {
             .await
             .expect("late waiter")
             .expect_err("same aborted result");
+    }
+
+    #[tokio::test]
+    async fn worker_abort_from_loading_releases_activating_scope_and_provider() {
+        let runtime = Runtime::new().expect("runtime");
+        let root = runtime.root();
+        let mut fiber = mounted_fiber(&runtime).await;
+        let inner = fiber.inner.clone();
+        inner
+            .unload_effect_to_pending()
+            .await
+            .expect("clear mounted effect");
+
+        let scope = inner.parent_scope.child_named("worker-abort-loading");
+        let effect_id = scope.id();
+        let context = inner.context.with_scope(scope.clone());
+        let registry = inner.registry.upgrade().expect("registry");
+        registry.register_effect(
+            effect_id,
+            scope.name().to_string(),
+            scope.parent_id(),
+            Some(inner.context.clone()),
+            Some(inner.id),
+            &scope,
+        );
+        context
+            .provide(WORKER_ABORT_SERVICE, 7_u64)
+            .expect("provide from activating scope");
+        *inner.ownership.lock().expect("ownership") = EffectOwnership::Activating(scope.clone());
+        inner.transition_if_alive(FiberState::Loading);
+
+        inner.converge_after_coordinator_abort().await;
+
+        assert_eq!(fiber.state(), FiberState::Failed);
+        assert!(scope.is_disposed());
+        assert!(matches!(
+            *inner.ownership.lock().expect("ownership"),
+            EffectOwnership::Empty
+        ));
+        assert!(root.get(WORKER_ABORT_SERVICE).is_err());
+        let snapshot = runtime.diagnostics();
+        assert!(
+            snapshot
+                .providers
+                .iter()
+                .all(|provider| provider.service != WORKER_ABORT_SERVICE.id().as_str())
+        );
+        assert!(snapshot.effects.iter().all(|effect| effect.id != effect_id));
+
+        fiber.dispose_wait().await.expect("dispose fiber");
+        runtime.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn worker_abort_from_unloading_waits_for_release_and_clears_ownership() {
+        let runtime = Runtime::new().expect("runtime");
+        let mut fiber = mounted_fiber(&runtime).await;
+        let inner = fiber.inner.clone();
+        inner
+            .unload_effect_to_pending()
+            .await
+            .expect("clear mounted effect");
+
+        let scope = inner.parent_scope.child_named("worker-abort-unloading");
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let release_rx = Arc::new(Mutex::new(Some(release_rx)));
+        scope
+            .on_dispose_async({
+                let release_rx = release_rx.clone();
+                move || async move {
+                    let _ = entered_tx.send(());
+                    let receiver = release_rx.lock().expect("release receiver").take();
+                    if let Some(receiver) = receiver {
+                        let _ = receiver.await;
+                    }
+                    Err(CoreError::PluginApply(
+                        "worker-abort disposer failed".into(),
+                    ))
+                }
+            })
+            .expect("register disposer");
+        *inner.ownership.lock().expect("ownership") = EffectOwnership::Releasing(FiberRelease {
+            scope: scope.clone(),
+            dispose_started: true,
+        });
+        inner.transition_if_alive(FiberState::Unloading);
+        scope.dispose();
+
+        let mut converge = Box::pin(tokio::spawn({
+            let inner = inner.clone();
+            async move { inner.converge_after_coordinator_abort().await }
+        }));
+        entered_rx.await.expect("disposer entered");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut converge)
+                .await
+                .is_err(),
+            "worker abort recovery must wait for the existing release"
+        );
+        let _ = release_tx.send(());
+        converge.await.expect("recovery join");
+
+        assert_eq!(fiber.state(), FiberState::Failed);
+        assert!(matches!(
+            *inner.ownership.lock().expect("ownership"),
+            EffectOwnership::Empty
+        ));
+        assert!(
+            fiber
+                .last_error()
+                .is_some_and(|error| error.contains("worker-abort disposer failed")),
+            "dispose error must remain visible in diagnostics"
+        );
+
+        fiber.dispose_wait().await.expect("dispose fiber");
+        let shutdown_error = runtime
+            .shutdown()
+            .await
+            .expect_err("shutdown dispose error");
+        assert!(matches!(shutdown_error, CoreError::DisposeFailed { .. }));
     }
 
     struct LifecycleFinishGuardForTest {

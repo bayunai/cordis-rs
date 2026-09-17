@@ -93,7 +93,11 @@ impl FiberInner {
         Ok(scope)
     }
 
-    fn abandon_loading_to_pending(&self, effect_scope: Option<&EffectScope>, mark_dirty: bool) {
+    pub(crate) fn abandon_loading_to_pending(
+        &self,
+        effect_scope: Option<&EffectScope>,
+        mark_dirty: bool,
+    ) {
         if let Some(scope) = effect_scope {
             scope.dispose();
         }
