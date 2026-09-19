@@ -1,7 +1,7 @@
 # 扩展编写指南
 
 面向在宿主中挂载的 `Plugin` 作者。Core 只提供挂载与 Fiber 生命周期；
-[`cordis-host`](host.md) 负责显式工厂注册、配置校验与 `Fiber::replace` 编排。
+[`cordis-loader`](host.md) 负责显式工厂注册、配置校验与 `Fiber::replace` 编排。
 
 ## 最小 Plugin
 
@@ -82,31 +82,39 @@ async fn main() -> Result<(), CoreError> {
 
 ```rust
 use cordis_core::Plugin;
-use cordis_host::{ExtensionFactory, HostError};
+use cordis_loader::{ExtensionFactory, LoaderError};
+use serde::Deserialize;
+use schemars::JsonSchema;
 use std::sync::Arc;
 
 struct GreeterFactory;
 
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct GreeterConfig {
+    name: String,
+}
+
 impl ExtensionFactory for GreeterFactory {
+    type Config = GreeterConfig;
+
     fn id(&self) -> &'static str {
         "demo.greeter"
     }
 
-    fn build(&self, config: &toml::Value) -> Result<Arc<dyn Plugin>, HostError> {
-        if config.get("name").and_then(|value| value.as_str()).is_none() {
-            return Err(HostError::invalid_config("name is required"));
-        }
-        Ok(Arc::new(Greeter))
+    fn build(&self, config: GreeterConfig) -> Result<Arc<dyn Plugin>, LoaderError> {
+        Ok(Arc::new(Greeter { name: config.name }))
     }
 }
 ```
 
 ```text
-Host 读取配置 → factory.build(&toml::Value) → 构造新实例 → fiber.replace(new_instance)
+Loader 读取配置 → 反序列化为 `Factory::Config` → factory.build(config) → 构造新实例 → fiber.replace(new_instance)
 ```
 
 - `build` 必须无副作用；I/O 与任务只出现在 `Plugin::apply`。
-- 工厂由应用调用 `ExtensionCatalog::register` 显式登记，不使用自动注册宏。
+- 工厂由应用调用 `ExtensionCatalog::register` 显式登记，不使用自动注册宏。`JsonSchema` 会被
+  `Loader` 公开给管理界面生成配置表单。
 - 校验或反序列化失败时，宿主不得调用 `replace`；旧 Active 实例保持运行。
 - `replace` 开始后旧实例会被释放；新实例的 `apply` 失败使 Fiber 进入 `Failed`，不会自动回滚旧实例。
 - 不得修改已挂载实例的内部配置后调用 `restart()`；`restart()` 仅用于配置未变的重新执行。
@@ -128,5 +136,5 @@ Host 读取配置 → factory.build(&toml::Value) → 构造新实例 → fiber.
 ## 禁止事项
 
 - 不要依赖宿主 AppState / HTTP / DB / Redis / 配置文件。
-- 不要实现 Manifest、Loader/HMR——属宿主层。插件配置 Schema 由对应 `ExtensionFactory::build` 校验。
+- 不要实现 Manifest、Loader/HMR——属 Loader 层。插件配置 Schema 由 Factory 的 `Config` 类型声明，并由 Loader 在调用 `build` 前校验。
 - `intercept` 仅派生配置（`ConfigKey`），不可替代 `provide` / Service。

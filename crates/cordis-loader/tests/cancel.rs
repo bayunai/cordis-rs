@@ -5,7 +5,7 @@ mod common;
 use common::*;
 
 use cordis_core::FiberState;
-use cordis_host::{CordisHost, HostError, toml};
+use cordis_loader::{CordisLoader, LoaderError, toml};
 use cordis_testkit::wait_until;
 use std::sync::atomic::Ordering;
 
@@ -15,15 +15,12 @@ async fn cancel_apply_during_replace_still_commits_new_config() {
     let factory = TestFactory::new("demo.value")
         .with_disposer(gate)
         .on_apply(|ctx, config| {
-            let value = config
-                .get("n")
-                .and_then(|item| item.as_integer())
-                .unwrap_or(0) as u32;
+            let value = config.get("n").and_then(|item| item.as_i64()).unwrap_or(0) as u32;
             ctx.provide(NUMBER, value)?;
             Ok(())
         });
     let applies = factory.applies();
-    let host = CordisHost::new(catalog_with(factory.into_arc())).unwrap();
+    let host = CordisLoader::new(catalog_with(factory)).unwrap();
     let initial = extensions(vec![
         enabled("db", "demo.value").with_config(table(&[("n", toml::Value::Integer(1))])),
     ]);
@@ -60,8 +57,8 @@ async fn cancel_apply_during_replace_still_commits_new_config() {
 #[tokio::test]
 async fn cancel_apply_during_remove_clears_instance_mapping() {
     let (gate, started_rx, release_tx) = DisposeGate::new();
-    let host = CordisHost::new(catalog_with(
-        TestFactory::new("demo.gate").with_disposer(gate).into_arc(),
+    let host = CordisLoader::new(catalog_with(
+        TestFactory::new("demo.gate").with_disposer(gate),
     ))
     .unwrap();
     host.apply(extensions(vec![enabled("db", "demo.gate")]))
@@ -85,8 +82,8 @@ async fn cancel_apply_during_remove_clears_instance_mapping() {
 #[tokio::test]
 async fn concurrent_apply_while_reconcile_returns_busy() {
     let (gate, started_rx, release_tx) = DisposeGate::new();
-    let host = CordisHost::new(catalog_with(
-        TestFactory::new("demo.gate").with_disposer(gate).into_arc(),
+    let host = CordisLoader::new(catalog_with(
+        TestFactory::new("demo.gate").with_disposer(gate),
     ))
     .unwrap();
     host.apply(extensions(vec![enabled("db", "demo.gate")]))
@@ -103,7 +100,7 @@ async fn concurrent_apply_while_reconcile_returns_busy() {
             .apply(extensions(vec![enabled("db", "demo.gate")]))
             .await
             .unwrap_err();
-        assert!(matches!(busy, HostError::ReconcileBusy));
+        assert!(matches!(busy, LoaderError::ReconcileBusy));
         release_tx.send(()).unwrap();
         pending.await.unwrap();
     }
@@ -114,8 +111,8 @@ async fn concurrent_apply_while_reconcile_returns_busy() {
 #[tokio::test]
 async fn shutdown_during_reconcile_converges_and_stops_scheduler() {
     let (gate, started_rx, release_tx) = DisposeGate::new();
-    let host = CordisHost::new(catalog_with(
-        TestFactory::new("demo.gate").with_disposer(gate).into_arc(),
+    let host = CordisLoader::new(catalog_with(
+        TestFactory::new("demo.gate").with_disposer(gate),
     ))
     .unwrap();
     host.apply(extensions(vec![enabled("db", "demo.gate")]))

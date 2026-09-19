@@ -5,14 +5,14 @@ mod common;
 use common::*;
 
 use cordis_core::FiberState;
-use cordis_host::{CordisHost, ExtensionCatalog, HostError, toml};
+use cordis_loader::{CordisLoader, ExtensionCatalog, LoaderError, toml};
 use std::sync::atomic::Ordering;
 
 #[tokio::test]
 async fn duplicate_instance_fails_before_mutation() {
     let factory = TestFactory::new("demo.noop");
     let applies = factory.applies();
-    let host = CordisHost::new(catalog_with(factory.into_arc())).unwrap();
+    let host = CordisLoader::new(catalog_with(factory)).unwrap();
     let error = host
         .apply(parse_extensions(
             r#"
@@ -29,7 +29,7 @@ enabled = true
         ))
         .await
         .unwrap_err();
-    assert!(matches!(error, HostError::DuplicateInstance { instance } if instance == "dup"));
+    assert!(matches!(error, LoaderError::DuplicateInstance { instance } if instance == "dup"));
     assert!(host.snapshot().instances.is_empty());
     assert_eq!(applies.load(Ordering::SeqCst), 0);
     host.shutdown().await.unwrap();
@@ -43,7 +43,7 @@ async fn plugin_build_error_does_not_touch_active_instance() {
     });
     let fail_build = factory.fail_build();
     let applies = factory.applies();
-    let host = CordisHost::new(catalog_with(factory.into_arc())).unwrap();
+    let host = CordisLoader::new(catalog_with(factory)).unwrap();
     host.apply(extensions(vec![enabled("db", "demo.value")]))
         .await
         .unwrap();
@@ -56,7 +56,7 @@ async fn plugin_build_error_does_not_touch_active_instance() {
         ]))
         .await
         .unwrap_err();
-    assert!(matches!(error, HostError::PluginBuild { .. }));
+    assert!(matches!(error, LoaderError::PluginBuild { .. }));
     assert_eq!(
         host.snapshot().instance("db").unwrap().state,
         FiberState::Active
@@ -71,7 +71,7 @@ async fn identical_reload_does_not_restart() {
     let factory = TestFactory::new("demo.noop");
     let builds = factory.builds();
     let applies = factory.applies();
-    let host = CordisHost::new(catalog_with(factory.into_arc())).unwrap();
+    let host = CordisLoader::new(catalog_with(factory)).unwrap();
     let config = extensions(vec![enabled("a", "demo.noop")]);
     host.apply(config.clone()).await.unwrap();
     assert_eq!(builds.load(Ordering::SeqCst), 1);
@@ -90,9 +90,9 @@ async fn config_change_replaces_only_that_instance() {
     let alpha_applies = alpha.applies();
     let beta_applies = beta.applies();
     let mut catalog = ExtensionCatalog::new();
-    catalog.register(alpha.into_arc()).unwrap();
-    catalog.register(beta.into_arc()).unwrap();
-    let host = CordisHost::new(catalog).unwrap();
+    catalog.register(alpha).unwrap();
+    catalog.register(beta).unwrap();
+    let host = CordisLoader::new(catalog).unwrap();
     host.apply(extensions(vec![
         enabled("a", "demo.alpha"),
         enabled("b", "demo.beta"),
@@ -116,13 +116,9 @@ async fn config_change_replaces_only_that_instance() {
 #[tokio::test]
 async fn factory_change_on_same_instance_is_rejected() {
     let mut catalog = ExtensionCatalog::new();
-    catalog
-        .register(TestFactory::new("demo.one").into_arc())
-        .unwrap();
-    catalog
-        .register(TestFactory::new("demo.two").into_arc())
-        .unwrap();
-    let host = CordisHost::new(catalog).unwrap();
+    catalog.register(TestFactory::new("demo.one")).unwrap();
+    catalog.register(TestFactory::new("demo.two")).unwrap();
+    let host = CordisLoader::new(catalog).unwrap();
     host.apply(extensions(vec![enabled("db", "demo.one")]))
         .await
         .unwrap();
@@ -132,7 +128,7 @@ async fn factory_change_on_same_instance_is_rejected() {
         .apply(extensions(vec![enabled("db", "demo.two")]))
         .await
         .unwrap_err();
-    assert!(matches!(error, HostError::FactoryChanged { .. }));
+    assert!(matches!(error, LoaderError::FactoryChanged { .. }));
     let snapshot = host.snapshot();
     let instance = snapshot.instance("db").unwrap();
     assert_eq!(instance.factory, "demo.one");
@@ -144,14 +140,16 @@ async fn factory_change_on_same_instance_is_rejected() {
 #[tokio::test]
 async fn plugin_key_change_on_replace_is_rejected() {
     struct DualKey;
-    impl cordis_host::ExtensionFactory for DualKey {
+    impl cordis_loader::ExtensionFactory for DualKey {
+        type Config = serde_json::Value;
+
         fn id(&self) -> &'static str {
             "demo.dual"
         }
         fn build(
             &self,
-            config: &toml::Value,
-        ) -> Result<std::sync::Arc<dyn cordis_core::Plugin>, HostError> {
+            config: serde_json::Value,
+        ) -> Result<std::sync::Arc<dyn cordis_core::Plugin>, LoaderError> {
             let alt = config.get("alt").and_then(|value| value.as_bool()) == Some(true);
             TestFactory::new("demo.dual")
                 .plugin_key(if alt {
@@ -164,8 +162,8 @@ async fn plugin_key_change_on_replace_is_rejected() {
     }
 
     let mut catalog = ExtensionCatalog::new();
-    catalog.register(std::sync::Arc::new(DualKey)).unwrap();
-    let host = CordisHost::new(catalog).unwrap();
+    catalog.register(DualKey).unwrap();
+    let host = CordisLoader::new(catalog).unwrap();
     host.apply(extensions(vec![enabled("db", "demo.dual")]))
         .await
         .unwrap();
@@ -180,7 +178,7 @@ async fn plugin_key_change_on_replace_is_rejected() {
         ]))
         .await
         .unwrap_err();
-    assert!(matches!(error, HostError::PluginKeyChanged { .. }));
+    assert!(matches!(error, LoaderError::PluginKeyChanged { .. }));
     assert_eq!(
         host.snapshot().instance("db").unwrap().state,
         FiberState::Active
@@ -195,8 +193,8 @@ async fn plugin_key_change_on_replace_is_rejected() {
 #[tokio::test]
 async fn removing_instance_waits_for_async_disposer() {
     let (gate, started_rx, release_tx) = DisposeGate::new();
-    let host = CordisHost::new(catalog_with(
-        TestFactory::new("demo.gate").with_disposer(gate).into_arc(),
+    let host = CordisLoader::new(catalog_with(
+        TestFactory::new("demo.gate").with_disposer(gate),
     ))
     .unwrap();
     host.apply(extensions(vec![enabled("db", "demo.gate")]))
@@ -235,12 +233,9 @@ factory = "demo.noop"
 enabled = true
 "#,
     );
-    let host = CordisHost::bootstrap(
-        catalog_with(TestFactory::new("demo.noop").into_arc()),
-        &bootstrap,
-    )
-    .await
-    .unwrap();
+    let host = CordisLoader::bootstrap(catalog_with(TestFactory::new("demo.noop")), &bootstrap)
+        .await
+        .unwrap();
     assert_eq!(host.snapshot().instances.len(), 1);
 
     std::fs::write(
@@ -258,8 +253,8 @@ extensions = []
 
 #[test]
 fn missing_extensions_field_fails_parse() {
-    let error = cordis_host::ExtensionsConfig::from_toml_str("version = 1\n").unwrap_err();
-    assert!(matches!(error, HostError::Toml { .. }));
+    let error = cordis_loader::ExtensionsConfig::from_toml_str("version = 1\n").unwrap_err();
+    assert!(matches!(error, LoaderError::Toml { .. }));
     assert!(error.to_string().contains("extensions"));
 }
 
@@ -282,12 +277,9 @@ factory = "demo.noop"
 enabled = true
 "#,
     );
-    let host = CordisHost::bootstrap(
-        catalog_with(TestFactory::new("demo.noop").into_arc()),
-        &bootstrap,
-    )
-    .await
-    .unwrap();
+    let host = CordisLoader::bootstrap(catalog_with(TestFactory::new("demo.noop")), &bootstrap)
+        .await
+        .unwrap();
     assert_eq!(
         host.snapshot().instance("a").unwrap().state,
         FiberState::Active
@@ -295,7 +287,7 @@ enabled = true
 
     std::fs::write(dir.path().join("extensions.toml"), "version = 1\n").unwrap();
     let error = host.reload().await.unwrap_err();
-    assert!(matches!(error, HostError::Toml { .. }));
+    assert!(matches!(error, LoaderError::Toml { .. }));
     assert_eq!(
         host.snapshot().instance("a").unwrap().state,
         FiberState::Active
@@ -305,7 +297,7 @@ enabled = true
 
 #[tokio::test]
 async fn unknown_extension_field_fails_parse() {
-    let error = cordis_host::ExtensionsConfig::from_toml_str(
+    let error = cordis_loader::ExtensionsConfig::from_toml_str(
         r#"
 version = 1
 [[extensions]]
@@ -316,6 +308,6 @@ extra = true
 "#,
     )
     .unwrap_err();
-    assert!(matches!(error, HostError::Toml { .. }));
+    assert!(matches!(error, LoaderError::Toml { .. }));
     assert!(error.to_string().contains("extra"));
 }

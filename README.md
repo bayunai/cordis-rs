@@ -20,7 +20,8 @@
 | Crate | 用途 |
 | --- | --- |
 | [`cordis-core`](crates/cordis-core) | Runtime 内核：`Context`、`Service`、`inject`、`Effect`、`Plugin`、`Event` 与诊断。 |
-| [`cordis-host`](crates/cordis-host) | 进程内宿主：显式工厂目录、严格 TOML 配置、扩展实例 reconcile。 |
+| [`cordis-loader`](crates/cordis-loader) | 静态 Catalog 插件管理：严格 TOML 配置、reconcile、管理服务与原子持久化。 |
+| [`cordis-host`](crates/cordis-host) | 应用进程薄外壳：启动 Loader、开放完整 Runtime 权限并受控关闭。 |
 | [`cordis-testkit`](crates/cordis-testkit) | 测试辅助；不应用于生产宿主。 |
 
 ## 快速开始
@@ -85,6 +86,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 - [`plugin_hotplug`](examples/plugin_hotplug.rs)：插件替换与卸载。
 - [`plugin_web`](examples/plugin_web.rs)：将运行时能力接入 HTTP 示例。
 - [`plugin_stack`](examples/plugin_stack/main.rs)：多插件应用栈。
+- [`host_bootstrap`](crates/cordis-host/examples/host_bootstrap/main.rs)：可复制的 Host 模板，包含入口、静态 Catalog、插件目录与 TOML 扩展清单。
 - [架构与边界](docs/architecture.md)
 - [Host 编排](docs/host.md)
 - [扩展编写指南](docs/extension-authoring.md)
@@ -94,10 +96,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ```bash
 cargo run -p cordis-core --example reactive
 cargo run -p cordis-core --example plugin_stack
+cargo run -p cordis-host --example host_bootstrap
 ```
 
-`cordis-host` 的启动锚点为本地 `bootstrap.toml`，当前仅支持 `file` 配置源；SQLite /
+`cordis-loader` 的启动锚点为本地 `bootstrap.toml`，当前仅支持 `file` 配置源；SQLite /
 PostgreSQL 配置存储和文件热更新尚未实现。详情见[架构文档](docs/architecture.md#bootstrap-配置边界)。
+应用代码可通过 `CordisHost::root()` 与 `runtime()` 取得完整 Cordis 运行时权限；插件配置
+由 Loader 反序列化为各 Factory 声明的强类型 `Config`。根服务 `Loader` 为管理界面提供静态
+Factory 的创建、更新、启停和删除，并在成功收敛后原子写回 `extensions.toml`；每个 Factory
+同时公开 JSON Schema 用于自动生成表单。
 
 ## 关键语义
 

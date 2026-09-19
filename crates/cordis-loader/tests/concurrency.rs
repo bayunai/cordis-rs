@@ -6,7 +6,7 @@ use common::*;
 
 use async_trait::async_trait;
 use cordis_core::{Context, CoreError, FiberState, Plugin, PluginKey};
-use cordis_host::{CordisHost, ExtensionFactory, HostError};
+use cordis_loader::{CordisLoader, ExtensionFactory, LoaderError};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
@@ -21,11 +21,13 @@ struct GatedAddFactory {
 }
 
 impl ExtensionFactory for GatedAddFactory {
+    type Config = serde_json::Value;
+
     fn id(&self) -> &'static str {
         "demo.concurrent"
     }
 
-    fn build(&self, _config: &toml::Value) -> Result<Arc<dyn Plugin>, HostError> {
+    fn build(&self, _config: serde_json::Value) -> Result<Arc<dyn Plugin>, LoaderError> {
         Ok(Arc::new(GatedAddPlugin {
             entered: self.entered.clone(),
             release: self.release.clone(),
@@ -60,12 +62,12 @@ impl Plugin for GatedAddPlugin {
 async fn snapshot_concurrent_with_add_instance_does_not_deadlock() {
     let (entered_tx, entered_rx) = oneshot::channel();
     let (release_tx, release_rx) = oneshot::channel();
-    let factory = Arc::new(GatedAddFactory {
+    let factory = GatedAddFactory {
         entered: Arc::new(Mutex::new(Some(entered_tx))),
         release: Arc::new(Mutex::new(Some(release_rx))),
-    });
+    };
 
-    let host = CordisHost::new(catalog_with(factory)).unwrap();
+    let host = CordisLoader::new(catalog_with(factory)).unwrap();
     let stop = Arc::new(AtomicBool::new(false));
     let snapshot_host = host.clone();
     let snapshot_stop = stop.clone();

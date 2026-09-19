@@ -3,8 +3,8 @@
 use crate::{
     catalog::ExtensionCatalog,
     config::{ExtensionEntry, ExtensionsConfig},
-    error::{HostError, format_panic_message},
-    host::MountedInstance,
+    error::{LoaderError, format_panic_message},
+    runtime::MountedInstance,
     snapshot::InstanceId,
 };
 use cordis_core::{Plugin, PluginKey};
@@ -33,14 +33,14 @@ pub(crate) fn prepare(
     mounted: &HashMap<InstanceId, MountedInstance>,
     order: &[InstanceId],
     config: &ExtensionsConfig,
-) -> Result<ReconcilePlan, HostError> {
+) -> Result<ReconcilePlan, LoaderError> {
     config.validate(catalog)?;
     for entry in &config.extensions {
         let id = InstanceId::from(entry.instance.as_str());
         if let Some(existing) = mounted.get(&id)
             && existing.factory != entry.factory
         {
-            return Err(HostError::FactoryChanged {
+            return Err(LoaderError::FactoryChanged {
                 instance: entry.instance.clone(),
                 from: existing.factory.clone(),
                 to: entry.factory.clone(),
@@ -74,7 +74,7 @@ pub(crate) fn prepare(
             Some(existing) => {
                 let prepared = build_instance(catalog, entry)?;
                 if prepared.plugin_key != existing.plugin_key {
-                    return Err(HostError::PluginKeyChanged {
+                    return Err(LoaderError::PluginKeyChanged {
                         instance: entry.instance.clone(),
                         expected: existing.plugin_key,
                         actual: prepared.plugin_key,
@@ -96,26 +96,26 @@ pub(crate) fn prepare(
 fn build_instance(
     catalog: &ExtensionCatalog,
     entry: &ExtensionEntry,
-) -> Result<PreparedInstance, HostError> {
+) -> Result<PreparedInstance, LoaderError> {
     let factory = catalog
         .get(&entry.factory)
-        .ok_or_else(|| HostError::UnknownFactory {
+        .ok_or_else(|| LoaderError::UnknownFactory {
             instance: entry.instance.clone(),
             factory: entry.factory.clone(),
         })?;
     let built =
         catch_unwind(AssertUnwindSafe(|| factory.build(&entry.config))).map_err(|payload| {
-            HostError::FactoryPanic {
+            LoaderError::FactoryPanic {
                 message: format_panic_message("extension factory build", payload),
             }
         })?;
-    let plugin = built.map_err(|error| HostError::PluginBuild {
+    let plugin = built.map_err(|error| LoaderError::PluginBuild {
         instance: entry.instance.clone(),
         factory: entry.factory.clone(),
         message: error.to_string(),
     })?;
     let plugin_key = catch_unwind(AssertUnwindSafe(|| plugin.key())).map_err(|payload| {
-        HostError::PluginPanic {
+        LoaderError::PluginPanic {
             message: format_panic_message("plugin key", payload),
         }
     })?;

@@ -1,0 +1,9 @@
+version = 1
+
+[[extensions]]
+instance = "default-greeting"
+factory = "demo.greeting"
+enabled = true
+
+[extensions.config]
+message = "Hello from the configured Cordis Host."

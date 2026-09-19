@@ -8,17 +8,14 @@ repository.workspace = true
 homepage.workspace = true
 documentation.workspace = true
 readme.workspace = true
-description = "In-process extension host: catalog, file config, and reconcile for cordis-core."
+description = "Thin application host shell for cordis-loader."
 
 [dependencies]
 cordis-core.workspace = true
-serde.workspace = true
-thiserror.workspace = true
-tokio = { workspace = true, features = ["macros", "rt", "sync"] }
-toml.workspace = true
+cordis-loader.workspace = true
 
 [dev-dependencies]
 async-trait.workspace = true
-cordis-testkit.workspace = true
-tempfile = "3"
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
+schemars.workspace = true
+serde.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

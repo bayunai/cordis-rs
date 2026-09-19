@@ -4,8 +4,8 @@
 
 use async_trait::async_trait;
 use cordis_core::{Context, CoreError, Plugin, PluginKey, ServiceId, ServiceKey};
-use cordis_host::{
-    ExtensionCatalog, ExtensionEntry, ExtensionFactory, ExtensionsConfig, HostError, toml,
+use cordis_loader::{
+    ExtensionCatalog, ExtensionEntry, ExtensionFactory, ExtensionsConfig, LoaderError, toml,
 };
 use std::{
     fs,
@@ -27,7 +27,7 @@ pub fn parse_extensions(text: &str) -> ExtensionsConfig {
     ExtensionsConfig::from_toml_str(text).expect("extensions toml")
 }
 
-pub fn catalog_with(factory: Arc<dyn ExtensionFactory>) -> ExtensionCatalog {
+pub fn catalog_with<F: ExtensionFactory>(factory: F) -> ExtensionCatalog {
     let mut catalog = ExtensionCatalog::new();
     catalog.register(factory).expect("register factory");
     catalog
@@ -61,7 +61,7 @@ impl DisposeGate {
     }
 }
 
-type SetupFn = Arc<dyn Fn(&Context, &toml::Value) -> Result<(), CoreError> + Send + Sync>;
+type SetupFn = Arc<dyn Fn(&Context, &serde_json::Value) -> Result<(), CoreError> + Send + Sync>;
 
 #[derive(Clone)]
 pub struct TestFactory {
@@ -103,7 +103,7 @@ impl TestFactory {
 
     pub fn on_apply<F>(mut self, setup: F) -> Self
     where
-        F: Fn(&Context, &toml::Value) -> Result<(), CoreError> + Send + Sync + 'static,
+        F: Fn(&Context, &serde_json::Value) -> Result<(), CoreError> + Send + Sync + 'static,
     {
         self.setup = Arc::new(setup);
         self
@@ -129,21 +129,19 @@ impl TestFactory {
     pub fn fail_apply(&self) -> Arc<Mutex<Option<String>>> {
         self.fail_apply.clone()
     }
-
-    pub fn into_arc(self) -> Arc<dyn ExtensionFactory> {
-        Arc::new(self)
-    }
 }
 
 impl ExtensionFactory for TestFactory {
+    type Config = serde_json::Value;
+
     fn id(&self) -> &'static str {
         self.id
     }
 
-    fn build(&self, config: &toml::Value) -> Result<Arc<dyn Plugin>, HostError> {
+    fn build(&self, config: serde_json::Value) -> Result<Arc<dyn Plugin>, LoaderError> {
         self.builds.fetch_add(1, Ordering::SeqCst);
         if let Some(message) = self.fail_build.lock().expect("fail_build").clone() {
-            return Err(HostError::invalid_config(message));
+            return Err(LoaderError::invalid_config(message));
         }
         Ok(Arc::new(TestHostPlugin {
             key: PluginKey::new(self.plugin_key),
@@ -151,7 +149,7 @@ impl ExtensionFactory for TestFactory {
             applies: self.applies.clone(),
             fail_apply: self.fail_apply.clone(),
             setup: self.setup.clone(),
-            config: config.clone(),
+            config,
             dispose: self.dispose.clone(),
         }))
     }
@@ -163,7 +161,7 @@ struct TestHostPlugin {
     applies: Arc<AtomicUsize>,
     fail_apply: Arc<Mutex<Option<String>>>,
     setup: SetupFn,
-    config: toml::Value,
+    config: serde_json::Value,
     dispose: Option<DisposeGate>,
 }
 

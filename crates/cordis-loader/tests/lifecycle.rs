@@ -5,7 +5,7 @@ mod common;
 use common::*;
 
 use cordis_core::FiberState;
-use cordis_host::{CordisHost, ExtensionCatalog, HostError};
+use cordis_loader::{CordisLoader, ExtensionCatalog, LoaderError};
 use cordis_testkit::wait_until;
 use std::sync::atomic::Ordering;
 
@@ -17,9 +17,9 @@ async fn missing_dependency_stays_pending_until_provider_arrives() {
     });
     let consumer = TestFactory::new("demo.consumer").inject(vec![NUMBER.id()]);
     let mut catalog = ExtensionCatalog::new();
-    catalog.register(provider.into_arc()).unwrap();
-    catalog.register(consumer.into_arc()).unwrap();
-    let host = CordisHost::new(catalog).unwrap();
+    catalog.register(provider).unwrap();
+    catalog.register(consumer).unwrap();
+    let host = CordisLoader::new(catalog).unwrap();
 
     host.apply(extensions(vec![
         enabled("consumer", "demo.consumer"),
@@ -43,15 +43,12 @@ async fn missing_dependency_stays_pending_until_provider_arrives() {
 #[tokio::test]
 async fn replace_apply_failure_enters_failed_without_rollback() {
     let factory = TestFactory::new("demo.value").on_apply(|ctx, config| {
-        let value = config
-            .get("n")
-            .and_then(|item| item.as_integer())
-            .unwrap_or(0) as u32;
+        let value = config.get("n").and_then(|item| item.as_i64()).unwrap_or(0) as u32;
         ctx.provide(NUMBER, value)?;
         Ok(())
     });
     let fail_apply = factory.fail_apply();
-    let host = CordisHost::new(catalog_with(factory.into_arc())).unwrap();
+    let host = CordisLoader::new(catalog_with(factory)).unwrap();
     host.apply(extensions(vec![
         enabled("db", "demo.value").with_config(table(&[("n", toml_int(1))])),
     ]))
@@ -66,7 +63,7 @@ async fn replace_apply_failure_enters_failed_without_rollback() {
         ]))
         .await
         .unwrap_err();
-    assert!(matches!(error, HostError::Lifecycle { .. }));
+    assert!(matches!(error, LoaderError::Lifecycle { .. }));
 
     let snapshot = host.snapshot().instance("db").unwrap().clone();
     assert_eq!(snapshot.state, FiberState::Failed);
@@ -84,7 +81,7 @@ async fn replace_apply_failure_enters_failed_without_rollback() {
 async fn shutdown_releases_plugins_and_stops_scheduler() {
     let factory = TestFactory::new("demo.noop");
     let applies = factory.applies();
-    let host = CordisHost::new(catalog_with(factory.into_arc())).unwrap();
+    let host = CordisLoader::new(catalog_with(factory)).unwrap();
     host.apply(extensions(vec![enabled("a", "demo.noop")]))
         .await
         .unwrap();
@@ -97,7 +94,7 @@ async fn shutdown_releases_plugins_and_stops_scheduler() {
 #[tokio::test]
 async fn snapshot_links_instance_plugin_key_fiber_and_state() {
     let factory = TestFactory::new("demo.snap").plugin_key("demo.snap.key");
-    let host = CordisHost::new(catalog_with(factory.into_arc())).unwrap();
+    let host = CordisLoader::new(catalog_with(factory)).unwrap();
     let snapshot = host
         .apply(extensions(vec![enabled("primary", "demo.snap")]))
         .await
@@ -118,6 +115,6 @@ async fn snapshot_links_instance_plugin_key_fiber_and_state() {
     host.shutdown().await.unwrap();
 }
 
-fn toml_int(value: i64) -> cordis_host::toml::Value {
-    cordis_host::toml::Value::Integer(value)
+fn toml_int(value: i64) -> cordis_loader::toml::Value {
+    cordis_loader::toml::Value::Integer(value)
 }

@@ -1,15 +1,16 @@
-//! `CordisHost`：创建 Runtime、保存实例映射并执行 reconcile。
+//! `CordisLoader`：创建 Runtime、保存实例映射并执行 reconcile。
 //!
 //! reconcile 由独立于调用者 Future 的协调器执行：取消 `apply()` / `reload()` 只取消等待，
-//! 不中断编排，也不阻止 Host 提交 `instances` / `order` / `config`。
+//! 不中断编排，也不阻止 Loader 提交 `instances` / `order` / `config`。
 
 use crate::{
-    bootstrap::{load_bootstrap, load_extensions},
+    bootstrap::{load_bootstrap, load_extensions_source},
     catalog::ExtensionCatalog,
     config::ExtensionsConfig,
-    error::HostError,
+    error::LoaderError,
+    loader::{LOADER, Loader},
     reconcile::{self, PreparedInstance, ReconcilePlan},
-    snapshot::{HostSnapshot, InstanceId, InstanceSnapshot},
+    snapshot::{InstanceId, InstanceSnapshot, LoaderSnapshot},
 };
 use cordis_core::{CoreError, Fiber, FiberState, PluginKey, Runtime};
 use std::{
@@ -26,10 +27,10 @@ pub(crate) struct MountedInstance {
     pub(crate) fiber: Fiber,
 }
 
-/// 一轮 Host reconcile 的共享 completion：调用方只 wait，取消不 abort 协调器。
+/// 一轮 Loader reconcile 的共享 completion：调用方只 wait，取消不 abort 协调器。
 struct ReconcileCompletion {
     notify: Notify,
-    result: Mutex<Option<Result<HostSnapshot, HostError>>>,
+    result: Mutex<Option<Result<LoaderSnapshot, LoaderError>>>,
     retain: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -46,7 +47,7 @@ impl ReconcileCompletion {
         *self.retain.lock().expect("reconcile retain") = Some(handle);
     }
 
-    fn finish(&self, result: Result<HostSnapshot, HostError>) {
+    fn finish(&self, result: Result<LoaderSnapshot, LoaderError>) {
         {
             let mut slot = self.result.lock().expect("reconcile completion");
             if slot.is_some() {
@@ -57,7 +58,7 @@ impl ReconcileCompletion {
         self.notify.notify_waiters();
     }
 
-    async fn wait(self: &Arc<Self>) -> Result<HostSnapshot, HostError> {
+    async fn wait(self: &Arc<Self>) -> Result<LoaderSnapshot, LoaderError> {
         loop {
             let notified = self.notify.notified();
             tokio::pin!(notified);
@@ -74,7 +75,7 @@ impl ReconcileCompletion {
 }
 
 struct ReconcileFinishGuard {
-    inner: Arc<HostInner>,
+    inner: Arc<LoaderInner>,
     completion: Arc<ReconcileCompletion>,
     finished: bool,
 }
@@ -84,7 +85,7 @@ impl Drop for ReconcileFinishGuard {
         if !self.finished {
             self.inner.finish_reconcile(
                 self.completion.clone(),
-                Err(HostError::ReconcileAborted {
+                Err(LoaderError::ReconcileAborted {
                     reason: "reconcile supervisor dropped".into(),
                 }),
             );
@@ -92,56 +93,70 @@ impl Drop for ReconcileFinishGuard {
     }
 }
 
-struct HostInner {
-    catalog: ExtensionCatalog,
+pub(crate) struct LoaderInner {
+    pub(crate) catalog: ExtensionCatalog,
     runtime: Runtime,
-    extensions_path: Option<PathBuf>,
+    pub(crate) extensions_path: Mutex<Option<PathBuf>>,
+    pub(crate) desired: Mutex<ExtensionsConfig>,
+    pub(crate) revision: Mutex<Option<String>>,
     instances: Mutex<HashMap<InstanceId, MountedInstance>>,
     order: Mutex<Vec<InstanceId>>,
     reconcile: Mutex<Option<Arc<ReconcileCompletion>>>,
+    pub(crate) loader_operations: tokio::sync::Mutex<()>,
+    loader: Loader,
 }
 
-/// 进程内扩展宿主。
+/// 进程内静态插件 Loader。
 ///
 /// 调用方必须在 Tokio 上下文中创建。重新加载只能通过显式 [`Self::reload`]
 /// 或 [`Self::apply`]；首版不监听文件。
 ///
-/// `apply` / `reload` 的等待可被取消，但内部 reconcile 仍会收敛并提交 Host 映射。
+/// `apply` / `reload` 的等待可被取消，但内部 reconcile 仍会收敛并提交 Loader 映射。
 #[derive(Clone)]
-pub struct CordisHost {
-    inner: Arc<HostInner>,
+pub struct CordisLoader {
+    pub(crate) inner: Arc<LoaderInner>,
 }
 
-impl CordisHost {
-    /// 创建空宿主（尚无已挂载实例）。须在 Tokio 中调用。
-    pub fn new(catalog: ExtensionCatalog) -> Result<Self, HostError> {
-        let runtime = Runtime::new().map_err(|source| HostError::Runtime { source })?;
-        Ok(Self {
-            inner: Arc::new(HostInner {
-                catalog,
-                runtime,
-                extensions_path: None,
-                instances: Mutex::new(HashMap::new()),
-                order: Mutex::new(Vec::new()),
-                reconcile: Mutex::new(None),
+impl CordisLoader {
+    /// 创建空 Loader（尚无已挂载实例）。须在 Tokio 中调用。
+    pub fn new(catalog: ExtensionCatalog) -> Result<Self, LoaderError> {
+        let runtime = Runtime::new().map_err(|source| LoaderError::Runtime { source })?;
+        let inner = Arc::new_cyclic(|weak| LoaderInner {
+            catalog,
+            runtime,
+            extensions_path: Mutex::new(None),
+            desired: Mutex::new(ExtensionsConfig {
+                version: crate::config::CONFIG_VERSION,
+                extensions: Vec::new(),
             }),
-        })
+            revision: Mutex::new(None),
+            instances: Mutex::new(HashMap::new()),
+            order: Mutex::new(Vec::new()),
+            reconcile: Mutex::new(None),
+            loader_operations: tokio::sync::Mutex::new(()),
+            loader: Loader::new(weak.clone()),
+        });
+        let host = Self { inner };
+        host.root()
+            .provide(LOADER, host.loader())
+            .map_err(|source| LoaderError::Runtime { source })?;
+        Ok(host)
     }
 
     /// 读取 bootstrap 与 extensions，预检通过后再创建 Runtime 并编排。
     pub async fn bootstrap(
         catalog: ExtensionCatalog,
         bootstrap_path: impl AsRef<Path>,
-    ) -> Result<Self, HostError> {
+    ) -> Result<Self, LoaderError> {
         let (_, extensions_path) = load_bootstrap(bootstrap_path.as_ref())?;
-        let extensions = load_extensions(&extensions_path)?;
+        let (extensions, revision) = load_extensions_source(&extensions_path)?;
         let plan = reconcile::prepare(&catalog, &HashMap::new(), &[], &extensions)?;
-        let mut host = Self::new(catalog)?;
+        let host = Self::new(catalog)?;
         {
-            let inner = Arc::get_mut(&mut host.inner).expect("exclusive host");
-            inner.extensions_path = Some(extensions_path);
+            *host.inner.extensions_path.lock().expect("extensions path") = Some(extensions_path);
+            *host.inner.revision.lock().expect("revision") = Some(revision);
         }
-        if let Err(error) = host.start_reconcile(plan).await {
+        if let Err(error) = host.start_reconcile(plan, extensions).await {
             let _ = host.shutdown().await;
             return Err(error);
         }
@@ -149,25 +164,35 @@ impl CordisHost {
     }
 
     /// 按启动时解析的 `extensions.toml` 绝对路径重新加载。
-    pub async fn reload(&self) -> Result<HostSnapshot, HostError> {
+    pub async fn reload(&self) -> Result<LoaderSnapshot, LoaderError> {
         let path = self
             .inner
             .extensions_path
+            .lock()
+            .expect("extensions path")
             .clone()
-            .ok_or(HostError::NoConfigSource)?;
-        let extensions = load_extensions(&path)?;
-        self.apply(extensions).await
+            .ok_or(LoaderError::NoConfigSource)?;
+        let (extensions, revision) = load_extensions_source(&path)?;
+        self.apply_with_revision(extensions, Some(revision)).await
     }
 
     /// 对已解析的目标配置执行 reconcile。
     ///
-    /// 调用方 Future 取消只取消 wait；协调器继续执行并提交 Host 状态。
-    /// 同一时刻已有 reconcile 时返回 [`HostError::ReconcileBusy`]。
-    pub async fn apply(&self, config: ExtensionsConfig) -> Result<HostSnapshot, HostError> {
+    /// 调用方 Future 取消只取消 wait；协调器继续执行并提交 Loader 状态。
+    /// 同一时刻已有 reconcile 时返回 [`LoaderError::ReconcileBusy`]。
+    pub async fn apply(&self, config: ExtensionsConfig) -> Result<LoaderSnapshot, LoaderError> {
+        self.apply_with_revision(config, None).await
+    }
+
+    pub(crate) async fn apply_with_revision(
+        &self,
+        config: ExtensionsConfig,
+        revision: Option<String>,
+    ) -> Result<LoaderSnapshot, LoaderError> {
         let completion = {
             let mut slot = self.inner.reconcile.lock().expect("reconcile slot");
             if slot.is_some() {
-                return Err(HostError::ReconcileBusy);
+                return Err(LoaderError::ReconcileBusy);
             }
             let plan = {
                 let instances = self.inner.instances.lock().expect("instances");
@@ -176,26 +201,35 @@ impl CordisHost {
             };
             let completion = ReconcileCompletion::new();
             *slot = Some(completion.clone());
-            self.spawn_reconcile(completion.clone(), plan);
+            self.spawn_reconcile(completion.clone(), plan, config, revision);
             completion
         };
         completion.wait().await
     }
 
-    pub fn runtime(&self) -> &Runtime {
-        &self.inner.runtime
-    }
-
+    /// 返回此 Loader 的根 Context。
+    ///
+    /// 应用与受信任的进程内插件可通过它使用完整 Cordis 运行时能力。
     pub fn root(&self) -> cordis_core::Context {
         self.inner.runtime.root()
     }
 
-    pub fn snapshot(&self) -> HostSnapshot {
+    /// 返回此 Loader 的完整 Runtime。
+    pub fn runtime(&self) -> &Runtime {
+        &self.inner.runtime
+    }
+
+    /// 返回管理静态 Factory 实例并持久化 `extensions.toml` 的 Loader。
+    pub fn loader(&self) -> Loader {
+        self.inner.loader.clone()
+    }
+
+    pub fn snapshot(&self) -> LoaderSnapshot {
         self.inner.snapshot()
     }
 
     /// 先等待在途 reconcile 收敛，再关闭 Runtime。
-    pub async fn shutdown(self) -> Result<(), HostError> {
+    pub async fn shutdown(self) -> Result<(), LoaderError> {
         let pending = self.inner.reconcile.lock().expect("reconcile slot").clone();
         if let Some(completion) = pending {
             let _ = completion.wait().await;
@@ -204,24 +238,34 @@ impl CordisHost {
             .runtime
             .shutdown()
             .await
-            .map_err(|source| HostError::Runtime { source })
+            .map_err(|source| LoaderError::Runtime { source })
     }
 
-    async fn start_reconcile(&self, plan: ReconcilePlan) -> Result<HostSnapshot, HostError> {
+    async fn start_reconcile(
+        &self,
+        plan: ReconcilePlan,
+        config: ExtensionsConfig,
+    ) -> Result<LoaderSnapshot, LoaderError> {
         let completion = {
             let mut slot = self.inner.reconcile.lock().expect("reconcile slot");
             if slot.is_some() {
-                return Err(HostError::ReconcileBusy);
+                return Err(LoaderError::ReconcileBusy);
             }
             let completion = ReconcileCompletion::new();
             *slot = Some(completion.clone());
-            self.spawn_reconcile(completion.clone(), plan);
+            self.spawn_reconcile(completion.clone(), plan, config, None);
             completion
         };
         completion.wait().await
     }
 
-    fn spawn_reconcile(&self, completion: Arc<ReconcileCompletion>, plan: ReconcilePlan) {
+    fn spawn_reconcile(
+        &self,
+        completion: Arc<ReconcileCompletion>,
+        plan: ReconcilePlan,
+        config: ExtensionsConfig,
+        revision: Option<String>,
+    ) {
         let inner = self.inner.clone();
         let completion_for_task = completion.clone();
         let supervisor = tokio::runtime::Handle::current().spawn(async move {
@@ -234,10 +278,16 @@ impl CordisHost {
             let worker = tokio::spawn(async move { worker_inner.run_reconcile(plan).await });
             let result = match worker.await {
                 Ok(result) => result,
-                Err(error) => Err(HostError::ReconcileAborted {
+                Err(error) => Err(LoaderError::ReconcileAborted {
                     reason: format!("reconcile worker: {error}"),
                 }),
             };
+            if result.is_ok() {
+                *inner.desired.lock().expect("desired") = config;
+                if let Some(revision) = revision {
+                    *inner.revision.lock().expect("revision") = Some(revision);
+                }
+            }
             inner.finish_reconcile(completion_for_task, result);
             guard.finished = true;
         });
@@ -245,11 +295,11 @@ impl CordisHost {
     }
 }
 
-impl HostInner {
+impl LoaderInner {
     fn finish_reconcile(
         &self,
         completion: Arc<ReconcileCompletion>,
-        result: Result<HostSnapshot, HostError>,
+        result: Result<LoaderSnapshot, LoaderError>,
     ) {
         {
             let mut slot = self.reconcile.lock().expect("reconcile slot");
@@ -263,7 +313,7 @@ impl HostInner {
         completion.finish(result);
     }
 
-    fn snapshot(&self) -> HostSnapshot {
+    fn snapshot(&self) -> LoaderSnapshot {
         let instances_map = self.instances.lock().expect("instances");
         let order = self.order.lock().expect("order");
         let instances = order
@@ -280,13 +330,13 @@ impl HostInner {
                 })
             })
             .collect();
-        HostSnapshot {
+        LoaderSnapshot {
             instances,
             runtime: self.runtime.diagnostics(),
         }
     }
 
-    async fn run_reconcile(&self, plan: ReconcilePlan) -> Result<HostSnapshot, HostError> {
+    async fn run_reconcile(&self, plan: ReconcilePlan) -> Result<LoaderSnapshot, LoaderError> {
         for id in plan.removes {
             self.remove_instance(id).await?;
         }
@@ -300,7 +350,7 @@ impl HostInner {
         Ok(self.snapshot())
     }
 
-    async fn remove_instance(&self, id: InstanceId) -> Result<(), HostError> {
+    async fn remove_instance(&self, id: InstanceId) -> Result<(), LoaderError> {
         let Some(mut mounted) = self.instances.lock().expect("instances").remove(&id) else {
             self.order
                 .lock()
@@ -320,13 +370,13 @@ impl HostInner {
                 .expect("instances")
                 .insert(id.clone(), mounted);
         }
-        result.map_err(|source| HostError::Lifecycle {
+        result.map_err(|source| LoaderError::Lifecycle {
             instance: id.to_string(),
             source,
         })
     }
 
-    async fn replace_instance(&self, item: PreparedInstance) -> Result<(), HostError> {
+    async fn replace_instance(&self, item: PreparedInstance) -> Result<(), LoaderError> {
         let PreparedInstance {
             instance,
             factory,
@@ -339,14 +389,14 @@ impl HostInner {
             .lock()
             .expect("instances")
             .remove(&instance)
-            .ok_or_else(|| HostError::Lifecycle {
+            .ok_or_else(|| LoaderError::Lifecycle {
                 instance: instance.to_string(),
                 source: CoreError::FiberDisposed,
             })?;
         let result = mounted.fiber.replace(plugin).await;
         let outcome = match result {
             Err(CoreError::PluginKeyMismatch { expected, actual }) => {
-                Err(HostError::PluginKeyChanged {
+                Err(LoaderError::PluginKeyChanged {
                     instance: instance.to_string(),
                     expected,
                     actual,
@@ -368,7 +418,7 @@ impl HostInner {
         outcome
     }
 
-    async fn add_instance(&self, item: PreparedInstance) -> Result<(), HostError> {
+    async fn add_instance(&self, item: PreparedInstance) -> Result<(), LoaderError> {
         let PreparedInstance {
             instance,
             factory,
@@ -379,7 +429,7 @@ impl HostInner {
         let fiber = match self.runtime.root().plugin(plugin).await {
             Ok(fiber) => fiber,
             Err(source) => {
-                return Err(HostError::Lifecycle {
+                return Err(LoaderError::Lifecycle {
                     instance: instance.to_string(),
                     source,
                 });
@@ -418,7 +468,7 @@ fn commit_mounted(
     mounted.config = config;
 }
 
-fn failed_fiber_error(instance: &InstanceId, fiber: &Fiber) -> Result<(), HostError> {
+fn failed_fiber_error(instance: &InstanceId, fiber: &Fiber) -> Result<(), LoaderError> {
     if fiber.state() == FiberState::Failed {
         Err(lifecycle_error(
             instance,
@@ -429,8 +479,8 @@ fn failed_fiber_error(instance: &InstanceId, fiber: &Fiber) -> Result<(), HostEr
     }
 }
 
-fn lifecycle_error(instance: &InstanceId, source: CoreError) -> HostError {
-    HostError::Lifecycle {
+fn lifecycle_error(instance: &InstanceId, source: CoreError) -> LoaderError {
+    LoaderError::Lifecycle {
         instance: instance.to_string(),
         source,
     }

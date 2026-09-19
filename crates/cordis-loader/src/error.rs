@@ -1,4 +1,4 @@
-//! [`HostError`]：配置、工厂目录与编排失败契约。
+//! [`LoaderError`]：配置、工厂目录与编排失败契约。
 
 use cordis_core::{CoreError, PluginKey};
 use std::{any::Any, io, path::PathBuf};
@@ -14,11 +14,11 @@ pub(crate) fn format_panic_message(boundary: &str, payload: Box<dyn Any + Send>)
     }
 }
 
-/// Host 公开失败类型。
+/// Loader 公开失败类型。
 ///
 /// 配置与构造错误发生在变更之前；生命周期错误表示至少一步编排已经提交。
 #[derive(Debug, Clone, thiserror::Error)]
-pub enum HostError {
+pub enum LoaderError {
     #[error("读取配置失败 {path}: {message}", path = path.display())]
     Io { path: PathBuf, message: String },
     #[error("解析配置失败 {path}: {message}", path = path.display())]
@@ -31,6 +31,8 @@ pub enum HostError {
     UnknownFactory { instance: String, factory: String },
     #[error("工厂 {id} 已注册")]
     DuplicateFactory { id: String },
+    #[error("工厂 {factory} 的配置 Schema 无法生成: {message}")]
+    FactorySchema { factory: String, message: String },
     #[error("实例 {instance} 不允许更换工厂：{from} → {to}")]
     FactoryChanged {
         instance: String,
@@ -66,15 +68,15 @@ pub enum HostError {
         #[source]
         source: CoreError,
     },
-    #[error("未配置文件配置源；只能对 bootstrap 启动的 Host 调用 reload")]
+    #[error("未配置文件配置源；只能对 bootstrap 启动的 Loader 调用 reload")]
     NoConfigSource,
-    #[error("Host reconcile 正在执行；同一时刻只允许一个编排操作")]
+    #[error("Loader reconcile 正在执行；同一时刻只允许一个编排操作")]
     ReconcileBusy,
-    #[error("Host reconcile 协调器异常终止: {reason}")]
+    #[error("Loader reconcile 协调器异常终止: {reason}")]
     ReconcileAborted { reason: String },
 }
 
-impl HostError {
+impl LoaderError {
     /// 工厂在 `build` 时报告的配置错误。
     pub fn invalid_config(message: impl Into<String>) -> Self {
         Self::InvalidConfig {

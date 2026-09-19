@@ -1,4 +1,4 @@
-//! Host 诊断快照：把配置实例与 Core Fiber 关联起来。
+//! Loader 诊断快照：把配置实例与 Core Fiber 关联起来。
 
 use cordis_core::{FiberState, PluginKey, RuntimeSnapshot};
 use std::fmt;
@@ -35,9 +35,9 @@ impl From<String> for InstanceId {
     }
 }
 
-/// Host + Runtime 联合快照。
+/// Loader + Runtime 联合快照。
 #[derive(Debug, Clone)]
-pub struct HostSnapshot {
+pub struct LoaderSnapshot {
     pub instances: Vec<InstanceSnapshot>,
     pub runtime: RuntimeSnapshot,
 }
@@ -53,7 +53,7 @@ pub struct InstanceSnapshot {
     pub last_error: Option<String>,
 }
 
-impl HostSnapshot {
+impl LoaderSnapshot {
     pub fn instance(&self, id: &str) -> Option<&InstanceSnapshot> {
         self.instances
             .iter()

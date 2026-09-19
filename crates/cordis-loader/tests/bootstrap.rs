@@ -4,8 +4,8 @@
 mod common;
 use common::*;
 
-use cordis_host::{
-    BootstrapConfig, ConfigDriver, CordisHost, ExtensionCatalog, HostError, load_bootstrap,
+use cordis_loader::{
+    BootstrapConfig, ConfigDriver, CordisLoader, ExtensionCatalog, LoaderError, load_bootstrap,
 };
 use std::fs;
 
@@ -36,7 +36,7 @@ path = "extensions.toml"
 "#,
     )
     .unwrap_err();
-    assert!(matches!(error, HostError::Toml { .. }));
+    assert!(matches!(error, LoaderError::Toml { .. }));
     assert!(error.to_string().contains("log_level"));
 }
 
@@ -50,7 +50,7 @@ driver = "file"
 "#,
     )
     .unwrap_err();
-    assert!(matches!(error, HostError::Toml { .. }));
+    assert!(matches!(error, LoaderError::Toml { .. }));
 }
 
 #[test]
@@ -64,7 +64,10 @@ path = "extensions.toml"
 "#,
     )
     .unwrap_err();
-    assert!(matches!(error, HostError::UnsupportedVersion { found: 2 }));
+    assert!(matches!(
+        error,
+        LoaderError::UnsupportedVersion { found: 2 }
+    ));
 }
 
 #[test]
@@ -78,7 +81,7 @@ path = "extensions.toml"
 "#,
     )
     .unwrap_err();
-    assert!(matches!(error, HostError::Toml { .. }));
+    assert!(matches!(error, LoaderError::Toml { .. }));
     assert!(error.to_string().contains("sqlite"));
 }
 
@@ -135,8 +138,8 @@ enabled = true
     );
     let factory = TestFactory::new("demo.noop");
     let mut catalog = ExtensionCatalog::new();
-    catalog.register(factory.into_arc()).unwrap();
-    let host = CordisHost::bootstrap(catalog, &bootstrap).await.unwrap();
+    catalog.register(factory).unwrap();
+    let host = CordisLoader::bootstrap(catalog, &bootstrap).await.unwrap();
     let snapshot = host.snapshot();
     assert_eq!(snapshot.instances.len(), 1);
     assert_eq!(snapshot.instance("rel").unwrap().factory, "demo.noop");
@@ -157,8 +160,8 @@ path = "missing.toml"
 "#,
     )
     .unwrap();
-    match CordisHost::bootstrap(ExtensionCatalog::new(), &bootstrap).await {
-        Err(error) => assert!(matches!(error, HostError::Io { .. })),
+    match CordisLoader::bootstrap(ExtensionCatalog::new(), &bootstrap).await {
+        Err(error) => assert!(matches!(error, LoaderError::Io { .. })),
         Ok(host) => {
             let _ = host.shutdown().await;
             panic!("expected missing extensions file");

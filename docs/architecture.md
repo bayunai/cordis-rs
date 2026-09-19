@@ -5,11 +5,12 @@
 | 层 | 职责 | 本仓库位置 |
 | --- | --- | --- |
 | **Runtime 内核** | Context、Service、inject、Isolation、Fiber、Effect、Event、诊断 | `crates/cordis-core` |
-| **宿主** | 组装 Runtime、显式工厂目录、严格配置与 reconcile | `crates/cordis-host`；应用再接入网络/持久化 |
+| **Loader** | 静态 Catalog、严格配置、reconcile 与管理服务 | `crates/cordis-loader` |
+| **应用 Host** | 组装 Loader、运行应用事件循环并受控关闭 | `crates/cordis-host`；应用再接入网络/持久化 |
 | **扩展** | 实现 `Plugin`，`provide` / `inject` / `on`，不触碰宿主内部类型 | 插件 crate |
 
 `cordis-core` **不包含** HTTP、数据库、Redis、JSON 配置、Manifest、WASM 或网关语义。
-`cordis-host` 首版只做进程内编排与文件配置源，不加载动态库、不提供管理后台。
+`cordis-loader` 首版只做进程内编排与文件配置源，不加载动态库、不提供管理后台。
 
 ## Bootstrap 配置边界
 
@@ -20,7 +21,7 @@
 启动文件只能包含已实现的启动锚点，不得承载应用、路由、策略或任意插件业务配置，
 也不得保存凭证明文。
 
-当前 `cordis-host` 实现的锚点只有文件配置源：
+当前 `cordis-loader` 实现的锚点只有文件配置源：
 
 ```toml
 version = 1
