@@ -36,7 +36,11 @@ pub enum LoaderControlError {
     ConfigConflict { path: PathBuf },
     #[error("运行时已生效，但未能写回配置 {path}: {message}", path = path.display())]
     Persist {
-        snapshot: LoaderSnapshot,
+        /// 持久化失败时仍可供管理界面展示的已生效运行时快照。
+        ///
+        /// 此载荷较大，必须堆分配，避免所有 `Result<_, LoaderControlError>` 都携带
+        /// 与快照等大的错误分支。
+        snapshot: Box<LoaderSnapshot>,
         path: PathBuf,
         message: String,
     },
@@ -180,7 +184,7 @@ impl Loader {
                 Ok(snapshot)
             }
             Err(error) => Err(LoaderControlError::Persist {
-                snapshot,
+                snapshot: Box::new(snapshot),
                 path,
                 message: error.to_string(),
             }),
