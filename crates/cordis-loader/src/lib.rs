@@ -11,6 +11,7 @@ mod config;
 mod error;
 mod loader;
 mod plugin;
+mod reconcile;
 mod snapshot;
 
 pub use bootstrap::{load_bootstrap, load_extensions};
