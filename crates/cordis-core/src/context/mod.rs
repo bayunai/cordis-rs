@@ -73,6 +73,24 @@ impl Context {
         })
     }
 
+    /// 仅覆盖 Config，复用父视图的 Service identity（不创建新服务域）。
+    fn overlay_config(
+        &self,
+        configs: HashMap<crate::config::ConfigId, crate::config::ErasedConfig>,
+    ) -> Result<Self, CoreError> {
+        self.ensure_alive()?;
+        Ok(Self {
+            inner: Arc::new(ContextInner {
+                identity: self.inner.identity.clone(),
+                parent: Some(self.clone()),
+                isolations: HashMap::new(),
+                configs,
+                registry: self.inner.registry.clone(),
+                scope: self.inner.scope.clone(),
+            }),
+        })
+    }
+
     /// 创建仅对派生 Context 生效的新隔离标签。
     pub fn isolate<T: Send + Sync + 'static>(
         &self,
@@ -95,7 +113,10 @@ impl Context {
         self.extend_with(HashMap::from([(key.id(), label)]), HashMap::new())
     }
 
-    /// 创建带不可变配置覆盖的派生 Context；父与兄弟节点不变。
+    /// 创建带不可变配置覆盖的派生视图；父与兄弟节点的配置不变。
+    ///
+    /// 配置按父链最近覆盖解析；`provide` / `get` / `inject` 仍使用与父相同的服务域
+    ///（复用 Service identity）。若需要新的服务域，使用 [`Self::extend`] 或 [`Self::isolate`]。
     pub fn intercept<T: Send + Sync + 'static>(
         &self,
         key: ConfigKey<T>,
@@ -103,16 +124,13 @@ impl Context {
     ) -> Result<Self, CoreError> {
         self.ensure_alive()?;
         self.registry()?.lock_config_type(key.id(), key.type_id())?;
-        self.extend_with(
-            HashMap::new(),
-            HashMap::from([(
-                key.id(),
-                crate::config::ErasedConfig {
-                    type_id: key.type_id(),
-                    value: Arc::new(value),
-                },
-            )]),
-        )
+        self.overlay_config(HashMap::from([(
+            key.id(),
+            crate::config::ErasedConfig {
+                type_id: key.type_id(),
+                value: Arc::new(value),
+            },
+        )]))
     }
 
     /// 自当前节点向父解析最近配置覆盖。

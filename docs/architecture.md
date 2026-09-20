@@ -132,7 +132,9 @@ Context::plugin(Arc<dyn Plugin>)
 
 ## Config / intercept
 
-`ConfigKey<T>` 独立于 `ServiceKey`。`Context::intercept(key, value)` 创建共享 Scope 的派生视图并写入覆盖；`config(key)` 向父链查找最近值。不影响 Provider / inject 生命周期。
+`ConfigKey<T>` 独立于 `ServiceKey`。`Context::intercept(key, value)` 创建**共享父视图 Service
+identity** 的派生配置视图并写入覆盖；`config(key)` 向父链查找最近值。`provide` / `get` /
+`inject` 的服务域不因配置覆盖而改变。需要新服务域时使用 `extend()` 或 `isolate()`。
 
 ## Plugin Registry
 

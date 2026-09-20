@@ -140,6 +140,54 @@ async fn intercept_overrides_config_without_mutating_parent() {
 }
 
 #[tokio::test]
+async fn intercept_shares_service_domain_with_parent_and_siblings() {
+    use cordis_core::ConfigKey;
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct Theme(&'static str);
+
+    static THEME: ConfigKey<Theme> = ConfigKey::new("test.theme-share@1");
+
+    let runtime = runtime();
+    let root = runtime.root();
+    let a = root.intercept(THEME, Theme("dark")).unwrap();
+    let b = root.intercept(THEME, Theme("light")).unwrap();
+
+    let owner = a.effect().unwrap();
+    owner.provide(NUMBER, Number(42)).unwrap();
+
+    assert_eq!(root.get(NUMBER).unwrap().0, 42);
+    assert_eq!(b.get(NUMBER).unwrap().0, 42);
+    assert_eq!(a.config(THEME).unwrap().0, "dark");
+    assert_eq!(b.config(THEME).unwrap().0, "light");
+
+    owner.dispose();
+    assert_service_unavailable(&root, NUMBER);
+    assert_service_unavailable(&b, NUMBER);
+}
+
+#[tokio::test]
+async fn extend_and_isolate_still_isolate_services() {
+    let runtime = runtime();
+    let root = runtime.root();
+
+    let extended = root.extend().unwrap();
+    let owner = extended.effect().unwrap();
+    owner.provide(NUMBER, Number(2)).unwrap();
+    assert_eq!(extended.get(NUMBER).unwrap().0, 2);
+    // 子服务域的 provide 对父不可见。
+    assert_service_unavailable(&root, NUMBER);
+
+    root.provide(NUMBER, Number(1)).unwrap();
+    // 未隔离的子域仍可沿父链看到父 Provider。
+    let sibling = root.extend().unwrap();
+    assert_eq!(sibling.get(NUMBER).unwrap().0, 1);
+
+    let (isolated, _) = root.isolate(NUMBER).unwrap();
+    assert_service_unavailable(&isolated, NUMBER);
+}
+
+#[tokio::test]
 async fn intercept_type_conflict_and_plugin_can_read_config() {
     use cordis_core::ConfigKey;
 

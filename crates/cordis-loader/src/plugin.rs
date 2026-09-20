@@ -274,13 +274,19 @@ impl LoaderInner {
         parent_disabled: bool,
     ) -> Result<(), LoaderError> {
         for entry in prepared {
-            let context = parent_context
-                .extend()
-                .map_err(|source| LoaderError::Runtime { source })?;
+            // Group：恰好一次 extend 得到该组服务域；普通 Entry：共享父域（Loader 根或所属 Group）。
+            // inject 的 Config intercept 只覆盖配置，不新建服务域（见 Context::intercept）。
+            let domain = if entry.options.group {
+                parent_context
+                    .extend()
+                    .map_err(|source| LoaderError::Runtime { source })?
+            } else {
+                parent_context.clone()
+            };
             let (context, dependencies) = self.catalog.resolve_injections(
                 entry.options.inject.as_ref(),
                 entry.path.as_str(),
-                context,
+                domain.clone(),
             )?;
             let enabled = !parent_disabled && !entry.options.disabled;
             let (fiber, plugin_key) = if entry.options.group {
@@ -336,6 +342,7 @@ impl LoaderInner {
                 },
             );
             if entry.options.group {
+                // 将 Group 的 inject Config 覆盖一并传给子树（intercept 共享服务域）。
                 Box::pin(self.mount_entries(
                     &entry.children,
                     Some(entry.path.clone()),

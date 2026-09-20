@@ -109,7 +109,7 @@ impl ExtensionFactory for GreeterFactory {
 ```
 
 ```text
-Loader 读取 EntryTree → 反序列化为 `Factory::Config` → factory.build(config) → 构造不可变实例 → 挂载到条目 Context
+Loader 读取 EntryTree → 反序列化为 `Factory::Config` → factory.build(config) → 构造不可变实例 → 挂载到所属服务域 Context
 ```
 
 - `build` 必须无副作用；I/O 与任务只出现在 `Plugin::apply`。
@@ -118,6 +118,9 @@ Loader 读取 EntryTree → 反序列化为 `Factory::Config` → factory.build(
 - 校验或反序列化失败时，Loader 不执行 reconcile，也不写回配置文件。
 - 配置、父 Group 或条目顺序变更会由 Loader 重建受影响的 Context 子树；插件不得自行保存可变 Loader 配置。
 - 不得修改已挂载实例的内部配置后调用 `restart()`；`restart()` 仅用于配置未变的重新执行。
+- **服务域**：顶层条目共享 Loader 根域；每个 Group 是独立服务边界；同 Group 子项互相可见。
+  `inject = { ... }` 只覆盖 `ConfigKey`，不会把条目变成独立服务域。跨 Group 的 `provide`
+  互不可见，因此不同 Group 可重复同一 `ServiceKey`。
 
 ## ServiceKey / Event Key
 
