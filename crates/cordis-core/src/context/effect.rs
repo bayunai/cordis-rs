@@ -9,6 +9,7 @@ use crate::{
     callback_context::{LifecycleFrame, USER_LIFECYCLE_CALLBACK},
     effect::EffectHandle,
     event::{EventKey, ListenOptions, Next, ParallelKey, SerialKey, Unsubscribe, WaterfallKey},
+    logger::{LogExporter, Logger},
 };
 use std::{future::Future, sync::Arc};
 use tokio::task::JoinHandle;
@@ -262,6 +263,18 @@ impl EffectContext {
                 ));
         self.context.inner.scope.push_task(handle);
         Ok(())
+    }
+
+    pub fn logger(&self) -> Result<Logger, CoreError> {
+        self.context.logger()
+    }
+
+    pub fn logger_named(&self, name: impl Into<String>) -> Result<Logger, CoreError> {
+        self.context.logger_named(name)
+    }
+
+    pub fn register_log_exporter(&self, exporter: Arc<dyn LogExporter>) -> Result<(), CoreError> {
+        self.context.register_log_exporter(exporter)
     }
 
     pub fn as_context(&self) -> &Context {

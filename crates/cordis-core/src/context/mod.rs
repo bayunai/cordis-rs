@@ -18,7 +18,8 @@ use crate::{
     },
     fiber::{Fiber, FiberInner, FiberState},
     isolation::IsolationLabel,
-    plugin::{Plugin, read_metadata},
+    logger::{LOGGER_CONFIG, LogExporter, LogLevel, Logger, LoggerService},
+    plugin::{Plugin, PluginKey, read_metadata},
     registry::{Registry, provider::ProviderCheck},
     service::ErasedService,
 };
@@ -39,6 +40,10 @@ pub(crate) struct ContextInner {
     /// Registry 反向持有资源记录时不能形成 Context ↔ Registry 环。
     pub(crate) registry: std::sync::Weak<Registry>,
     pub(crate) scope: EffectScope,
+    /// Runtime 唯一 LoggerService（与 isolate / ServiceKey 无关）。
+    pub(crate) logger: Arc<LoggerService>,
+    pub(crate) log_fiber_id: Option<u64>,
+    pub(crate) log_plugin_key: Option<PluginKey>,
 }
 
 /// 通用的层级 Service Context。
@@ -69,6 +74,9 @@ impl Context {
                 configs,
                 registry: self.inner.registry.clone(),
                 scope: self.inner.scope.clone(),
+                logger: self.inner.logger.clone(),
+                log_fiber_id: self.inner.log_fiber_id,
+                log_plugin_key: self.inner.log_plugin_key,
             }),
         })
     }
@@ -87,6 +95,9 @@ impl Context {
                 configs,
                 registry: self.inner.registry.clone(),
                 scope: self.inner.scope.clone(),
+                logger: self.inner.logger.clone(),
+                log_fiber_id: self.inner.log_fiber_id,
+                log_plugin_key: self.inner.log_plugin_key,
             }),
         })
     }
@@ -105,6 +116,9 @@ impl Context {
                 configs: HashMap::new(),
                 registry: self.inner.registry.clone(),
                 scope: self.inner.scope.clone(),
+                logger: self.inner.logger.clone(),
+                log_fiber_id: self.inner.log_fiber_id,
+                log_plugin_key: self.inner.log_plugin_key,
             }),
         })
     }
@@ -265,6 +279,9 @@ impl Context {
                         configs: template.inner.configs.clone(),
                         registry: template.inner.registry.clone(),
                         scope: child,
+                        logger: template.inner.logger.clone(),
+                        log_fiber_id: template.inner.log_fiber_id,
+                        log_plugin_key: template.inner.log_plugin_key,
                     }),
                 },
             };
@@ -306,6 +323,9 @@ impl Context {
                     configs: self.inner.configs.clone(),
                     registry: self.inner.registry.clone(),
                     scope,
+                    logger: self.inner.logger.clone(),
+                    log_fiber_id: self.inner.log_fiber_id,
+                    log_plugin_key: self.inner.log_plugin_key,
                 }),
             },
         })
@@ -731,7 +751,13 @@ impl Context {
         self.inner.parent.clone()
     }
 
-    pub(crate) fn with_scope(&self, scope: EffectScope) -> Context {
+    /// 换入 Effect Scope，并写入当前插件 Fiber 的日志来源元数据。
+    pub(crate) fn with_scope_and_log_source(
+        &self,
+        scope: EffectScope,
+        fiber_id: u64,
+        plugin_key: PluginKey,
+    ) -> Context {
         Context {
             inner: Arc::new(ContextInner {
                 identity: self.inner.identity.clone(),
@@ -740,8 +766,71 @@ impl Context {
                 configs: self.inner.configs.clone(),
                 registry: self.inner.registry.clone(),
                 scope,
+                logger: self.inner.logger.clone(),
+                log_fiber_id: Some(fiber_id),
+                log_plugin_key: Some(plugin_key),
             }),
         }
+    }
+
+    /// 当前 Context 的默认 Logger（目标名：`LOGGER_CONFIG.name` → PluginKey → `root`）。
+    ///
+    /// 仅 [`CoreError::ConfigUnavailable`] 表示无 `LOGGER_CONFIG` 覆盖（使用默认名/等级）；
+    /// `ContextDisposed`、配置类型冲突等其他错误原样返回。
+    pub fn logger(&self) -> Result<Logger, CoreError> {
+        let (name, default_level) = self.logger_defaults()?;
+        Ok(Logger::new(
+            self.inner.logger.clone(),
+            name,
+            default_level,
+            self.inner.log_fiber_id,
+            self.inner.log_plugin_key,
+        ))
+    }
+
+    /// 指定目标名称的 Logger。
+    pub fn logger_named(&self, name: impl Into<String>) -> Result<Logger, CoreError> {
+        let (_, default_level) = self.logger_defaults()?;
+        Ok(Logger::new(
+            self.inner.logger.clone(),
+            name.into(),
+            default_level,
+            self.inner.log_fiber_id,
+            self.inner.log_plugin_key,
+        ))
+    }
+
+    /// 在当前 Effect Scope 注册 exporter；Scope/Fiber 卸载时自动移除。
+    pub fn register_log_exporter(&self, exporter: Arc<dyn LogExporter>) -> Result<(), CoreError> {
+        self.ensure_alive()?;
+        let id = self.inner.logger.register_exporter(exporter);
+        let logger = self.inner.logger.clone();
+        self.inner.scope.on_dispose(move || {
+            logger.unregister_exporter(id);
+        });
+        Ok(())
+    }
+
+    fn logger_defaults(&self) -> Result<(String, LogLevel), CoreError> {
+        let config = match self.config(LOGGER_CONFIG) {
+            Ok(cfg) => Some(cfg),
+            Err(CoreError::ConfigUnavailable { .. }) => None,
+            Err(err) => return Err(err),
+        };
+        let name = config
+            .as_ref()
+            .and_then(|cfg| cfg.name.clone())
+            .or_else(|| {
+                self.inner
+                    .log_plugin_key
+                    .map(|key| key.as_str().to_string())
+            })
+            .unwrap_or_else(|| "root".into());
+        let default_level = config
+            .as_ref()
+            .and_then(|cfg| cfg.level)
+            .unwrap_or(LogLevel::Info);
+        Ok((name, default_level))
     }
 
     pub(crate) fn context_depth(&self) -> usize {

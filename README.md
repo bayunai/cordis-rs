@@ -23,6 +23,7 @@
 | [`cordis-loader`](crates/cordis-loader) | 可挂载的静态 Catalog EntryTree LoaderPlugin：v3 TOML 树、多树 reconcile、管理服务与原子持久化。 |
 | [`cordis-host`](crates/cordis-host) | 应用进程薄外壳：创建 Runtime、开放完整权限并受控关闭。 |
 | [`cordis-plugin-timer`](crates/cordis-plugin-timer) | Host 显式挂载的 Effect 作用域计时器能力（timeout / interval / throttle / debounce）。 |
+| [`cordis-plugin-logger-console`](crates/cordis-plugin-logger-console) | Host 显式挂载的控制台日志 exporter；不经 ServiceKey / isolate。 |
 | [`cordis-plugin-include`](crates/cordis-plugin-include) | 可选：TOML 文件驱动的嵌套 EntryTree（`cordis:include`）；须 Catalog 显式注册。 |
 | [`cordis-testkit`](crates/cordis-testkit) | 测试辅助；不应用于生产宿主。 |
 
@@ -111,6 +112,8 @@ cargo run -p cordis-host --example host_bootstrap
 - `Runtime::new()` 必须在 Tokio Runtime 内调用；专用调度器处理依赖变更后的重算。
 - `Context::extend()` 是不拥有独立生命周期的派生视图，并创建新的服务域；`isolate` /
   `isolate_with` 复用父服务 identity，仅隔离指定 `ServiceKey` 的可见性。
+- `Context::logger()?` 使用 Runtime 全局日志总线（不过滤等级），不受 `isolate` 影响；控制台
+  输出由 `cordis-plugin-logger-console` 显式挂载，按 target / `"default"` / `default_level` 过滤。
 - `Context::intercept()` 只覆盖 `ConfigKey`，**复用父视图的 Service identity**，不会隔离服务。
 - Loader EntryTree 中：顶层条目共享 Loader 根服务域；服务隔离由条目 `isolate` 声明驱动（见 Host 文档）；
   普通 Entry 默认不是服务边界。嵌套文件树由可选的 `cordis-plugin-include` 附着为独立

@@ -55,6 +55,24 @@ async fn main() -> Result<(), CoreError> {
 - 标签不可跨 Runtime。
 - Loader 侧通过 Catalog `IsolationDescriptor` + 条目 `isolate` 声明驱动上述 API（见 Host 文档）。
 
+## Logger
+
+- `ctx.logger()?` / `ctx.logger_named("x")?` 使用 Runtime 唯一的 `LoggerService`；`isolate` / Group **不能**换成另一总线。
+- 全局总线**不过滤**：`Debug` 也会进入缓冲并送达全部 exporter。
+- 默认目标名：`LOGGER_CONFIG.name` → 当前 PluginKey → `root`；`LOGGER_CONFIG.level`（缺省 `Info`）写入 `LogRecord.default_level`，供 exporter 回退，不决定是否创建记录。
+- `ConfigUnavailable`（无 `LOGGER_CONFIG`）时使用上述默认；`ContextDisposed`、配置类型冲突等其他错误由 `logger()` 原样返回。
+- `ctx.register_log_exporter(exporter)` 挂到当前 Effect Scope；Scope/Fiber 卸载后自动移除。
+- 控制台输出用独立 crate `cordis-plugin-logger-console`（Host 显式挂载，先于 Loader）：
+
+```rust
+let _console = host.root().plugin(Arc::new(ConsoleLoggerPlugin::default())).await?;
+ctx.logger()?.info("hello");
+```
+
+- Console `levels` 为 `BTreeMap`：完整 `target` → 键 `"default"` → `record.default_level`。
+- 若需经 Loader 管理 Console，应用自建 Factory；勿向 Core/Loader 引入反向依赖。
+- 首版无 JSON fields、文件/远程 exporter、HTTP 订阅或动态改配置。
+
 ## Context 与资源生命周期
 
 - `Context::extend()`、`isolate()` 返回的都是不可变派生视图，不登记 Runtime 节点，也没有 `dispose()`；无引用后自动回收。

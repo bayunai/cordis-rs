@@ -1,0 +1,19 @@
+[package]
+name = "cordis-plugin-logger-console"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+readme.workspace = true
+description = "Console log exporter plugin for cordis-core hosts."
+
+[dependencies]
+async-trait.workspace = true
+cordis-core.workspace = true
+time = { version = "0.3", features = ["formatting", "local-offset", "macros"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync"] }

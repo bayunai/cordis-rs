@@ -13,6 +13,7 @@ use crate::{
     diagnostics::RuntimeSnapshot,
     effect::EffectScope,
     fiber::{Fiber, FiberStateChange},
+    logger::LoggerService,
     plugin::group::UnmountCompletion,
     registry::Registry,
 };
@@ -36,6 +37,7 @@ pub struct Runtime {
 struct RuntimeInner {
     registry: Arc<Registry>,
     root: Context,
+    logger: Arc<LoggerService>,
     handle: Handle,
     shutdown: Mutex<Option<Arc<ShutdownCompletion>>>,
     /// 受控 shutdown 已完成 `stop_scheduler().await`；供 Drop 跳过 abort。
@@ -159,6 +161,7 @@ impl Runtime {
         registry.start_scheduler()?;
         let handle = tokio::runtime::Handle::current();
         let root_scope = EffectScope::root(handle.clone());
+        let logger = LoggerService::new();
         Ok(Self {
             inner: Arc::new(RuntimeInner {
                 registry: registry.clone(),
@@ -170,13 +173,22 @@ impl Runtime {
                         configs: std::collections::HashMap::new(),
                         registry: Arc::downgrade(&registry),
                         scope: root_scope,
+                        logger: logger.clone(),
+                        log_fiber_id: None,
+                        log_plugin_key: None,
                     }),
                 },
+                logger,
                 handle,
                 shutdown: Mutex::new(None),
                 scheduler_awaited: AtomicBool::new(false),
             }),
         })
+    }
+
+    /// Runtime 唯一的全局 LoggerService（不受 isolate / ServiceKey 影响）。
+    pub fn logger_service(&self) -> Arc<LoggerService> {
+        self.inner.logger.clone()
     }
 
     pub fn root(&self) -> Context {

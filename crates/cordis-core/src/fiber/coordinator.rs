@@ -439,7 +439,10 @@ mod lifecycle_completion_tests {
 
         let scope = inner.parent_scope.child_named("worker-abort-loading");
         let effect_id = scope.id();
-        let context = inner.context.with_scope(scope.clone());
+        let context =
+            inner
+                .context
+                .with_scope_and_log_source(scope.clone(), inner.id, inner.plugin_key);
         let registry = inner.registry.upgrade().expect("registry");
         registry.register_effect(
             effect_id,

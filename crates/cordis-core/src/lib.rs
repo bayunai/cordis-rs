@@ -12,6 +12,7 @@ mod error;
 mod event;
 mod fiber;
 mod isolation;
+mod logger;
 mod plugin;
 mod registry;
 mod runtime;
@@ -31,6 +32,10 @@ pub use event::{
 };
 pub use fiber::{Fiber, FiberState, FiberStateChange};
 pub use isolation::IsolationLabel;
+pub use logger::{
+    LOG_BUFFER_CAPACITY, LOGGER_CONFIG, LogExporter, LogLevel, LogRecord, Logger, LoggerConfig,
+    LoggerService,
+};
 pub use plugin::{Plugin, PluginKey};
 pub use registry::provider::ProviderHandle;
 pub use runtime::Runtime;

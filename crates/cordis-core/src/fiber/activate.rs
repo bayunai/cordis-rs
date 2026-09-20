@@ -215,7 +215,9 @@ impl FiberInner {
             Ok(scope) => scope,
             Err(error) => return Err(error),
         };
-        let apply_ctx = self.context.with_scope(effect_scope.clone());
+        let apply_ctx =
+            self.context
+                .with_scope_and_log_source(effect_scope.clone(), self.id, self.plugin_key);
         registry.register_effect(
             effect_scope.id(),
             effect_scope.name().to_string(),

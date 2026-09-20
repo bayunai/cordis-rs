@@ -245,7 +245,7 @@ impl<T: Send + 'static> Next<T> {
 
 /// 事件订阅句柄。
 ///
-/// 订阅默认归属当前 [`crate::effect::EffectScope`]；Scope 释放时自动退订。
+/// 订阅默认归属当前 Effect Scope；Scope 释放时自动退订。
 /// 调用 [`Unsubscribe::dispose`] 可提前退订。丢弃本句柄**不会**退订。
 pub struct Unsubscribe {
     dispose: Option<Box<dyn FnOnce() + Send>>,
