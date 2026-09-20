@@ -17,11 +17,11 @@ mod snapshot;
 pub use bootstrap::{load_bootstrap, load_extensions};
 pub use catalog::{
     ExtensionCatalog, ExtensionFactory, FactoryDescriptor, InjectionDescriptor,
-    InjectionDescriptorInfo,
+    InjectionDescriptorInfo, IsolationDescriptor, IsolationDescriptorInfo,
 };
 pub use config::{
     BootstrapConfig, BootstrapConfigSource, CONFIG_VERSION, ConfigDriver, EntryOptions,
-    ExtensionsConfig, GROUP_NAME, InjectConfig,
+    ExtensionsConfig, GROUP_NAME, InjectConfig, IsolateConfig, IsolateValue,
 };
 pub use error::LoaderError;
 pub use loader::{EntryUpdate, LOADER, Loader, LoaderControlError};

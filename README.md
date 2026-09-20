@@ -109,9 +109,9 @@ cargo run -p cordis-host --example host_bootstrap
 
 - `Runtime::new()` 必须在 Tokio Runtime 内调用；专用调度器处理依赖变更后的重算。
 - `Context::extend()` 是不拥有独立生命周期的派生视图，并创建新的服务域；`isolate` /
-  `isolate_with` 仅隔离指定 `ServiceKey` 的可见性。
+  `isolate_with` 复用父服务 identity，仅隔离指定 `ServiceKey` 的可见性。
 - `Context::intercept()` 只覆盖 `ConfigKey`，**复用父视图的 Service identity**，不会隔离服务。
-- Loader EntryTree 中：顶层条目共享 Loader 根服务域；每个 Group 一次 `extend()` 作为服务边界；
+- Loader EntryTree 中：顶层条目共享 Loader 根服务域；服务隔离由条目 `isolate` 声明驱动（见 Host 文档）；
   普通 Entry 默认不是服务边界。详见[Host 文档](docs/host.md)。
 - `Plugin` 用 `PluginKey` 标识，并由 Fiber 管理加载、替换、卸载与依赖变更后的重启。
 - `Effect` 统一归属插件的任务、监听器和清理回调；长期任务使用 `spawn`，一次性异步清理使用

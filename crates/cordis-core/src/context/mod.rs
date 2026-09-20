@@ -91,18 +91,41 @@ impl Context {
         })
     }
 
-    /// 创建仅对派生 Context 生效的新隔离标签。
+    /// 仅覆盖指定 ServiceKey 的隔离标签，复用父视图的 Service identity。
+    fn overlay_isolations(
+        &self,
+        isolations: HashMap<ServiceId, IsolationLabel>,
+    ) -> Result<Self, CoreError> {
+        self.ensure_alive()?;
+        Ok(Self {
+            inner: Arc::new(ContextInner {
+                identity: self.inner.identity.clone(),
+                parent: Some(self.clone()),
+                isolations,
+                configs: HashMap::new(),
+                registry: self.inner.registry.clone(),
+                scope: self.inner.scope.clone(),
+            }),
+        })
+    }
+
+    /// 为指定 ServiceKey 创建仅对派生 Context 生效的新隔离标签。
+    ///
+    /// 复用父视图的 Service identity：未隔离的服务仍与父级同槽；需要完整新服务域时使用
+    /// [`Self::extend`]。
     pub fn isolate<T: Send + Sync + 'static>(
         &self,
         key: ServiceKey<T>,
     ) -> Result<(Self, IsolationLabel), CoreError> {
         self.ensure_alive()?;
         let label = self.registry()?.allocate_isolation_label();
-        let view = self.extend_with(HashMap::from([(key.id(), label.clone())]), HashMap::new())?;
+        let view = self.overlay_isolations(HashMap::from([(key.id(), label.clone())]))?;
         Ok((view, label))
     }
 
-    /// 创建加入既有隔离标签的派生 Context；跨 Runtime 标签报错。
+    /// 为指定 ServiceKey 加入既有隔离标签；跨 Runtime 标签报错。
+    ///
+    /// 同样复用父 Service identity，仅覆盖该 Key 的隔离可见性。
     pub fn isolate_with<T: Send + Sync + 'static>(
         &self,
         key: ServiceKey<T>,
@@ -110,13 +133,13 @@ impl Context {
     ) -> Result<Self, CoreError> {
         self.ensure_alive()?;
         label.ensure_runtime(self.registry()?.runtime_token())?;
-        self.extend_with(HashMap::from([(key.id(), label)]), HashMap::new())
+        self.overlay_isolations(HashMap::from([(key.id(), label)]))
     }
 
     /// 创建带不可变配置覆盖的派生视图；父与兄弟节点的配置不变。
     ///
     /// 配置按父链最近覆盖解析；`provide` / `get` / `inject` 仍使用与父相同的服务域
-    ///（复用 Service identity）。若需要新的服务域，使用 [`Self::extend`] 或 [`Self::isolate`]。
+    ///（复用 Service identity）。若需要新的服务域，使用 [`Self::extend`]。
     pub fn intercept<T: Send + Sync + 'static>(
         &self,
         key: ConfigKey<T>,

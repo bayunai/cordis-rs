@@ -231,12 +231,14 @@ impl LoaderInner {
                 })?;
         }
 
-        let domain = if node.options.group {
-            parent_context
-                .extend()
-                .map_err(|source| LoaderError::Runtime { source })?
-        } else {
-            parent_context
+        let domain = {
+            let mut labels = self.named_labels.lock().expect("named labels");
+            self.catalog.resolve_isolations(
+                node.options.isolate.as_ref(),
+                path.as_str(),
+                parent_context,
+                &mut labels,
+            )?
         };
         let (context, dependencies) =
             self.catalog
@@ -402,7 +404,9 @@ pub(crate) fn plan_reconcile(
         }
 
         if node.options.group {
-            if current.options.inject != node.options.inject {
+            if current.options.inject != node.options.inject
+                || current.options.isolate != node.options.isolate
+            {
                 rebuild_subtrees.insert(path.clone());
             } else {
                 let parent_disabled = ancestor_disabled(path, desired);
@@ -424,6 +428,7 @@ pub(crate) fn plan_reconcile(
             let parent_disabled = ancestor_disabled(path, desired);
             let want_enabled = !parent_disabled && !node.options.disabled;
             let inject_changed = current.options.inject != node.options.inject;
+            let isolate_changed = current.options.isolate != node.options.isolate;
             let config_changed = current.options.config != node.options.config;
             let failed = current
                 .fiber
@@ -435,6 +440,7 @@ pub(crate) fn plan_reconcile(
                 .is_some_and(|fiber| fiber.is_disposed());
 
             if inject_changed
+                || isolate_changed
                 || current.enabled != want_enabled
                 || (want_enabled && (current.fiber.is_none() || disposed))
             {

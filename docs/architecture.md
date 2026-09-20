@@ -26,7 +26,7 @@
 当前 `cordis-loader` 实现的锚点只有文件配置源：
 
 ```toml
-version = 2
+version = 3
 
 [config]
 driver = "file"
@@ -60,9 +60,9 @@ bootstrap.toml
 
 - `IsolationLabel` 由 Runtime 分配，跨 Runtime 使用 → `IsolationRuntimeMismatch`。
 - `Context::extend()` 创建不可变派生 Context 视图，不创建 Registry 节点或 Scope；父 Context 不会被修改，最后一个引用释放后视图自然回收。
-- `Context::isolate(key)` 返回 `(派生 Context, 新标签)`；`isolate_with(key, label)` 返回加入既有标签的派生 Context。
+- `Context::isolate(key)` 返回 `(派生 Context, 新标签)`；`isolate_with(key, label)` 返回加入既有标签的派生 Context。二者**复用父 Service identity**，只覆盖声明的 Key。
 - 解析：若当前 Context 谱系对该 Key 有隔离覆盖，则只看同 label 的 Provider；否则走父子 Local 覆盖。最近槽位即使未就绪也会遮蔽父级，严格解析绝不静默回退。
-- 隔离**只影响声明的 Key**；其他 Service 仍按父子链解析。
+- 隔离**只影响声明的 Key**；其他 Service 仍按父子链解析，且与父同槽（可共享或 `ServiceConflict`）。
 
 ## 响应式注入
 
@@ -136,7 +136,7 @@ Context::plugin(Arc<dyn Plugin>)
 
 `ConfigKey<T>` 独立于 `ServiceKey`。`Context::intercept(key, value)` 创建**共享父视图 Service
 identity** 的派生配置视图并写入覆盖；`config(key)` 向父链查找最近值。`provide` / `get` /
-`inject` 的服务域不因配置覆盖而改变。需要新服务域时使用 `extend()` 或 `isolate()`。
+`inject` 的服务域不因配置覆盖而改变。需要新服务域时使用 `extend()`；按 Key 隔离可见性使用 `isolate` / `isolate_with`。
 
 ## Plugin Registry
 

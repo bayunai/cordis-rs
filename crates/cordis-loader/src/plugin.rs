@@ -2,7 +2,7 @@
 
 use crate::{
     bootstrap::{load_bootstrap, load_extensions_source},
-    catalog::ExtensionCatalog,
+    catalog::{ExtensionCatalog, NamedIsolationLabels},
     config::{EntryOptions, ExtensionsConfig},
     error::LoaderError,
     loader::{LOADER, Loader},
@@ -102,6 +102,7 @@ impl LoaderPlugin {
             revision: Mutex::new(revision),
             entries: Mutex::new(BTreeMap::new()),
             order: Mutex::new(Vec::new()),
+            named_labels: Mutex::new(NamedIsolationLabels::new()),
             reconcile: Mutex::new(None),
             loader_operations: tokio::sync::Mutex::new(()),
             alive: AtomicBool::new(true),
@@ -187,6 +188,7 @@ pub(crate) struct LoaderInner {
     pub(crate) revision: Mutex<Option<String>>,
     pub(crate) entries: Mutex<BTreeMap<EntryId, MountedEntry>>,
     pub(crate) order: Mutex<Vec<EntryId>>,
+    pub(crate) named_labels: Mutex<NamedIsolationLabels>,
     reconcile: Mutex<Option<Arc<ReconcileCompletion>>>,
     pub(crate) loader_operations: tokio::sync::Mutex<()>,
     pub(crate) alive: AtomicBool,
@@ -255,6 +257,7 @@ impl LoaderInner {
                 if let Some(revision) = revision {
                     *inner.revision.lock().expect("revision") = Some(revision);
                 }
+                inner.prune_named_isolation_labels();
             }
             let mut slot = inner.reconcile.lock().expect("reconcile slot");
             if slot
@@ -309,6 +312,29 @@ impl LoaderInner {
             .ok_or_else(|| LoaderError::UnknownInstance {
                 instance: path.into(),
             })
+    }
+
+    pub(crate) fn prune_named_isolation_labels(&self) {
+        let desired = self.desired.lock().expect("desired");
+        let mut live = std::collections::HashSet::new();
+        collect_named_isolation_refs(&self.catalog, &desired.extensions, &mut live);
+        let mut labels = self.named_labels.lock().expect("named labels");
+        labels.retain(|key, _| live.contains(key));
+    }
+}
+
+fn collect_named_isolation_refs(
+    catalog: &ExtensionCatalog,
+    entries: &[EntryOptions],
+    out: &mut std::collections::HashSet<(cordis_core::ServiceId, String)>,
+) {
+    for entry in entries {
+        catalog.collect_named_isolation_refs(entry.isolate.as_ref(), out);
+        if entry.group
+            && let Ok(children) = entry.children()
+        {
+            collect_named_isolation_refs(catalog, &children, out);
+        }
     }
 }
 

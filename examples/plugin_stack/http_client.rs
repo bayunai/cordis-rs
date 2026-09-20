@@ -99,10 +99,7 @@ impl Plugin for HttpPlugin {
             .build()
             .map_err(|e| CoreError::PluginApply(e.to_string()))?;
         ctx.provide(HTTP, HttpCaller { logger, client })?;
-        bus(
-            &self.bus,
-            format!("sys: http apply (label={})", self.label),
-        );
+        bus(&self.bus, format!("sys: http apply (label={})", self.label));
         let bus_d = self.bus.clone();
         ctx.effect()?.on_dispose(move || {
             bus(&bus_d, "sys: http disposed");

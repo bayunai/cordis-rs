@@ -49,10 +49,11 @@ async fn main() -> Result<(), CoreError> {
 
 ## Isolation
 
-- `let (isolated, label) = ctx.isolate(KEY)?` 创建带新标签的派生 Context；原 `ctx` 不变。
+- `let (isolated, label) = ctx.isolate(KEY)?` 创建带新标签的派生 Context；**复用父服务 identity**，原 `ctx` 不变。
 - `ctx.isolate_with(KEY, label)?` 创建加入既有标签的派生 Context。
 - 同 label 的兄弟 Context 共享该 Key；未加入 label 的 Context 不可见。
 - 标签不可跨 Runtime。
+- Loader 侧通过 Catalog `IsolationDescriptor` + 条目 `isolate` 声明驱动上述 API（见 Host 文档）。
 
 ## Context 与资源生命周期
 
@@ -117,12 +118,14 @@ Loader 读取 EntryTree → 反序列化为 `Factory::Config` → factory.build(
   `Loader` 公开给管理界面生成配置表单。
 - 校验或反序列化失败时，Loader 不执行 reconcile，也不写回配置文件。
 - Loader 按 Entry/子树差分更新：仅受影响节点参与生命周期；纯排序不重启 Fiber。
-  `inject`/父 Context 不变的普通配置更新走 `Fiber::replace`；Group `inject` 变化重建该子树。
+  `inject`/`isolate`/父 Context 不变的普通配置更新走 `Fiber::replace`；Group 的 `inject` 或
+  `isolate` 变化重建该子树。
 - 插件不得自行保存可变 Loader 配置。
 - 不得修改已挂载实例的内部配置后调用 `restart()`；`restart()` 仅用于配置未变的重新执行。
-- **服务域**：顶层条目共享 Loader 根域；每个 Group 是独立服务边界；同 Group 子项互相可见。
-  `inject = { ... }` 只覆盖 `ConfigKey`，不会把条目变成独立服务域。跨 Group 的 `provide`
-  互不可见，因此不同 Group 可重复同一 `ServiceKey`。
+- **服务域**：顶层与 Group 默认共享父服务域（Group **不再** `extend()`）。服务隔离唯一手段是
+  条目上的 `isolate`（Catalog 须先 `register_isolation`）：`true` 独占运行期标签，非空字符串
+  按 `(ServiceId, 标签名)` 在 Loader 内复用。`inject = { ... }` 只覆盖 `ConfigKey`。未隔离的
+  Key 与父同槽，可共享也可 `ServiceConflict`。
 
 ## ServiceKey / Event Key
 

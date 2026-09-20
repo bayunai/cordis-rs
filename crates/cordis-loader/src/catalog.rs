@@ -1,7 +1,10 @@
-//! 静态 Factory 与可配置注入目录。
+//! 静态 Factory、可配置注入与服务隔离目录。
 
-use crate::error::{LoaderError, format_panic_message};
-use cordis_core::{ConfigKey, Context, Plugin, ServiceId, ServiceKey};
+use crate::{
+    config::{IsolateConfig, IsolateValue},
+    error::{LoaderError, format_panic_message},
+};
+use cordis_core::{ConfigKey, Context, CoreError, IsolationLabel, Plugin, ServiceId, ServiceKey};
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 use serde_json::Value as JsonValue;
@@ -13,6 +16,10 @@ use std::{
 
 type InjectionValidator = Arc<dyn Fn(&toml::Value) -> Result<(), String> + Send + Sync>;
 type InjectionApplier = Arc<dyn Fn(Context, &toml::Value) -> Result<Context, String> + Send + Sync>;
+type IsolateExclusive =
+    Arc<dyn Fn(Context) -> Result<(Context, IsolationLabel), CoreError> + Send + Sync>;
+type IsolateNamed =
+    Arc<dyn Fn(Context, IsolationLabel) -> Result<Context, CoreError> + Send + Sync>;
 
 pub trait ExtensionFactory: Send + Sync + 'static {
     type Config: DeserializeOwned + JsonSchema + Send + Sync + 'static;
@@ -122,10 +129,46 @@ impl InjectionDescriptor {
     }
 }
 
+/// 编译期登记的可隔离服务；TOML `isolate` 的键必须命中此处。
+#[derive(Clone)]
+pub struct IsolationDescriptor {
+    id: &'static str,
+    service: ServiceId,
+    apply_exclusive: IsolateExclusive,
+    apply_named: IsolateNamed,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct IsolationDescriptorInfo {
+    pub id: String,
+    pub service: String,
+}
+
+impl IsolationDescriptor {
+    pub fn new<T: Send + Sync + 'static>(id: &'static str, key: ServiceKey<T>) -> Self {
+        Self {
+            id,
+            service: key.id(),
+            apply_exclusive: Arc::new(move |context| context.isolate(key)),
+            apply_named: Arc::new(move |context, label| context.isolate_with(key, label)),
+        }
+    }
+    fn info(&self) -> IsolationDescriptorInfo {
+        IsolationDescriptorInfo {
+            id: self.id.into(),
+            service: self.service.as_str().into(),
+        }
+    }
+}
+
+/// Loader 内命名隔离标签仓库：`(ServiceId, 标签名) → IsolationLabel`。
+pub(crate) type NamedIsolationLabels = HashMap<(ServiceId, String), IsolationLabel>;
+
 #[derive(Clone, Default)]
 pub struct ExtensionCatalog {
     factories: HashMap<&'static str, FactoryRecord>,
     injections: HashMap<&'static str, InjectionDescriptor>,
+    isolations: HashMap<&'static str, IsolationDescriptor>,
 }
 
 impl ExtensionCatalog {
@@ -164,6 +207,29 @@ impl ExtensionCatalog {
         self.injections.insert(descriptor.id, descriptor);
         Ok(())
     }
+    pub fn register_isolation(
+        &mut self,
+        descriptor: IsolationDescriptor,
+    ) -> Result<(), LoaderError> {
+        if self.isolations.contains_key(descriptor.id) {
+            return Err(LoaderError::DuplicateIsolation {
+                id: descriptor.id.into(),
+            });
+        }
+        if let Some(existing) = self
+            .isolations
+            .values()
+            .find(|existing| existing.service == descriptor.service)
+        {
+            return Err(LoaderError::DuplicateIsolationService {
+                service: descriptor.service.as_str().into(),
+                registered: existing.id.into(),
+                attempted: descriptor.id.into(),
+            });
+        }
+        self.isolations.insert(descriptor.id, descriptor);
+        Ok(())
+    }
     pub(crate) fn get(&self, id: &str) -> Option<&Arc<dyn ErasedExtensionFactory>> {
         self.factories.get(id).map(|record| &record.factory)
     }
@@ -184,6 +250,15 @@ impl ExtensionCatalog {
             .injections
             .values()
             .map(InjectionDescriptor::info)
+            .collect::<Vec<_>>();
+        values.sort_by(|left, right| left.id.cmp(&right.id));
+        values
+    }
+    pub fn isolations(&self) -> Vec<IsolationDescriptorInfo> {
+        let mut values = self
+            .isolations
+            .values()
+            .map(IsolationDescriptor::info)
             .collect::<Vec<_>>();
         values.sort_by(|left, right| left.id.cmp(&right.id));
         values
@@ -214,6 +289,16 @@ impl ExtensionCatalog {
             })?;
         }
         Ok(())
+    }
+    pub(crate) fn validate_isolation(&self, id: &str, entry: &str) -> Result<(), LoaderError> {
+        if self.isolations.contains_key(id) {
+            Ok(())
+        } else {
+            Err(LoaderError::UnknownIsolation {
+                entry: entry.into(),
+                isolation: id.into(),
+            })
+        }
     }
     pub(crate) fn resolve_injections(
         &self,
@@ -263,5 +348,80 @@ impl ExtensionCatalog {
             }
         }
         Ok((context, dependencies))
+    }
+
+    /// 先应用 `isolate`（独占或命名共享），再由调用方继续 `resolve_injections`。
+    pub(crate) fn resolve_isolations(
+        &self,
+        isolate: Option<&IsolateConfig>,
+        entry: &str,
+        context: Context,
+        labels: &mut NamedIsolationLabels,
+    ) -> Result<Context, LoaderError> {
+        let Some(isolate) = isolate else {
+            return Ok(context);
+        };
+        let mut context = context;
+        for (id, value) in isolate {
+            let descriptor =
+                self.isolations
+                    .get(id.as_str())
+                    .ok_or_else(|| LoaderError::UnknownIsolation {
+                        entry: entry.into(),
+                        isolation: id.clone(),
+                    })?;
+            match value {
+                IsolateValue::Flag(true) => {
+                    let (next, _) = (descriptor.apply_exclusive)(context)
+                        .map_err(|source| LoaderError::Runtime { source })?;
+                    context = next;
+                }
+                IsolateValue::Flag(false) => {
+                    return Err(LoaderError::InvalidEntry {
+                        path: entry.into(),
+                        message: format!("isolate.{id} 仅允许 true 或非空字符串"),
+                    });
+                }
+                IsolateValue::Name(name) => {
+                    if name.is_empty() {
+                        return Err(LoaderError::InvalidEntry {
+                            path: entry.into(),
+                            message: format!("isolate.{id} 的命名标签不得为空"),
+                        });
+                    }
+                    let key = (descriptor.service, name.clone());
+                    let label = if let Some(label) = labels.get(&key) {
+                        label.clone()
+                    } else {
+                        let (_, label) = (descriptor.apply_exclusive)(context.clone())
+                            .map_err(|source| LoaderError::Runtime { source })?;
+                        labels.insert(key, label.clone());
+                        label
+                    };
+                    context = (descriptor.apply_named)(context, label)
+                        .map_err(|source| LoaderError::Runtime { source })?;
+                }
+            }
+        }
+        Ok(context)
+    }
+
+    /// 收集目标树仍引用的命名标签键，供 reconcile 成功后清理。
+    pub(crate) fn collect_named_isolation_refs(
+        &self,
+        isolate: Option<&IsolateConfig>,
+        out: &mut std::collections::HashSet<(ServiceId, String)>,
+    ) {
+        let Some(isolate) = isolate else {
+            return;
+        };
+        for (id, value) in isolate {
+            if let IsolateValue::Name(name) = value
+                && !name.is_empty()
+                && let Some(descriptor) = self.isolations.get(id.as_str())
+            {
+                out.insert((descriptor.service, name.clone()));
+            }
+        }
     }
 }

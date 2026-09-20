@@ -2,8 +2,8 @@
 
 use crate::{
     bootstrap::{load_extensions_source, write_extensions},
-    catalog::{FactoryDescriptor, InjectionDescriptorInfo},
-    config::{EntryOptions, ExtensionsConfig, InjectConfig},
+    catalog::{FactoryDescriptor, InjectionDescriptorInfo, IsolationDescriptorInfo},
+    config::{EntryOptions, ExtensionsConfig, InjectConfig, IsolateConfig},
     error::LoaderError,
     plugin::LoaderInner,
     snapshot::LoaderSnapshot,
@@ -18,6 +18,7 @@ pub struct EntryUpdate {
     pub config: Option<toml::Value>,
     pub disabled: Option<bool>,
     pub inject: Option<Option<InjectConfig>>,
+    pub isolate: Option<Option<IsolateConfig>>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -66,6 +67,9 @@ impl Loader {
     }
     pub fn injections(&self) -> Result<Vec<InjectionDescriptorInfo>, LoaderControlError> {
         Ok(self.inner()?.catalog.injections())
+    }
+    pub fn isolations(&self) -> Result<Vec<IsolationDescriptorInfo>, LoaderControlError> {
+        Ok(self.inner()?.catalog.isolations())
     }
     pub async fn await_idle(&self) -> Result<LoaderSnapshot, LoaderControlError> {
         Ok(self.inner()?.await_idle().await?)
@@ -296,6 +300,9 @@ fn patch_nested(
         }
         if let Some(inject) = patch.inject {
             entry.inject = inject;
+        }
+        if let Some(isolate) = patch.isolate {
+            entry.isolate = isolate;
         }
         return Ok(());
     }

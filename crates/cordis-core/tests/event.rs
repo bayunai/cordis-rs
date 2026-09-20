@@ -408,8 +408,8 @@ async fn event_prepend_orders_newest_first_then_normal() {
 async fn event_global_crosses_sibling_contexts_local_does_not() {
     let runtime = runtime();
     let root = runtime.root();
-    let (left, _) = root.isolate(NUMBER).unwrap();
-    let (right, _) = root.isolate(NUMBER).unwrap();
+    let left = root.extend().unwrap();
+    let right = root.extend().unwrap();
     let local_hits = Arc::new(AtomicUsize::new(0));
     let global_hits = Arc::new(AtomicUsize::new(0));
     let local = local_hits.clone();

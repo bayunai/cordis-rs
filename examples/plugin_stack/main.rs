@@ -7,7 +7,7 @@
 //!
 //! 初始树：
 //! - `side`：根级旁路，观察 `app` 子树变更时 Fiber ID 是否保持
-//! - `app` Group：`db` → `logger` → `http`（同组共享服务域）
+//! - `app` Group：`db` → `logger` → `http`（组上显式 `isolate`，组内共享、对根不可见）
 
 mod db;
 mod http_client;
@@ -27,13 +27,13 @@ use axum::{
 };
 use cordis_core::{FiberState, FiberStateSnapshot, Plugin, Runtime};
 use cordis_loader::{
-    EntryOptions, EntryUpdate, ExtensionCatalog, ExtensionFactory, ExtensionsConfig, LOADER,
-    Loader, LoaderError, LoaderPlugin, LoaderSnapshot,
+    EntryOptions, EntryUpdate, ExtensionCatalog, ExtensionFactory, ExtensionsConfig, IsolateValue,
+    IsolationDescriptor, LOADER, Loader, LoaderError, LoaderPlugin, LoaderSnapshot,
 };
 use db::{DbPlugin, LogTx};
 use futures_util::stream::{Stream, unfold};
 use http_client::{HttpConfig, HttpPlugin};
-use keys::{DB, HTTP, KEY_DB, KEY_HTTP, KEY_LOGGER, KEY_SIDE};
+use keys::{DB, HTTP, KEY_DB, KEY_HTTP, KEY_LOGGER, KEY_SIDE, LOGGER};
 use logger::LoggerPlugin;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -602,6 +602,9 @@ fn build_catalog(bus: LogTx) -> Result<ExtensionCatalog, LoaderError> {
         build: |bus| Arc::new(LoggerPlugin { bus }) as Arc<dyn Plugin>,
     })?;
     catalog.register(HttpFactory { bus })?;
+    catalog.register_isolation(IsolationDescriptor::new("db", DB))?;
+    catalog.register_isolation(IsolationDescriptor::new("logger", LOGGER))?;
+    catalog.register_isolation(IsolationDescriptor::new("http", HTTP))?;
     Ok(catalog)
 }
 
@@ -615,9 +618,17 @@ fn initial_extensions() -> Result<ExtensionsConfig, LoaderError> {
             EntryOptions::new("logger", "demo.stack.logger"),
             EntryOptions::new("http", "demo.stack.http").with_config(toml::Value::Table(http_cfg)),
         ],
-    )?;
+    )?
+    .with_isolate(
+        [
+            ("db".into(), IsolateValue::Flag(true)),
+            ("logger".into(), IsolateValue::Flag(true)),
+            ("http".into(), IsolateValue::Flag(true)),
+        ]
+        .into(),
+    );
     Ok(ExtensionsConfig {
-        version: 2,
+        version: 3,
         extensions: vec![EntryOptions::new("side", "demo.stack.side"), app],
     })
 }
@@ -627,7 +638,7 @@ fn write_bootstrap_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
     fs::create_dir_all(&dir)?;
     fs::write(
         dir.join("bootstrap.toml"),
-        "version = 2\n[config]\ndriver = \"file\"\npath = \"extensions.toml\"\n",
+        "version = 3\n[config]\ndriver = \"file\"\npath = \"extensions.toml\"\n",
     )?;
     fs::write(
         dir.join("extensions.toml"),

@@ -188,6 +188,41 @@ async fn extend_and_isolate_still_isolate_services() {
 }
 
 #[tokio::test]
+async fn isolate_keeps_unisolated_services_in_parent_domain() {
+    let runtime = runtime();
+    let root = runtime.root();
+    root.provide(NUMBER, Number(1)).unwrap();
+
+    let (isolated, _) = root.isolate(DERIVED).unwrap();
+    assert_eq!(isolated.get(NUMBER).unwrap().0, 1);
+    assert_service_unavailable(&isolated, DERIVED);
+
+    let owner = isolated.effect().unwrap();
+    owner.provide(DERIVED, Number(9)).unwrap();
+    assert_eq!(isolated.get(DERIVED).unwrap().0, 9);
+    assert_service_unavailable(&root, DERIVED);
+
+    // 未隔离 Key 与父同槽：重复 provide 冲突。
+    assert!(matches!(
+        isolated.provide(NUMBER, Number(3)),
+        Err(CoreError::ServiceConflict { .. })
+    ));
+}
+
+#[tokio::test]
+async fn isolate_unisolated_provide_is_visible_on_parent() {
+    let runtime = runtime();
+    let root = runtime.root();
+    let (isolated, _) = root.isolate(DERIVED).unwrap();
+    let owner = isolated.effect().unwrap();
+    owner.provide(NUMBER, Number(7)).unwrap();
+    assert_eq!(root.get(NUMBER).unwrap().0, 7);
+    assert_eq!(isolated.get(NUMBER).unwrap().0, 7);
+    owner.dispose();
+    assert_service_unavailable(&root, NUMBER);
+}
+
+#[tokio::test]
 async fn intercept_type_conflict_and_plugin_can_read_config() {
     use cordis_core::ConfigKey;
 

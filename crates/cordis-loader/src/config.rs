@@ -1,4 +1,4 @@
-//! `extensions.toml` 的 v2 EntryTree 配置合同。
+//! `extensions.toml` 的 v3 EntryTree 配置合同。
 
 use crate::{catalog::ExtensionCatalog, error::LoaderError};
 use serde::{Deserialize, Serialize};
@@ -7,7 +7,7 @@ use std::{
     path::Path,
 };
 
-pub const CONFIG_VERSION: u32 = 2;
+pub const CONFIG_VERSION: u32 = 3;
 pub const GROUP_NAME: &str = "cordis:group";
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -46,6 +46,17 @@ pub enum InjectConfig {
     Map(BTreeMap<String, toml::Value>),
 }
 
+/// 服务隔离声明：`true` 为独占标签，非空字符串为命名共享标签。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum IsolateValue {
+    Flag(bool),
+    Name(String),
+}
+
+/// `isolate = { logger = true }` / `{ logger = "team-ab" }`。
+pub type IsolateConfig = BTreeMap<String, IsolateValue>;
+
 /// 一个普通插件或内建 Group 节点。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -60,6 +71,8 @@ pub struct EntryOptions {
     pub disabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inject: Option<InjectConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub isolate: Option<IsolateConfig>,
 }
 
 fn empty_table() -> toml::Value {
@@ -75,6 +88,7 @@ impl EntryOptions {
             group: false,
             disabled: false,
             inject: None,
+            isolate: None,
         }
     }
     pub fn group(id: impl Into<String>, children: Vec<EntryOptions>) -> Result<Self, LoaderError> {
@@ -88,6 +102,7 @@ impl EntryOptions {
             group: true,
             disabled: false,
             inject: None,
+            isolate: None,
         })
     }
     pub fn with_config(mut self, config: toml::Value) -> Self {
@@ -96,6 +111,10 @@ impl EntryOptions {
     }
     pub fn with_inject(mut self, inject: InjectConfig) -> Self {
         self.inject = Some(inject);
+        self
+    }
+    pub fn with_isolate(mut self, isolate: IsolateConfig) -> Self {
+        self.isolate = Some(isolate);
         self
     }
     pub fn children(&self) -> Result<Vec<EntryOptions>, LoaderError> {
@@ -148,6 +167,7 @@ fn validate_entries(
             return Err(LoaderError::DuplicateEntry { path });
         }
         validate_inject(entry, catalog, &path)?;
+        validate_isolate(entry, catalog, &path)?;
         if entry.group {
             if entry.name != GROUP_NAME {
                 return Err(LoaderError::InvalidEntry {
@@ -190,6 +210,36 @@ fn validate_inject(
                 catalog.validate_injection(id, Some(value), path)?;
             }
         }
+    }
+    Ok(())
+}
+
+fn validate_isolate(
+    entry: &EntryOptions,
+    catalog: &ExtensionCatalog,
+    path: &str,
+) -> Result<(), LoaderError> {
+    let Some(isolate) = &entry.isolate else {
+        return Ok(());
+    };
+    for (id, value) in isolate {
+        match value {
+            IsolateValue::Flag(true) => {}
+            IsolateValue::Flag(false) => {
+                return Err(LoaderError::InvalidEntry {
+                    path: path.into(),
+                    message: format!("isolate.{id} 仅允许 true 或非空字符串，不能为 false"),
+                });
+            }
+            IsolateValue::Name(name) if name.is_empty() => {
+                return Err(LoaderError::InvalidEntry {
+                    path: path.into(),
+                    message: format!("isolate.{id} 的命名标签不得为空"),
+                });
+            }
+            IsolateValue::Name(_) => {}
+        }
+        catalog.validate_isolation(id, path)?;
     }
     Ok(())
 }
