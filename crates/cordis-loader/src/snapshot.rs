@@ -1,6 +1,6 @@
 //! Loader 诊断快照：把配置实例与 Core Fiber 关联起来。
 
-use cordis_core::{FiberState, PluginKey, RuntimeSnapshot};
+use cordis_core::{FiberState, PluginKey};
 use std::fmt;
 
 /// 配置层实例身份，例如 `primary-database`。
@@ -35,11 +35,10 @@ impl From<String> for InstanceId {
     }
 }
 
-/// Loader + Runtime 联合快照。
+/// Loader 管理的实例快照。
 #[derive(Debug, Clone)]
 pub struct LoaderSnapshot {
     pub instances: Vec<InstanceSnapshot>,
-    pub runtime: RuntimeSnapshot,
 }
 
 /// 单个已编排实例。

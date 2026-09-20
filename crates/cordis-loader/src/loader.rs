@@ -5,7 +5,7 @@ use crate::{
     catalog::FactoryDescriptor,
     config::{ExtensionEntry, ExtensionsConfig},
     error::LoaderError,
-    runtime::{CordisLoader, LoaderInner},
+    plugin::LoaderInner,
     snapshot::LoaderSnapshot,
 };
 use cordis_core::ServiceKey;
@@ -63,10 +63,27 @@ impl Loader {
         Ok(inner.desired.lock().expect("desired").clone())
     }
 
+    /// 返回指定实例的 Context。
+    ///
+    /// 条目服务只在其自己的 Context 子树中可见；应用读取实例服务时须使用此入口。
+    pub fn entry_context(
+        &self,
+        instance: impl AsRef<str>,
+    ) -> Result<cordis_core::Context, LoaderControlError> {
+        Ok(self.inner()?.entry_context(instance.as_ref())?)
+    }
+
     /// 返回静态 Catalog 中全部可创建 Factory 及其 JSON Schema。
     pub fn factories(&self) -> Result<Vec<FactoryDescriptor>, LoaderControlError> {
         let inner = self.inner()?;
         Ok(inner.catalog.factories()?)
+    }
+
+    /// 等待 Loader 当前正在执行的 reconcile 完成。
+    ///
+    /// 不等待 Runtime 中与 Loader 无关的调度或插件工作。
+    pub async fn await_idle(&self) -> Result<LoaderSnapshot, LoaderControlError> {
+        Ok(self.inner()?.await_idle().await?)
     }
 
     /// 新建一个实例，并在成功挂载后写回完整配置。
@@ -158,10 +175,7 @@ impl Loader {
         let _operation = inner.loader_operations.lock().await;
         let path = source_path(&inner)?;
         let (config, revision) = load_extensions_source(&path)?;
-        let host = CordisLoader {
-            inner: inner.clone(),
-        };
-        Ok(host.apply_with_revision(config, Some(revision)).await?)
+        Ok(inner.apply(config, Some(revision)).await?)
     }
 
     async fn mutate<F>(&self, mutate: F) -> Result<LoaderSnapshot, LoaderControlError>
@@ -174,10 +188,7 @@ impl Loader {
         ensure_revision(&inner, &path)?;
         let mut target = inner.desired.lock().expect("desired").clone();
         mutate(&mut target)?;
-        let host = CordisLoader {
-            inner: inner.clone(),
-        };
-        let snapshot = host.apply(target.clone()).await?;
+        let snapshot = inner.apply(target.clone(), None).await?;
         match write_extensions(&path, &target) {
             Ok(revision) => {
                 *inner.revision.lock().expect("revision") = Some(revision);
@@ -192,9 +203,15 @@ impl Loader {
     }
 
     fn inner(&self) -> Result<std::sync::Arc<LoaderInner>, LoaderControlError> {
-        self.inner
+        let inner = self
+            .inner
             .upgrade()
-            .ok_or(LoaderControlError::LoaderUnavailable)
+            .ok_or(LoaderControlError::LoaderUnavailable)?;
+        if inner.alive.load(std::sync::atomic::Ordering::Acquire) {
+            Ok(inner)
+        } else {
+            Err(LoaderControlError::LoaderUnavailable)
+        }
     }
 }
 

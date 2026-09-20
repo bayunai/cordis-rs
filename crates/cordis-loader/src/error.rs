@@ -39,6 +39,8 @@ pub enum LoaderError {
         from: String,
         to: String,
     },
+    #[error("实例 {instance} 不存在")]
+    UnknownInstance { instance: String },
     #[error("实例 {instance} 的 PluginKey 不允许更换：期望 {expected}，实际 {actual}")]
     PluginKeyChanged {
         instance: String,

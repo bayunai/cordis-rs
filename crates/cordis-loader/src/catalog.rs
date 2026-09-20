@@ -63,13 +63,14 @@ pub struct FactoryDescriptor {
     pub schema: JsonValue,
 }
 
+#[derive(Clone)]
 struct FactoryRecord {
     factory: Arc<dyn ErasedExtensionFactory>,
     descriptor: FactoryDescriptor,
 }
 
 /// 进程内工厂目录。
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct ExtensionCatalog {
     factories: HashMap<&'static str, FactoryRecord>,
 }

@@ -1,61 +1,42 @@
-//! 应用 Host 外壳：负责应用进程对 Loader 的启动、访问与关闭。
+//! 应用 Host 外壳：负责 Runtime 的创建、访问与关闭。
 //!
-//! 插件 Factory Catalog、配置解析、reconcile 与管理服务由 [`cordis_loader`] 提供。
-//! 此 crate 不重复实现插件管理逻辑；一个可执行程序通常只创建一个 [`CordisHost`]。
+//! LoaderPlugin 由应用入口显式挂载；此 crate 不假定某个插件一定存在。
 
 use cordis_core::{Context, Runtime};
-use cordis_loader::{CordisLoader, ExtensionCatalog, Loader, LoaderError, LoaderSnapshot};
-use std::path::Path;
+use cordis_loader::LoaderError;
 
 /// 应用进程的薄 Host。
 ///
-/// 它持有唯一的 [`CordisLoader`]。应用入口负责构造静态 Catalog、启动 Host、运行自身事件循环，
+/// 它持有唯一 Runtime。应用入口负责按需挂载 LoaderPlugin 或其他根插件，运行自身事件循环，
 /// 并在退出时调用 [`Self::shutdown`]。
 #[derive(Clone)]
 pub struct CordisHost {
-    loader: CordisLoader,
+    runtime: Runtime,
 }
 
 impl CordisHost {
-    /// 创建没有配置源的应用 Host。
-    pub fn new(catalog: ExtensionCatalog) -> Result<Self, LoaderError> {
+    /// 创建应用唯一的 Runtime。
+    pub fn new() -> Result<Self, LoaderError> {
         Ok(Self {
-            loader: CordisLoader::new(catalog)?,
-        })
-    }
-
-    /// 按 bootstrap 配置启动应用 Host 与其 Loader。
-    pub async fn bootstrap(
-        catalog: ExtensionCatalog,
-        bootstrap_path: impl AsRef<Path>,
-    ) -> Result<Self, LoaderError> {
-        Ok(Self {
-            loader: CordisLoader::bootstrap(catalog, bootstrap_path).await?,
+            runtime: Runtime::new().map_err(|source| LoaderError::Runtime { source })?,
         })
     }
 
     /// 返回完整根 Context；应用代码和受信任进程内插件拥有完整 Cordis 权限。
     pub fn root(&self) -> Context {
-        self.loader.root()
+        self.runtime.root()
     }
 
     /// 返回当前应用唯一 Runtime。
     pub fn runtime(&self) -> &Runtime {
-        self.loader.runtime()
+        &self.runtime
     }
 
-    /// 返回插件管理控制面。
-    pub fn loader(&self) -> Loader {
-        self.loader.loader()
-    }
-
-    /// 返回当前由 Loader 收敛的实例快照。
-    pub fn snapshot(&self) -> LoaderSnapshot {
-        self.loader.snapshot()
-    }
-
-    /// 关闭 Loader 管理的插件和 Runtime。
+    /// 关闭 Runtime 及其全部根插件。
     pub async fn shutdown(self) -> Result<(), LoaderError> {
-        self.loader.shutdown().await
+        self.runtime
+            .shutdown()
+            .await
+            .map_err(|source| LoaderError::Runtime { source })
     }
 }

@@ -9,8 +9,8 @@ mod catalog;
 mod config;
 mod error;
 mod loader;
+mod plugin;
 mod reconcile;
-mod runtime;
 mod snapshot;
 
 pub use bootstrap::{load_bootstrap, load_extensions};
@@ -21,7 +21,7 @@ pub use config::{
 };
 pub use error::LoaderError;
 pub use loader::{ExtensionUpdate, LOADER, Loader, LoaderControlError};
-pub use runtime::CordisLoader;
+pub use plugin::LoaderPlugin;
 pub use snapshot::{InstanceId, InstanceSnapshot, LoaderSnapshot};
 
 pub use schemars;

@@ -4,7 +4,7 @@ use crate::{
     catalog::ExtensionCatalog,
     config::{ExtensionEntry, ExtensionsConfig},
     error::{LoaderError, format_panic_message},
-    runtime::MountedInstance,
+    plugin::MountedInstance,
     snapshot::InstanceId,
 };
 use cordis_core::{Plugin, PluginKey};

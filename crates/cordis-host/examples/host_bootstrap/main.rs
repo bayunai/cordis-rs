@@ -10,8 +10,9 @@ mod host;
 mod plugins;
 
 use cordis_host::CordisHost;
+use cordis_loader::LoaderPlugin;
 use plugins::greeting::GREETING;
-use std::path::PathBuf;
+use std::{path::PathBuf, sync::Arc};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -22,13 +23,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/host_bootstrap/bootstrap.toml")
         });
 
-    // main.rs 只负责进程生命周期；业务插件由 extensions.toml 统一编排。
-    let host = CordisHost::bootstrap(host::build_catalog()?, bootstrap_path).await?;
+    let host = CordisHost::new()?;
+    let loader = LoaderPlugin::bootstrap(host::build_catalog()?, bootstrap_path)?;
+    let _loader_fiber = host.root().plugin(Arc::new(loader)).await?;
 
     // 真实应用在此运行 HTTP、窗口事件循环或后台任务。
-    let greeting = host.root().get(GREETING)?;
+    let loader = host.root().get(cordis_loader::LOADER)?;
+    let greeting = loader.entry_context("default-greeting")?.get(GREETING)?;
     println!("{}", greeting.0);
-    println!("mounted instances: {}", host.snapshot().instances.len());
+    println!(
+        "mounted instances: {}",
+        loader.await_idle().await?.instances.len()
+    );
 
     host.shutdown().await?;
     Ok(())

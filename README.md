@@ -20,8 +20,8 @@
 | Crate | 用途 |
 | --- | --- |
 | [`cordis-core`](crates/cordis-core) | Runtime 内核：`Context`、`Service`、`inject`、`Effect`、`Plugin`、`Event` 与诊断。 |
-| [`cordis-loader`](crates/cordis-loader) | 静态 Catalog 插件管理：严格 TOML 配置、reconcile、管理服务与原子持久化。 |
-| [`cordis-host`](crates/cordis-host) | 应用进程薄外壳：启动 Loader、开放完整 Runtime 权限并受控关闭。 |
+| [`cordis-loader`](crates/cordis-loader) | 可挂载的静态 Catalog LoaderPlugin：严格 TOML 配置、reconcile、管理服务与原子持久化。 |
+| [`cordis-host`](crates/cordis-host) | 应用进程薄外壳：创建 Runtime、开放完整权限并受控关闭。 |
 | [`cordis-testkit`](crates/cordis-testkit) | 测试辅助；不应用于生产宿主。 |
 
 ## 快速开始
@@ -99,12 +99,10 @@ cargo run -p cordis-core --example plugin_stack
 cargo run -p cordis-host --example host_bootstrap
 ```
 
-`cordis-loader` 的启动锚点为本地 `bootstrap.toml`，当前仅支持 `file` 配置源；SQLite /
-PostgreSQL 配置存储和文件热更新尚未实现。详情见[架构文档](docs/architecture.md#bootstrap-配置边界)。
-应用代码可通过 `CordisHost::root()` 与 `runtime()` 取得完整 Cordis 运行时权限；插件配置
-由 Loader 反序列化为各 Factory 声明的强类型 `Config`。根服务 `Loader` 为管理界面提供静态
-Factory 的创建、更新、启停和删除，并在成功收敛后原子写回 `extensions.toml`；每个 Factory
-同时公开 JSON Schema 用于自动生成表单。
+应用入口通过 `root.plugin(Arc::new(LoaderPlugin::bootstrap(...)?))` 显式挂载 LoaderPlugin；
+`bootstrap.toml` 当前仅支持 `file` 配置源。应用与受信任插件通过 `ctx.get(LOADER)` 取得管理
+服务；实例业务服务则通过 `loader.entry_context(instance)` 读取。Loader 的 Factory 配置为强类型
+`Config`，并公开 JSON Schema 供管理界面生成表单。详情见[Host 文档](docs/host.md)。
 
 ## 关键语义
 

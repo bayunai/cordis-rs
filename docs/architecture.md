@@ -6,7 +6,7 @@
 | --- | --- | --- |
 | **Runtime 内核** | Context、Service、inject、Isolation、Fiber、Effect、Event、诊断 | `crates/cordis-core` |
 | **Loader** | 静态 Catalog、严格配置、reconcile 与管理服务 | `crates/cordis-loader` |
-| **应用 Host** | 组装 Loader、运行应用事件循环并受控关闭 | `crates/cordis-host`；应用再接入网络/持久化 |
+| **应用 Host** | 创建 Runtime、显式挂载 LoaderPlugin、运行应用事件循环并受控关闭 | `crates/cordis-host`；应用再接入网络/持久化 |
 | **扩展** | 实现 `Plugin`，`provide` / `inject` / `on`，不触碰宿主内部类型 | 插件 crate |
 
 `cordis-core` **不包含** HTTP、数据库、Redis、JSON 配置、Manifest、WASM 或网关语义。
@@ -33,9 +33,10 @@ path = "extensions.toml"
 
 ```text
 bootstrap.toml
-  → 宿主读取文件配置源
-  → 校验 extensions.toml、经 ExtensionFactory 构造不可变 Plugin 实例
-  → 挂载或 replace 已启用扩展
+  → 应用入口构造 LoaderPlugin
+  → root.plugin(LoaderPlugin)
+  → LoaderPlugin 校验 extensions.toml、经 ExtensionFactory 构造实例
+  → LoaderPlugin 挂载或 replace 已启用扩展
 ```
 
 - 相对 `path` 相对于 `bootstrap.toml` 所在目录解析；重新加载只能显式 `reload()`。
