@@ -3,15 +3,8 @@
 use async_trait::async_trait;
 use cordis_core::{Context, CoreError, Plugin, PluginKey};
 use std::sync::{Arc, Mutex};
-use tokio::sync::broadcast;
 
 use crate::keys::{DB, KEY_DB};
-
-pub type LogTx = broadcast::Sender<String>;
-
-fn bus(tx: &LogTx, msg: impl Into<String>) {
-    let _ = tx.send(msg.into());
-}
 
 /// 对外契约：日志落库 / 查询。换 SQLite/PG 时尽量保持这些方法稳定。
 #[derive(Clone, Debug)]
@@ -54,9 +47,7 @@ impl Db {
     }
 }
 
-pub struct DbPlugin {
-    pub bus: LogTx,
-}
+pub struct DbPlugin;
 
 #[async_trait]
 impl Plugin for DbPlugin {
@@ -65,12 +56,12 @@ impl Plugin for DbPlugin {
     }
 
     async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
-        let db = Db::new();
-        bus(&self.bus, "sys: db apply (memory)");
-        ctx.provide(DB, db)?;
-        let bus_tx = self.bus.clone();
+        let logger = ctx.logger()?;
+        logger.info("sys: db apply (memory)");
+        ctx.provide(DB, Db::new())?;
+        let logger_d = logger.clone();
         ctx.effect()?.on_dispose(move || {
-            bus(&bus_tx, "sys: db disposed");
+            logger_d.info("sys: db disposed");
         });
         Ok(())
     }

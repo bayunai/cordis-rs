@@ -275,7 +275,8 @@
     <main>
       <h1>Loader 子树差分 Reconcile</h1>
       <p class="sub">
-        EntryTree：根级 <code>side</code> + Group <code>app</code>（<code>db → logger → http</code>）。
+        EntryTree：根级 <code>side</code> + Group <code>app</code>（<code>db → log-store → http</code>）。
+        Log Store 订阅 Runtime Logger 落库；不提供 ServiceKey。
         操作只触及受影响子树；看表格里的 <code>fiber_id</code> 是否保持。
       </p>
       <p class="note" id="note">加载中…</p>
@@ -347,9 +348,9 @@
           <pre id="response">尚未请求</pre>
         </section>
         <section class="card">
-          <h2>实时总线</h2>
+          <h2>Runtime Logger（SSE）</h2>
           <pre id="bus"></pre>
-          <h2 style="margin-top: 12px">DB 中的日志</h2>
+          <h2 style="margin-top: 12px">Log Store → DB</h2>
           <pre id="db-logs">（空）</pre>
         </section>
       </div>
@@ -401,7 +402,7 @@
         stack: { x: 36, y: 150, w: 150, h: 88 },
         Side: { fiber: { x: 36, y: 40, w: 150, h: 88 } },
         DB: { fiber: { x: 260, y: 48, w: 168, h: 96 }, provider: { x: 266, y: 230, w: 156, h: 86 } },
-        Logger: { fiber: { x: 520, y: 48, w: 168, h: 96 }, provider: { x: 526, y: 230, w: 156, h: 86 } },
+        LogStore: { fiber: { x: 520, y: 48, w: 168, h: 96 } },
         HTTP: { fiber: { x: 780, y: 48, w: 168, h: 96 }, provider: { x: 786, y: 230, w: 156, h: 86 } },
       };
 
@@ -549,7 +550,7 @@
 
         const side = findFiber(graph, "Side");
         const db = findFiber(graph, "DB");
-        const logger = findFiber(graph, "Logger");
+        const logStore = findFiber(graph, "LogStore");
         const http = findFiber(graph, "HTTP");
         const group = findFiber(graph, "Group");
         graphMeta.textContent = `${graph.view} · fibers=${(graph.fibers || []).length} · providers=${(graph.providers || []).length}`;
@@ -602,7 +603,7 @@
 
         const slots = [
           { label: "DB", fiber: db, expected: "demo.stack.db@1" },
-          { label: "Logger", fiber: logger, expected: "demo.stack.logger@1" },
+          { label: "LogStore", fiber: logStore, expected: null },
           { label: "HTTP", fiber: http, expected: "demo.stack.http@1" },
         ];
 
@@ -635,6 +636,7 @@
                 f && f.dependencies?.length
                   ? `inject=${f.dependencies.join(", ")}`
                   : "inject=(none)",
+                slot.expected === null ? "无 ServiceKey（落库 Runtime Logger）" : null,
                 missing.length ? `missing=${missing.join(", ")}` : null,
                 f && f.last_error ? `error=${f.last_error}` : null,
               ]),
@@ -642,6 +644,8 @@
           );
 
           if (f) addEdge(paths, stackBox, "right", fiberBox, "left", "contain");
+
+          if (!providerBox) continue;
 
           let provider = null;
           if (f) {
@@ -719,8 +723,7 @@
           addEdge(paths, fromBox, "right", toBox, "left", "error");
         }
 
-        injectEdge("DB", "Logger", "demo.stack.db@1");
-        injectEdge("Logger", "HTTP", "demo.stack.logger@1");
+        injectEdge("DB", "LogStore", "demo.stack.db@1");
 
         for (const n of nodes) graphFlow.appendChild(n);
         graphSvg.insertAdjacentHTML("beforeend", paths.join(""));

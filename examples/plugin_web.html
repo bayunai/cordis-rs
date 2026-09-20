@@ -183,14 +183,14 @@
     <main>
       <h1>Cordis 插件插拔</h1>
       <p class="sub">
-        Logger / Greeter / Counter · Counter 依赖前两者 · 支持挂载、卸载与 Logger
-        热替换
+        Note / Greeter / Counter · Counter 依赖 NoteService + Greeting · 支持挂载、卸载与 Note
+        热替换 · 日志来自 Runtime Logger
       </p>
 
       <div class="grid">
-        <section class="card" data-plugin="logger">
-          <h2>Logger <span class="pill" id="st-logger">off</span></h2>
-          <p class="meta">demo.logger · provide LOGGER · on NOTE</p>
+        <section class="card" data-plugin="note">
+          <h2>Note <span class="pill" id="st-note">off</span></h2>
+          <p class="meta">demo.note · provide NoteService · on NOTE</p>
           <div class="row">
             <button class="primary" data-act="mount">挂载</button>
             <button data-act="replace">替换 vN</button>
@@ -207,7 +207,7 @@
         </section>
         <section class="card" data-plugin="counter">
           <h2>Counter <span class="pill" id="st-counter">off</span></h2>
-          <p class="meta">demo.counter · needs LOGGER + GREETING</p>
+          <p class="meta">demo.counter · needs NoteService + GREETING</p>
           <div class="row">
             <button class="primary" data-act="mount">挂载</button>
             <button data-act="unmount">卸载</button>
@@ -264,11 +264,11 @@
 
       async function refresh() {
         const s = await api("/api/state");
-        setPill("st-logger", s.plugins.logger || "off");
+        setPill("st-note", s.plugins.note || "off");
         setPill("st-greeter", s.plugins.greeter || "off");
         setPill("st-counter", s.plugins.counter || "off");
         registryEl.textContent =
-          `ticks=${s.ticks}  logger_gen=${s.logger_gen}  greeter=${s.greeter_name}\n` +
+          `ticks=${s.ticks}  note_gen=${s.note_gen}  greeter=${s.greeter_name}\n` +
           (s.registry.length
             ? s.registry
                 .map(

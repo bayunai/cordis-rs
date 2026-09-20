@@ -7,6 +7,7 @@
 use async_trait::async_trait;
 use cordis_core::{Context, CoreError, Plugin, PluginKey, ServiceId};
 use cordis_host::CordisHost;
+use cordis_plugin_logger_console::ConsoleLoggerPlugin;
 use cordis_plugin_timer::{TIMER, TimerExt, TimerPlugin};
 use std::{sync::Arc, time::Duration};
 
@@ -24,10 +25,12 @@ impl Plugin for HeartbeatPlugin {
 
     async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
         let effect = ctx.effect_named("heartbeat")?;
+        let logger = effect.logger()?;
+        let tick_logger = logger.clone();
         let handle = effect
             .interval(
-                || {
-                    println!("heartbeat tick");
+                move || {
+                    tick_logger.info("heartbeat tick");
                 },
                 Duration::from_millis(50),
             )
@@ -36,10 +39,11 @@ impl Plugin for HeartbeatPlugin {
             drop(handle);
         });
 
+        let timeout_logger = logger.clone();
         let timeout = effect
             .timeout(
-                || {
-                    println!("timeout fired once");
+                move || {
+                    timeout_logger.info("timeout fired once");
                 },
                 Duration::from_millis(120),
             )
@@ -54,6 +58,10 @@ impl Plugin for HeartbeatPlugin {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let host = CordisHost::new()?;
+    let _console = host
+        .root()
+        .plugin(Arc::new(ConsoleLoggerPlugin::default()))
+        .await?;
     let _timer = host.root().plugin(Arc::new(TimerPlugin)).await?;
     let _heartbeat = host.root().plugin(Arc::new(HeartbeatPlugin)).await?;
 

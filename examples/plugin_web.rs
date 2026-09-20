@@ -5,6 +5,9 @@
 //! # 打开 http://127.0.0.1:3001
 //! ```
 
+#[path = "log_stream.rs"]
+mod log_stream;
+
 use async_trait::async_trait;
 use axum::{
     Json, Router,
@@ -19,7 +22,9 @@ use axum::{
 use cordis_core::{
     Context, CoreError, EventKey, Fiber, FiberStateSnapshot, Plugin, PluginKey, Runtime, ServiceKey,
 };
-use futures_util::stream::{Stream, unfold};
+use cordis_plugin_logger_console::ConsoleLoggerPlugin;
+use futures_util::stream::Stream;
+use log_stream::{SseLogExporter, sse_stream};
 use serde::{Deserialize, Serialize};
 use std::{
     convert::Infallible,
@@ -29,12 +34,12 @@ use std::{
     },
     time::Duration,
 };
-use tokio::sync::{Mutex as AsyncMutex, broadcast};
+use tokio::sync::Mutex as AsyncMutex;
 
 // --- Cordis keys -------------------------------------------------------------
 
 #[derive(Debug)]
-struct Logger;
+struct NoteService;
 
 #[derive(Debug, Clone)]
 struct Greeting(String);
@@ -43,47 +48,40 @@ struct Greeting(String);
 #[allow(dead_code)]
 struct Counter(u64);
 
-static LOGGER: ServiceKey<Logger> = ServiceKey::new("demo.logger@1");
+static NOTE_SERVICE: ServiceKey<NoteService> = ServiceKey::new("demo.note@1");
 static GREETING: ServiceKey<Greeting> = ServiceKey::new("demo.greeting@1");
 static COUNTER: ServiceKey<Counter> = ServiceKey::new("demo.counter@1");
 static NOTE: EventKey<String> = EventKey::new("demo.note@1");
 
-static KEY_LOGGER: PluginKey = PluginKey::new("demo.logger");
+static KEY_NOTE: PluginKey = PluginKey::new("demo.note");
 static KEY_GREETER: PluginKey = PluginKey::new("demo.greeter");
 static KEY_COUNTER: PluginKey = PluginKey::new("demo.counter");
 
-type LogTx = broadcast::Sender<String>;
-
-fn log(tx: &LogTx, msg: impl Into<String>) {
-    let _ = tx.send(msg.into());
-}
-
 // --- Plugins -----------------------------------------------------------------
 
-struct LoggerPlugin {
+struct NotePlugin {
     label: String,
-    logs: LogTx,
 }
 
 #[async_trait]
-impl Plugin for LoggerPlugin {
+impl Plugin for NotePlugin {
     fn key(&self) -> PluginKey {
-        KEY_LOGGER
+        KEY_NOTE
     }
     async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
+        let logger = ctx.logger()?;
         let label = self.label.clone();
-        let logs = self.logs.clone();
-        log(&logs, format!("[{label}] logger apply"));
-        ctx.provide(LOGGER, Logger)?;
-        let logs_on = logs.clone();
+        logger.info(format!("[{label}] note apply"));
+        ctx.provide(NOTE_SERVICE, NoteService)?;
+        let logger_on = logger.clone();
         let label_on = label.clone();
         ctx.on(NOTE, move |msg| {
-            log(&logs_on, format!("[{label_on}] note: {msg}"));
+            logger_on.info(format!("[{label_on}] note: {msg}"));
             Ok(())
         })?;
-        let logs_d = logs.clone();
+        let logger_d = logger.clone();
         ctx.effect()?.on_dispose(move || {
-            log(&logs_d, format!("[{label}] logger disposed"));
+            logger_d.info(format!("[{label}] note disposed"));
         });
         Ok(())
     }
@@ -91,7 +89,6 @@ impl Plugin for LoggerPlugin {
 
 struct GreeterPlugin {
     name: String,
-    logs: LogTx,
 }
 
 #[async_trait]
@@ -100,14 +97,15 @@ impl Plugin for GreeterPlugin {
         KEY_GREETER
     }
     async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
+        let logger = ctx.logger()?;
         let text = format!("hello from {}", self.name);
-        log(&self.logs, format!("[greeter] apply → {text}"));
+        logger.info(format!("[greeter] apply → {text}"));
         ctx.provide(GREETING, Greeting(text))?;
         ctx.emit(NOTE, &format!("greeter online: {}", self.name))?;
         let name = self.name.clone();
-        let logs = self.logs.clone();
+        let logger_d = logger.clone();
         ctx.effect()?.on_dispose(move || {
-            log(&logs, format!("[greeter:{name}] disposed"));
+            logger_d.info(format!("[greeter:{name}] disposed"));
         });
         Ok(())
     }
@@ -115,7 +113,6 @@ impl Plugin for GreeterPlugin {
 
 struct CounterPlugin {
     ticks: Arc<AtomicU64>,
-    logs: LogTx,
 }
 
 #[async_trait]
@@ -124,38 +121,36 @@ impl Plugin for CounterPlugin {
         KEY_COUNTER
     }
     fn inject(&self) -> Vec<cordis_core::ServiceId> {
-        vec![LOGGER.id(), GREETING.id()]
+        vec![NOTE_SERVICE.id(), GREETING.id()]
     }
     async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
-        let _ = ctx.get(LOGGER)?;
+        let _ = ctx.get(NOTE_SERVICE)?;
         let greeting = ctx.get(GREETING)?;
-        log(
-            &self.logs,
-            format!("[counter] apply (seen greeting: {})", greeting.0),
-        );
+        let logger = ctx.logger()?;
+        logger.info(format!("[counter] apply (seen greeting: {})", greeting.0));
         let ticks = self.ticks.clone();
         ctx.provide(COUNTER, Counter(ticks.load(Ordering::SeqCst)))?;
         let effect = ctx.effect()?;
         let ticks_bg = ticks.clone();
-        let logs = self.logs.clone();
+        let logger_bg = logger.clone();
         effect.spawn(move |cancel| async move {
             let mut n = 0u64;
             loop {
                 tokio::select! {
                     _ = cancel.cancelled() => {
-                        log(&logs, format!("[counter] tick loop cancelled at {n}"));
+                        logger_bg.info(format!("[counter] tick loop cancelled at {n}"));
                         break;
                     }
                     _ = tokio::time::sleep(Duration::from_millis(700)) => {
                         n += 1;
                         ticks_bg.store(n, Ordering::SeqCst);
-                        log(&logs, format!("[counter] tick {n}"));
+                        logger_bg.info(format!("[counter] tick {n}"));
                     }
                 }
             }
         })?;
-        let logs_d = self.logs.clone();
-        effect.on_dispose(move || log(&logs_d, "[counter] disposed"));
+        let logger_d = logger.clone();
+        effect.on_dispose(move || logger_d.info("[counter] disposed"));
         Ok(())
     }
 }
@@ -164,14 +159,14 @@ impl Plugin for CounterPlugin {
 
 struct AppState {
     runtime: Runtime,
-    logger: AsyncMutex<Option<Fiber>>,
+    note: AsyncMutex<Option<Fiber>>,
     greeter: AsyncMutex<Option<Fiber>>,
     counter: AsyncMutex<Option<Fiber>>,
     ticks: Arc<AtomicU64>,
-    logger_gen: AtomicU32,
+    note_gen: AtomicU32,
     greeter_seq: AtomicU32,
     greeter_name: Mutex<String>,
-    logs: LogTx,
+    sse: Arc<SseLogExporter>,
 }
 
 #[derive(Deserialize)]
@@ -199,7 +194,7 @@ struct GroupJson {
 #[derive(Serialize)]
 struct StateJson {
     ticks: u64,
-    logger_gen: u32,
+    note_gen: u32,
     greeter_name: String,
     plugins: PluginsJson,
     registry: Vec<GroupJson>,
@@ -207,7 +202,7 @@ struct StateJson {
 
 #[derive(Serialize)]
 struct PluginsJson {
-    logger: String,
+    note: String,
     greeter: String,
     counter: String,
 }
@@ -259,10 +254,10 @@ fn build_state(app: &AppState) -> StateJson {
         .collect();
     StateJson {
         ticks: app.ticks.load(Ordering::SeqCst),
-        logger_gen: app.logger_gen.load(Ordering::SeqCst),
+        note_gen: app.note_gen.load(Ordering::SeqCst),
         greeter_name: app.greeter_name.lock().expect("name").clone(),
         plugins: PluginsJson {
-            logger: plugin_state(&app.runtime, &KEY_LOGGER),
+            note: plugin_state(&app.runtime, &KEY_NOTE),
             greeter: plugin_state(&app.runtime, &KEY_GREETER),
             counter: plugin_state(&app.runtime, &KEY_COUNTER),
         },
@@ -272,6 +267,15 @@ fn build_state(app: &AppState) -> StateJson {
 
 fn err(status: StatusCode, msg: impl Into<String>) -> (StatusCode, Json<ErrJson>) {
     (status, Json(ErrJson { error: msg.into() }))
+}
+
+fn sys_log(app: &AppState, msg: impl Into<String>) -> Result<(), cordis_core::CoreError> {
+    app.runtime.root().logger()?.info(msg.into());
+    Ok(())
+}
+
+fn map_core(e: cordis_core::CoreError) -> (StatusCode, Json<ErrJson>) {
+    err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
 }
 
 async fn index() -> Html<&'static str> {
@@ -285,18 +289,7 @@ async fn api_state(State(app): State<Arc<AppState>>) -> Json<StateJson> {
 async fn api_logs(
     State(app): State<Arc<AppState>>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    let rx = app.logs.subscribe();
-    let stream = unfold(rx, |mut rx| async move {
-        match rx.recv().await {
-            Ok(msg) => Some((Ok(Event::default().data(msg)), rx)),
-            Err(broadcast::error::RecvError::Closed) => None,
-            Err(broadcast::error::RecvError::Lagged(_)) => Some((
-                Ok(Event::default().data("(log lagged; skipped some lines)")),
-                rx,
-            )),
-        }
-    });
-    Sse::new(stream).keep_alive(KeepAlive::default())
+    Sse::new(sse_stream(app.sse.subscribe())).keep_alive(KeepAlive::default())
 }
 
 async fn api_mount(
@@ -305,16 +298,15 @@ async fn api_mount(
 ) -> Result<Json<StateJson>, (StatusCode, Json<ErrJson>)> {
     let root = app.runtime.root();
     match body.plugin.as_str() {
-        "logger" => {
-            let mut slot = app.logger.lock().await;
+        "note" => {
+            let mut slot = app.note.lock().await;
             if slot.is_some() {
-                return Err(err(StatusCode::CONFLICT, "logger already mounted"));
+                return Err(err(StatusCode::CONFLICT, "note already mounted"));
             }
-            let ver = app.logger_gen.fetch_add(1, Ordering::SeqCst) + 1;
+            let ver = app.note_gen.fetch_add(1, Ordering::SeqCst) + 1;
             let fiber = root
-                .plugin(Arc::new(LoggerPlugin {
+                .plugin(Arc::new(NotePlugin {
                     label: format!("v{ver}"),
-                    logs: app.logs.clone(),
                 }))
                 .await
                 .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
@@ -329,10 +321,7 @@ async fn api_mount(
             let name = if seq % 2 == 1 { "Alice" } else { "Bob" };
             *app.greeter_name.lock().expect("name") = name.into();
             let fiber = root
-                .plugin(Arc::new(GreeterPlugin {
-                    name: name.into(),
-                    logs: app.logs.clone(),
-                }))
+                .plugin(Arc::new(GreeterPlugin { name: name.into() }))
                 .await
                 .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
             *slot = Some(fiber);
@@ -345,7 +334,6 @@ async fn api_mount(
             let fiber = root
                 .plugin(Arc::new(CounterPlugin {
                     ticks: app.ticks.clone(),
-                    logs: app.logs.clone(),
                 }))
                 .await
                 .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
@@ -359,7 +347,7 @@ async fn api_mount(
         }
     }
     app.runtime.settle().await;
-    log(&app.logs, format!("sys: mounted {}", body.plugin));
+    sys_log(&app, format!("sys: mounted {}", body.plugin)).map_err(map_core)?;
     Ok(Json(build_state(&app)))
 }
 
@@ -368,15 +356,15 @@ async fn api_unmount(
     Json(body): Json<PluginBody>,
 ) -> Result<Json<StateJson>, (StatusCode, Json<ErrJson>)> {
     match body.plugin.as_str() {
-        "logger" => {
-            let mut slot = app.logger.lock().await;
+        "note" => {
+            let mut slot = app.note.lock().await;
             if let Some(mut fiber) = slot.take() {
                 fiber
                     .dispose_wait()
                     .await
                     .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
             } else {
-                return Err(err(StatusCode::NOT_FOUND, "logger not mounted"));
+                return Err(err(StatusCode::NOT_FOUND, "note not mounted"));
             }
         }
         "greeter" => {
@@ -398,7 +386,6 @@ async fn api_unmount(
                     .await
                     .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
             } else {
-                // 也可能已被 unmount(key)
                 let _ = app.runtime.unmount(KEY_COUNTER).await;
             }
         }
@@ -410,7 +397,7 @@ async fn api_unmount(
         }
     }
     app.runtime.settle().await;
-    log(&app.logs, format!("sys: unmounted {}", body.plugin));
+    sys_log(&app, format!("sys: unmounted {}", body.plugin)).map_err(map_core)?;
     Ok(Json(build_state(&app)))
 }
 
@@ -418,26 +405,25 @@ async fn api_replace(
     State(app): State<Arc<AppState>>,
     Json(body): Json<PluginBody>,
 ) -> Result<Json<StateJson>, (StatusCode, Json<ErrJson>)> {
-    if body.plugin != "logger" {
+    if body.plugin != "note" {
         return Err(err(
             StatusCode::BAD_REQUEST,
-            "only logger supports replace in this demo",
+            "only note supports replace in this demo",
         ));
     }
-    let mut slot = app.logger.lock().await;
+    let mut slot = app.note.lock().await;
     let Some(fiber) = slot.as_mut() else {
-        return Err(err(StatusCode::NOT_FOUND, "logger not mounted"));
+        return Err(err(StatusCode::NOT_FOUND, "note not mounted"));
     };
-    let ver = app.logger_gen.fetch_add(1, Ordering::SeqCst) + 1;
+    let ver = app.note_gen.fetch_add(1, Ordering::SeqCst) + 1;
     fiber
-        .replace(Arc::new(LoggerPlugin {
+        .replace(Arc::new(NotePlugin {
             label: format!("v{ver}"),
-            logs: app.logs.clone(),
         }))
         .await
         .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
     app.runtime.settle().await;
-    log(&app.logs, format!("sys: logger replaced → v{ver}"));
+    sys_log(&app, format!("sys: note replaced → v{ver}")).map_err(map_core)?;
     Ok(Json(build_state(&app)))
 }
 
@@ -454,18 +440,24 @@ async fn api_emit(
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let (logs, _) = broadcast::channel(256);
     let runtime = Runtime::new()?;
+    let _console = runtime
+        .root()
+        .plugin(Arc::new(ConsoleLoggerPlugin::default()))
+        .await?;
+    let sse = Arc::new(SseLogExporter::default());
+    runtime.root().register_log_exporter(sse.clone())?;
+
     let app = Arc::new(AppState {
         runtime,
-        logger: AsyncMutex::new(None),
+        note: AsyncMutex::new(None),
         greeter: AsyncMutex::new(None),
         counter: AsyncMutex::new(None),
         ticks: Arc::new(AtomicU64::new(0)),
-        logger_gen: AtomicU32::new(0),
+        note_gen: AtomicU32::new(0),
         greeter_seq: AtomicU32::new(0),
         greeter_name: Mutex::new(String::new()),
-        logs: logs.clone(),
+        sse,
     });
 
     let router = Router::new()
@@ -476,12 +468,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/unmount", post(api_unmount))
         .route("/api/replace", post(api_replace))
         .route("/api/emit", post(api_emit))
-        .with_state(app);
+        .with_state(app.clone());
 
     let addr = "127.0.0.1:3001";
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    println!("Cordis plugin web demo → http://{addr}");
-    log(&logs, format!("sys: listening on http://{addr}"));
+    app.runtime
+        .root()
+        .logger()?
+        .info(format!("sys: Cordis plugin web demo → http://{addr}"));
     axum::serve(listener, router).await?;
     Ok(())
 }

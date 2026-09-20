@@ -20,6 +20,7 @@ tokio-util.workspace = true
 
 [dev-dependencies]
 cordis-host.workspace = true
+cordis-plugin-logger-console.workspace = true
 cordis-testkit.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time", "test-util"] }
 
