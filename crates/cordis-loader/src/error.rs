@@ -23,12 +23,26 @@ pub enum LoaderError {
     Io { path: PathBuf, message: String },
     #[error("解析配置失败 {path}: {message}", path = path.display())]
     Toml { path: PathBuf, message: String },
-    #[error("不支持的配置版本 {found}，当前仅支持 1")]
+    #[error("不支持的配置版本 {found}，当前仅支持 2")]
     UnsupportedVersion { found: u32 },
-    #[error("实例 {instance} 重复")]
-    DuplicateInstance { instance: String },
+    #[error("条目 {path} 重复")]
+    DuplicateEntry { path: String },
+    #[error("条目 {path} 无效: {message}")]
+    InvalidEntry { path: String, message: String },
     #[error("实例 {instance} 引用未注册工厂 {factory}")]
     UnknownFactory { instance: String, factory: String },
+    #[error("注入描述符 {id} 已注册")]
+    DuplicateInjection { id: String },
+    #[error("条目 {entry} 引用未知注入服务 {injection}")]
+    UnknownInjection { entry: String, injection: String },
+    #[error("条目 {entry} 为不可拦截的服务 {injection} 提供了配置")]
+    InjectionNotConfigurable { entry: String, injection: String },
+    #[error("条目 {entry} 的注入配置 {injection} 无效: {message}")]
+    InvalidInjectionConfig {
+        entry: String,
+        injection: String,
+        message: String,
+    },
     #[error("工厂 {id} 已注册")]
     DuplicateFactory { id: String },
     #[error("工厂 {factory} 的配置 Schema 无法生成: {message}")]

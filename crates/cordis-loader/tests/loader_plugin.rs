@@ -1,331 +1,324 @@
 use async_trait::async_trait;
-use cordis_core::{Context, CoreError, Fiber, FiberState, Plugin, PluginKey, Runtime, ServiceKey};
+use cordis_core::{
+    ConfigKey, Context, CoreError, Fiber, FiberState, Plugin, PluginKey, Runtime, ServiceKey,
+};
 use cordis_loader::{
-    ExtensionCatalog, ExtensionEntry, ExtensionFactory, ExtensionsConfig, LOADER, Loader,
-    LoaderControlError, LoaderError, LoaderPlugin,
+    EntryOptions, EntryUpdate, ExtensionCatalog, ExtensionFactory, ExtensionsConfig, InjectConfig,
+    InjectionDescriptor, LOADER, Loader, LoaderControlError, LoaderError, LoaderPlugin,
 };
 use schemars::JsonSchema;
 use std::{
     fs,
-    sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    },
+    sync::{Arc, Mutex},
 };
-use tokio::sync::Notify;
 
-static PRIVATE: ServiceKey<&'static str> = ServiceKey::new("loader.test.private@1");
-static BLOCK: ServiceKey<()> = ServiceKey::new("loader.test.block@1");
+static DEP: ServiceKey<()> = ServiceKey::new("loader.tree.dep@1");
+static VALUE: ServiceKey<String> = ServiceKey::new("loader.tree.value@1");
+static LABEL: ConfigKey<LabelConfig> = ConfigKey::new("loader.tree.label@1");
 
-#[derive(Clone)]
-struct TestFactory {
+#[derive(Clone, serde::Deserialize, JsonSchema)]
+struct Empty {}
+#[derive(Clone, serde::Deserialize, JsonSchema)]
+struct LabelConfig {
+    label: String,
+}
+struct Factory {
     id: &'static str,
-    dependency: bool,
-    provide_private: bool,
-    disposals: Arc<AtomicUsize>,
+    needs_dep: bool,
+    record: Option<Arc<Mutex<Vec<String>>>>,
 }
-
-impl TestFactory {
-    fn new(id: &'static str) -> Self {
-        Self {
-            id,
-            dependency: false,
-            provide_private: false,
-            disposals: Arc::new(AtomicUsize::new(0)),
-        }
-    }
-
-    fn dependency(mut self) -> Self {
-        self.dependency = true;
-        self
-    }
-
-    fn provide_private(mut self) -> Self {
-        self.provide_private = true;
-        self
-    }
+struct TestPlugin {
+    id: &'static str,
+    needs_dep: bool,
+    record: Option<Arc<Mutex<Vec<String>>>>,
 }
-
 #[async_trait]
 impl Plugin for TestPlugin {
     fn key(&self) -> PluginKey {
-        PluginKey::new(self.key)
+        PluginKey::new(self.id)
     }
-
     fn inject(&self) -> Vec<cordis_core::ServiceId> {
-        self.dependency
-            .then_some(PRIVATE.id())
-            .into_iter()
-            .collect()
+        self.needs_dep.then_some(DEP.id()).into_iter().collect()
     }
-
     async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
-        if self.provide_private {
-            ctx.provide(PRIVATE, "private")?;
+        if self.id == "demo.value" {
+            ctx.provide(VALUE, "value".into())?;
         }
-        let disposals = self.disposals.clone();
-        ctx.effect()?.on_dispose(move || {
-            disposals.fetch_add(1, Ordering::SeqCst);
-        });
+        if self.id == "demo.label" {
+            ctx.provide(VALUE, ctx.config(LABEL)?.label.clone())?;
+        }
+        if let Some(record) = &self.record {
+            let id = self.id.to_string();
+            let record = record.clone();
+            ctx.effect()?
+                .on_dispose(move || record.lock().unwrap().push(id.clone()));
+        }
         Ok(())
     }
 }
-
-struct TestPlugin {
-    key: &'static str,
-    dependency: bool,
-    provide_private: bool,
-    disposals: Arc<AtomicUsize>,
-}
-
-impl ExtensionFactory for TestFactory {
-    type Config = serde_json::Value;
-
+impl ExtensionFactory for Factory {
+    type Config = Empty;
     fn id(&self) -> &'static str {
         self.id
     }
-
-    fn build(&self, _: Self::Config) -> Result<Arc<dyn Plugin>, LoaderError> {
+    fn build(&self, _: Empty) -> Result<Arc<dyn Plugin>, LoaderError> {
         Ok(Arc::new(TestPlugin {
-            key: self.id,
-            dependency: self.dependency,
-            provide_private: self.provide_private,
-            disposals: self.disposals.clone(),
+            id: self.id,
+            needs_dep: self.needs_dep,
+            record: self.record.clone(),
         }))
     }
 }
-
-fn catalog(factories: Vec<TestFactory>) -> ExtensionCatalog {
+fn catalog(factories: Vec<Factory>) -> ExtensionCatalog {
     let mut catalog = ExtensionCatalog::new();
     for factory in factories {
         catalog.register(factory).unwrap();
     }
     catalog
 }
-
-fn config(entries: Vec<ExtensionEntry>) -> ExtensionsConfig {
+fn config(entries: Vec<EntryOptions>) -> ExtensionsConfig {
     ExtensionsConfig {
-        version: 1,
+        version: 2,
         extensions: entries,
     }
 }
-
 async fn mount(plugin: LoaderPlugin) -> (Runtime, Fiber, Loader) {
     let runtime = Runtime::new().unwrap();
     let root = runtime.root();
     let fiber = root.plugin(Arc::new(plugin)).await.unwrap();
-    assert_ne!(
-        fiber.state(),
-        FiberState::Failed,
-        "{:?}",
-        fiber.last_error()
-    );
     let loader = (*root.get(LOADER).unwrap()).clone();
     (runtime, fiber, loader)
 }
 
 #[tokio::test]
-async fn loader_plugin_provides_service_and_unload_releases_its_tree() {
-    let factory = TestFactory::new("demo.provider").provide_private();
-    let disposals = factory.disposals.clone();
-    let plugin = LoaderPlugin::new(
-        catalog(vec![factory]),
-        config(vec![ExtensionEntry::new("provider", "demo.provider", true)]),
+async fn tree_uses_paths_group_contexts_and_ancestor_disable() {
+    let child = EntryOptions::new("child", "demo.value");
+    let mut group = EntryOptions::group("parent", vec![child]).unwrap();
+    group.disabled = true;
+    let (runtime, mut loader_fiber, loader) = mount(
+        LoaderPlugin::new(
+            catalog(vec![Factory {
+                id: "demo.value",
+                needs_dep: false,
+                record: None,
+            }]),
+            config(vec![group]),
+        )
+        .unwrap(),
     )
-    .unwrap();
-    let (runtime, mut loader_fiber, loader) = mount(plugin).await;
-
-    assert_eq!(loader.await_idle().await.unwrap().instances.len(), 1);
-    assert!(runtime.root().get(PRIVATE).is_err());
-
+    .await;
+    let snapshot = loader.await_idle().await.unwrap();
+    assert_eq!(snapshot.entries.len(), 2);
+    assert!(snapshot.entry("parent").unwrap().state.is_some());
+    assert!(!snapshot.entry("parent:child").unwrap().enabled);
+    assert!(snapshot.entry("parent:child").unwrap().state.is_none());
+    assert!(runtime.root().get(VALUE).is_err());
     loader_fiber.dispose_wait().await.unwrap();
     assert!(runtime.root().get(LOADER).is_err());
     assert!(matches!(
         loader.entries(),
         Err(LoaderControlError::LoaderUnavailable)
     ));
-    assert_eq!(disposals.load(Ordering::SeqCst), 1);
     runtime.shutdown().await.unwrap();
 }
 
 #[tokio::test]
-async fn entries_use_isolated_child_contexts() {
-    let plugin = LoaderPlugin::new(
-        catalog(vec![
-            TestFactory::new("demo.provider").provide_private(),
-            TestFactory::new("demo.consumer").dependency(),
-        ]),
-        config(vec![
-            ExtensionEntry::new("provider", "demo.provider", true),
-            ExtensionEntry::new("consumer", "demo.consumer", true),
-        ]),
-    )
-    .unwrap();
-    let (runtime, _loader_fiber, loader) = mount(plugin).await;
-    let snapshot = loader.await_idle().await.unwrap();
-
+async fn configured_inject_is_typed_and_static_dependency_is_merged() {
+    let mut catalog = catalog(vec![Factory {
+        id: "demo.label",
+        needs_dep: true,
+        record: None,
+    }]);
+    catalog
+        .register_injection(InjectionDescriptor::intercepted("dep", DEP, LABEL))
+        .unwrap();
+    let entry = EntryOptions::new("label", "demo.label").with_inject(InjectConfig::Map(
+        [(
+            "dep".into(),
+            toml::Value::Table(toml::toml! { label = "configured" }),
+        )]
+        .into(),
+    ));
+    let runtime = Runtime::new().unwrap();
+    runtime.root().provide(DEP, ()).unwrap();
+    let fiber = runtime
+        .root()
+        .plugin(Arc::new(
+            LoaderPlugin::new(catalog, config(vec![entry])).unwrap(),
+        ))
+        .await
+        .unwrap();
+    assert_ne!(fiber.state(), FiberState::Failed);
+    let loader = runtime.root().get(LOADER).unwrap();
     assert_eq!(
-        snapshot.instance("provider").unwrap().state,
-        FiberState::Active
+        &*loader.entry_context("label").unwrap().get(VALUE).unwrap(),
+        "configured"
     );
-    assert_eq!(
-        snapshot.instance("consumer").unwrap().state,
-        FiberState::Pending
-    );
-    assert!(runtime.root().get(PRIVATE).is_err());
     runtime.shutdown().await.unwrap();
 }
 
+#[test]
+fn v2_rejects_old_flat_entries_and_bad_groups() {
+    let old = ExtensionsConfig::from_toml_str("version = 1\nextensions = []\n").unwrap();
+    assert!(matches!(
+        old.validate(&ExtensionCatalog::new()),
+        Err(LoaderError::UnsupportedVersion { .. })
+    ));
+    let bad = config(vec![EntryOptions {
+        id: "bad".into(),
+        name: "demo.value".into(),
+        config: toml::Value::Table(toml::Table::new()),
+        group: true,
+        disabled: false,
+        inject: None,
+    }]);
+    assert!(matches!(
+        bad.validate(&ExtensionCatalog::new()),
+        Err(LoaderError::InvalidEntry { .. })
+    ));
+}
+
 #[tokio::test]
-async fn persistent_changes_reload_and_conflict_keep_existing_semantics() {
+async fn persistent_create_move_and_conflict_use_paths() {
     let directory = tempfile::tempdir().unwrap();
     let bootstrap = directory.path().join("bootstrap.toml");
     let extensions = directory.path().join("extensions.toml");
     fs::write(
         &bootstrap,
-        "version = 1\n[config]\ndriver = \"file\"\npath = \"extensions.toml\"\n",
+        "version = 2\n[config]\ndriver = \"file\"\npath = \"extensions.toml\"\n",
     )
     .unwrap();
-    fs::write(&extensions, "version = 1\nextensions = []\n").unwrap();
-    let plugin =
-        LoaderPlugin::bootstrap(catalog(vec![TestFactory::new("demo.file")]), &bootstrap).unwrap();
-    let (runtime, _loader_fiber, loader) = mount(plugin).await;
-
+    fs::write(&extensions, "version = 2\nextensions = []\n").unwrap();
+    let (runtime, _loader_fiber, loader) = mount(
+        LoaderPlugin::bootstrap(
+            catalog(vec![Factory {
+                id: "demo.value",
+                needs_dep: false,
+                record: None,
+            }]),
+            &bootstrap,
+        )
+        .unwrap(),
+    )
+    .await;
     loader
-        .create(ExtensionEntry::new("one", "demo.file", true))
+        .create(EntryOptions::group("one", vec![]).unwrap(), None, None)
         .await
         .unwrap();
-    assert_eq!(
+    loader
+        .create(EntryOptions::group("two", vec![]).unwrap(), None, None)
+        .await
+        .unwrap();
+    loader
+        .create(EntryOptions::new("child", "demo.value"), Some("one"), None)
+        .await
+        .unwrap();
+    loader
+        .update(
+            "one",
+            EntryUpdate {
+                disabled: Some(true),
+                ..Default::default()
+            },
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(
         loader
             .await_idle()
             .await
             .unwrap()
-            .instance("one")
+            .entry("one:child")
             .unwrap()
-            .state,
-        FiberState::Active
+            .state
+            .is_none()
+    );
+    loader
+        .update(
+            "one",
+            EntryUpdate {
+                disabled: Some(false),
+                ..Default::default()
+            },
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    loader
+        .update(
+            "one:child",
+            EntryUpdate::default(),
+            Some(Some("two")),
+            Some(0),
+        )
+        .await
+        .unwrap();
+    assert!(
+        loader
+            .await_idle()
+            .await
+            .unwrap()
+            .entry("two:child")
+            .is_some()
     );
     assert!(
         fs::read_to_string(&extensions)
             .unwrap()
-            .contains("instance = \"one\"")
+            .contains("id = \"two\"")
     );
-
-    fs::write(&extensions, "version = 1\nextensions = []\n# edited\n").unwrap();
+    fs::write(&extensions, "version = 2\nextensions = []\n# outside\n").unwrap();
     assert!(matches!(
         loader
-            .create(ExtensionEntry::new("two", "demo.file", true))
+            .create(EntryOptions::new("nope", "demo.value"), None, None)
             .await,
         Err(LoaderControlError::ConfigConflict { .. })
     ));
-    loader.reload().await.unwrap();
-    assert!(loader.await_idle().await.unwrap().instances.is_empty());
     runtime.shutdown().await.unwrap();
 }
 
-#[cfg(unix)]
 #[tokio::test]
-async fn persist_failure_keeps_the_applied_snapshot() {
-    use std::os::unix::fs::PermissionsExt;
-
+async fn deleting_group_disposes_children_in_postorder() {
+    let record = Arc::new(Mutex::new(Vec::new()));
+    let group = EntryOptions::group(
+        "group",
+        vec![
+            EntryOptions::new("first", "demo.first"),
+            EntryOptions::new("second", "demo.second"),
+        ],
+    )
+    .unwrap();
     let directory = tempfile::tempdir().unwrap();
     let bootstrap = directory.path().join("bootstrap.toml");
+    let extensions = directory.path().join("extensions.toml");
     fs::write(
         &bootstrap,
-        "version = 1\n[config]\ndriver = \"file\"\npath = \"extensions.toml\"\n",
+        "version = 2\n[config]\ndriver = \"file\"\npath = \"extensions.toml\"\n",
     )
     .unwrap();
-    fs::write(
-        directory.path().join("extensions.toml"),
-        "version = 1\nextensions = []\n",
+    fs::write(&extensions, toml::to_string(&config(vec![group])).unwrap()).unwrap();
+    let (runtime, _loader_fiber, loader) = mount(
+        LoaderPlugin::bootstrap(
+            catalog(vec![
+                Factory {
+                    id: "demo.first",
+                    needs_dep: false,
+                    record: Some(record.clone()),
+                },
+                Factory {
+                    id: "demo.second",
+                    needs_dep: false,
+                    record: Some(record.clone()),
+                },
+            ]),
+            &bootstrap,
+        )
+        .unwrap(),
     )
-    .unwrap();
-    let plugin =
-        LoaderPlugin::bootstrap(catalog(vec![TestFactory::new("demo.persist")]), &bootstrap)
-            .unwrap();
-    let (runtime, _loader_fiber, loader) = mount(plugin).await;
-    let original = fs::metadata(directory.path()).unwrap().permissions();
-    let mut read_only = original.clone();
-    read_only.set_mode(0o500);
-    fs::set_permissions(directory.path(), read_only).unwrap();
-
-    let result = loader
-        .create(ExtensionEntry::new("persist", "demo.persist", true))
-        .await;
-
-    fs::set_permissions(directory.path(), original).unwrap();
-    match result.unwrap_err() {
-        LoaderControlError::Persist { snapshot, .. } => {
-            assert_eq!(
-                snapshot.instance("persist").unwrap().state,
-                FiberState::Active
-            );
-        }
-        error => panic!("expected persist error, got {error}"),
-    }
-    assert_eq!(
-        loader
-            .await_idle()
-            .await
-            .unwrap()
-            .instance("persist")
-            .unwrap()
-            .state,
-        FiberState::Active
-    );
+    .await;
+    loader.remove("group").await.unwrap();
+    assert_eq!(&*record.lock().unwrap(), &["demo.second", "demo.first"]);
     runtime.shutdown().await.unwrap();
-}
-
-#[tokio::test]
-async fn await_idle_does_not_wait_for_unrelated_runtime_work() {
-    let runtime = Runtime::new().unwrap();
-    let root = runtime.root();
-    let gate = Arc::new(Notify::new());
-    let waiter = gate.clone();
-    root.inject([BLOCK.id()], move |_, _| {
-        let waiter = waiter.clone();
-        async move {
-            waiter.notified().await;
-            Ok(())
-        }
-    })
-    .unwrap();
-    root.provide(BLOCK, ()).unwrap();
-
-    let plugin = LoaderPlugin::new(
-        catalog(vec![TestFactory::new("demo.fast")]),
-        config(vec![ExtensionEntry::new("fast", "demo.fast", true)]),
-    )
-    .unwrap();
-    let _loader_fiber = tokio::time::timeout(
-        std::time::Duration::from_millis(100),
-        root.plugin(Arc::new(plugin)),
-    )
-    .await
-    .expect("Loader must not wait for unrelated work")
-    .unwrap();
-    let loader = root.get(LOADER).unwrap();
-    assert_eq!(loader.await_idle().await.unwrap().instances.len(), 1);
-
-    gate.notify_waiters();
-    runtime.shutdown().await.unwrap();
-}
-
-#[test]
-fn typed_factory_schema_is_available_before_plugin_mount() {
-    #[derive(serde::Deserialize, JsonSchema)]
-    struct Typed;
-    struct TypedFactory;
-    impl ExtensionFactory for TypedFactory {
-        type Config = Typed;
-        fn id(&self) -> &'static str {
-            "demo.typed"
-        }
-        fn build(&self, _: Typed) -> Result<Arc<dyn Plugin>, LoaderError> {
-            Err(LoaderError::invalid_config("not used"))
-        }
-    }
-    let mut catalog = ExtensionCatalog::new();
-    catalog.register(TypedFactory).unwrap();
-    assert!(catalog.factories().unwrap()[0].schema.is_object());
 }

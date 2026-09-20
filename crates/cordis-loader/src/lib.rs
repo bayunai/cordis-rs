@@ -10,19 +10,21 @@ mod config;
 mod error;
 mod loader;
 mod plugin;
-mod reconcile;
 mod snapshot;
 
 pub use bootstrap::{load_bootstrap, load_extensions};
-pub use catalog::{ExtensionCatalog, ExtensionFactory, FactoryDescriptor};
+pub use catalog::{
+    ExtensionCatalog, ExtensionFactory, FactoryDescriptor, InjectionDescriptor,
+    InjectionDescriptorInfo,
+};
 pub use config::{
-    BootstrapConfig, BootstrapConfigSource, CONFIG_VERSION, ConfigDriver, ExtensionEntry,
-    ExtensionsConfig,
+    BootstrapConfig, BootstrapConfigSource, CONFIG_VERSION, ConfigDriver, EntryOptions,
+    ExtensionsConfig, GROUP_NAME, InjectConfig,
 };
 pub use error::LoaderError;
-pub use loader::{ExtensionUpdate, LOADER, Loader, LoaderControlError};
+pub use loader::{EntryUpdate, LOADER, Loader, LoaderControlError};
 pub use plugin::LoaderPlugin;
-pub use snapshot::{InstanceId, InstanceSnapshot, LoaderSnapshot};
+pub use snapshot::{EntryId, EntrySnapshot, LoaderSnapshot};
 
 pub use schemars;
 pub use toml;

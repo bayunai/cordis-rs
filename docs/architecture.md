@@ -24,7 +24,7 @@
 当前 `cordis-loader` 实现的锚点只有文件配置源：
 
 ```toml
-version = 1
+version = 2
 
 [config]
 driver = "file"
@@ -35,8 +35,8 @@ path = "extensions.toml"
 bootstrap.toml
   → 应用入口构造 LoaderPlugin
   → root.plugin(LoaderPlugin)
-  → LoaderPlugin 校验 extensions.toml、经 ExtensionFactory 构造实例
-  → LoaderPlugin 挂载或 replace 已启用扩展
+  → LoaderPlugin 校验 EntryTree、经 ExtensionFactory 构造普通条目
+  → LoaderPlugin 后序释放旧树、前序挂载新树
 ```
 
 - 相对 `path` 相对于 `bootstrap.toml` 所在目录解析；重新加载只能显式 `reload()`。

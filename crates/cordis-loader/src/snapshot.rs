@@ -1,61 +1,49 @@
-//! Loader 诊断快照：把配置实例与 Core Fiber 关联起来。
+//! EntryTree 诊断快照。
 
 use cordis_core::{FiberState, PluginKey};
 use std::fmt;
 
-/// 配置层实例身份，例如 `primary-database`。
-#[derive(Clone, Debug, Eq, PartialEq, Hash)]
-pub struct InstanceId(String);
-
-impl InstanceId {
-    pub fn new(id: impl Into<String>) -> Self {
-        Self(id.into())
-    }
-
+#[derive(Clone, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
+pub struct EntryId(String);
+impl EntryId {
     pub fn as_str(&self) -> &str {
         &self.0
     }
 }
-
-impl fmt::Display for InstanceId {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(formatter)
+impl fmt::Display for EntryId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
     }
 }
-
-impl From<&str> for InstanceId {
-    fn from(value: &str) -> Self {
-        Self(value.to_string())
-    }
-}
-
-impl From<String> for InstanceId {
+impl From<String> for EntryId {
     fn from(value: String) -> Self {
         Self(value)
     }
 }
+impl From<&str> for EntryId {
+    fn from(value: &str) -> Self {
+        Self(value.into())
+    }
+}
 
-/// Loader 管理的实例快照。
 #[derive(Debug, Clone)]
 pub struct LoaderSnapshot {
-    pub instances: Vec<InstanceSnapshot>,
+    pub entries: Vec<EntrySnapshot>,
 }
-
-/// 单个已编排实例。
 #[derive(Debug, Clone)]
-pub struct InstanceSnapshot {
-    pub instance: InstanceId,
-    pub factory: String,
-    pub plugin_key: PluginKey,
-    pub fiber_id: u64,
-    pub state: FiberState,
+pub struct EntrySnapshot {
+    pub path: EntryId,
+    pub parent: Option<EntryId>,
+    pub name: String,
+    pub group: bool,
+    pub enabled: bool,
+    pub plugin_key: Option<PluginKey>,
+    pub fiber_id: Option<u64>,
+    pub state: Option<FiberState>,
     pub last_error: Option<String>,
 }
-
 impl LoaderSnapshot {
-    pub fn instance(&self, id: &str) -> Option<&InstanceSnapshot> {
-        self.instances
-            .iter()
-            .find(|item| item.instance.as_str() == id)
+    pub fn entry(&self, path: &str) -> Option<&EntrySnapshot> {
+        self.entries.iter().find(|item| item.path.as_str() == path)
     }
 }

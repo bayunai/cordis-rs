@@ -1,7 +1,7 @@
 # 扩展编写指南
 
 面向在宿主中挂载的 `Plugin` 作者。Core 只提供挂载与 Fiber 生命周期；
-[`cordis-loader`](host.md) 负责显式工厂注册、配置校验与 `Fiber::replace` 编排。
+[`cordis-loader`](host.md) 负责显式 Factory 注册、EntryTree 配置校验与生命周期编排。
 
 ## 最小 Plugin
 
@@ -109,14 +109,14 @@ impl ExtensionFactory for GreeterFactory {
 ```
 
 ```text
-Loader 读取配置 → 反序列化为 `Factory::Config` → factory.build(config) → 构造新实例 → fiber.replace(new_instance)
+Loader 读取 EntryTree → 反序列化为 `Factory::Config` → factory.build(config) → 构造不可变实例 → 挂载到条目 Context
 ```
 
 - `build` 必须无副作用；I/O 与任务只出现在 `Plugin::apply`。
 - 工厂由应用调用 `ExtensionCatalog::register` 显式登记，不使用自动注册宏。`JsonSchema` 会被
   `Loader` 公开给管理界面生成配置表单。
-- 校验或反序列化失败时，宿主不得调用 `replace`；旧 Active 实例保持运行。
-- `replace` 开始后旧实例会被释放；新实例的 `apply` 失败使 Fiber 进入 `Failed`，不会自动回滚旧实例。
+- 校验或反序列化失败时，Loader 不执行 reconcile，也不写回配置文件。
+- 配置、父 Group 或条目顺序变更会由 Loader 重建受影响的 Context 子树；插件不得自行保存可变 Loader 配置。
 - 不得修改已挂载实例的内部配置后调用 `restart()`；`restart()` 仅用于配置未变的重新执行。
 
 ## ServiceKey / Event Key

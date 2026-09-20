@@ -20,7 +20,7 @@
 | Crate | 用途 |
 | --- | --- |
 | [`cordis-core`](crates/cordis-core) | Runtime 内核：`Context`、`Service`、`inject`、`Effect`、`Plugin`、`Event` 与诊断。 |
-| [`cordis-loader`](crates/cordis-loader) | 可挂载的静态 Catalog LoaderPlugin：严格 TOML 配置、reconcile、管理服务与原子持久化。 |
+| [`cordis-loader`](crates/cordis-loader) | 可挂载的静态 Catalog EntryTree LoaderPlugin：v2 TOML 树、reconcile、管理服务与原子持久化。 |
 | [`cordis-host`](crates/cordis-host) | 应用进程薄外壳：创建 Runtime、开放完整权限并受控关闭。 |
 | [`cordis-testkit`](crates/cordis-testkit) | 测试辅助；不应用于生产宿主。 |
 
@@ -101,8 +101,8 @@ cargo run -p cordis-host --example host_bootstrap
 
 应用入口通过 `root.plugin(Arc::new(LoaderPlugin::bootstrap(...)?))` 显式挂载 LoaderPlugin；
 `bootstrap.toml` 当前仅支持 `file` 配置源。应用与受信任插件通过 `ctx.get(LOADER)` 取得管理
-服务；实例业务服务则通过 `loader.entry_context(instance)` 读取。Loader 的 Factory 配置为强类型
-`Config`，并公开 JSON Schema 供管理界面生成表单。详情见[Host 文档](docs/host.md)。
+服务；条目业务服务则通过 `loader.entry_context("父:子")` 读取。Loader 的 Factory 与可配置 inject
+均为静态、强类型目录，并公开 JSON Schema 供管理界面生成表单。详情见[Host 文档](docs/host.md)。
 
 ## 关键语义
 

@@ -1,18 +1,18 @@
-//! 可挂载的静态 Catalog Loader 插件及其 reconcile 状态。
+//! 可挂载的静态 EntryTree Loader 插件。
 
 use crate::{
     bootstrap::{load_bootstrap, load_extensions_source},
     catalog::ExtensionCatalog,
-    config::ExtensionsConfig,
-    error::LoaderError,
+    config::{EntryOptions, ExtensionsConfig},
+    error::{LoaderError, format_panic_message},
     loader::{LOADER, Loader},
-    reconcile::{self, PreparedInstance, ReconcilePlan},
-    snapshot::{InstanceId, InstanceSnapshot, LoaderSnapshot},
+    snapshot::{EntryId, EntrySnapshot, LoaderSnapshot},
 };
 use async_trait::async_trait;
-use cordis_core::{Context, CoreError, Fiber, FiberState, Plugin, PluginKey};
+use cordis_core::{Context, CoreError, Fiber, Plugin, PluginKey, ServiceId};
 use std::{
-    collections::HashMap,
+    collections::BTreeMap,
+    panic::{AssertUnwindSafe, catch_unwind},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -21,12 +21,14 @@ use std::{
 };
 use tokio::{sync::Notify, task::JoinHandle};
 
-pub(crate) struct MountedInstance {
-    pub(crate) factory: String,
-    pub(crate) plugin_key: PluginKey,
-    pub(crate) config: toml::Value,
-    pub(crate) fiber: Fiber,
-    pub(crate) context: Context,
+struct MountedEntry {
+    parent: Option<EntryId>,
+    name: String,
+    group: bool,
+    enabled: bool,
+    fiber: Option<Fiber>,
+    plugin_key: Option<PluginKey>,
+    context: Context,
 }
 
 enum ConfigSource {
@@ -40,15 +42,12 @@ enum ConfigSource {
     },
 }
 
-/// 由 LoaderPlugin 作为普通 Cordis 插件挂载的静态 Catalog Loader。
 pub struct LoaderPlugin {
     catalog: ExtensionCatalog,
     source: ConfigSource,
     state: Mutex<Option<Arc<LoaderInner>>>,
 }
-
 impl LoaderPlugin {
-    /// 创建不带文件持久化来源的内存 LoaderPlugin。
     pub fn new(catalog: ExtensionCatalog, config: ExtensionsConfig) -> Result<Self, LoaderError> {
         preflight(&catalog, &config)?;
         Ok(Self {
@@ -57,8 +56,6 @@ impl LoaderPlugin {
             state: Mutex::new(None),
         })
     }
-
-    /// 读取 Bootstrap 与扩展清单并预检，返回可由 `Context::plugin` 挂载的插件。
     pub fn bootstrap(
         catalog: ExtensionCatalog,
         bootstrap_path: impl AsRef<Path>,
@@ -76,7 +73,6 @@ impl LoaderPlugin {
             state: Mutex::new(None),
         })
     }
-
     fn initial_state(&self, context: Context) -> Arc<LoaderInner> {
         let (config, extensions_path, revision) = match &self.source {
             ConfigSource::Memory { config } => (config.clone(), None, None),
@@ -86,7 +82,7 @@ impl LoaderPlugin {
                 revision,
             } => (config.clone(), Some(path.clone()), Some(revision.clone())),
         };
-        Arc::new_cyclic(|weak| LoaderInner {
+        Arc::new(LoaderInner {
             catalog: self.catalog.clone(),
             context,
             extensions_path: Mutex::new(extensions_path),
@@ -95,12 +91,11 @@ impl LoaderPlugin {
                 extensions: Vec::new(),
             }),
             revision: Mutex::new(revision),
-            instances: Mutex::new(HashMap::new()),
+            entries: Mutex::new(BTreeMap::new()),
             order: Mutex::new(Vec::new()),
             reconcile: Mutex::new(None),
             loader_operations: tokio::sync::Mutex::new(()),
             alive: AtomicBool::new(true),
-            loader: Loader::new(weak.clone()),
             initial: Mutex::new(Some(config)),
         })
     }
@@ -111,14 +106,11 @@ impl Plugin for LoaderPlugin {
     fn key(&self) -> PluginKey {
         PluginKey::new("cordis.loader")
     }
-
     async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
-        if let Some(previous) = self.state.lock().expect("loader plugin state").take() {
-            previous.alive.store(false, Ordering::Release);
-        }
-        let inner = self.initial_state(ctx.extend()?);
-        ctx.provide(LOADER, inner.loader.clone())?;
-        ctx.effect_named("loader")?.on_dispose({
+        self.state.lock().expect("loader plugin state").take();
+        let inner = self.initial_state(ctx.clone());
+        ctx.provide(LOADER, Loader::new(inner.clone()))?;
+        ctx.effect_named("loader-state")?.on_dispose({
             let inner = inner.clone();
             move || inner.alive.store(false, Ordering::Release)
         });
@@ -128,7 +120,7 @@ impl Plugin for LoaderPlugin {
             .lock()
             .expect("initial config")
             .take()
-            .expect("LoaderPlugin apply only initializes once per state");
+            .expect("LoaderPlugin applies once per state");
         inner
             .apply(config, None)
             .await
@@ -137,13 +129,11 @@ impl Plugin for LoaderPlugin {
     }
 }
 
-/// 一轮 reconcile 的共享 completion；取消等待者不会中止编排。
 struct ReconcileCompletion {
     notify: Notify,
     result: Mutex<Option<Result<LoaderSnapshot, LoaderError>>>,
     retain: Mutex<Option<JoinHandle<()>>>,
 }
-
 impl ReconcileCompletion {
     fn new() -> Arc<Self> {
         Arc::new(Self {
@@ -152,19 +142,16 @@ impl ReconcileCompletion {
             retain: Mutex::new(None),
         })
     }
-
     fn attach(&self, task: JoinHandle<()>) {
         *self.retain.lock().expect("reconcile retain") = Some(task);
     }
-
     fn finish(&self, result: Result<LoaderSnapshot, LoaderError>) {
-        let mut slot = self.result.lock().expect("reconcile completion");
-        if slot.is_none() {
-            *slot = Some(result);
+        let mut result_slot = self.result.lock().expect("reconcile completion");
+        if result_slot.is_none() {
+            *result_slot = Some(result);
             self.notify.notify_waiters();
         }
     }
-
     async fn wait(self: &Arc<Self>) -> Result<LoaderSnapshot, LoaderError> {
         loop {
             let notified = self.notify.notified();
@@ -178,37 +165,17 @@ impl ReconcileCompletion {
     }
 }
 
-struct ReconcileFinishGuard {
-    inner: Arc<LoaderInner>,
-    completion: Arc<ReconcileCompletion>,
-    finished: bool,
-}
-
-impl Drop for ReconcileFinishGuard {
-    fn drop(&mut self) {
-        if !self.finished {
-            self.inner.finish_reconcile(
-                self.completion.clone(),
-                Err(LoaderError::ReconcileAborted {
-                    reason: "reconcile supervisor dropped".into(),
-                }),
-            );
-        }
-    }
-}
-
 pub(crate) struct LoaderInner {
     pub(crate) catalog: ExtensionCatalog,
     pub(crate) context: Context,
     pub(crate) extensions_path: Mutex<Option<PathBuf>>,
     pub(crate) desired: Mutex<ExtensionsConfig>,
     pub(crate) revision: Mutex<Option<String>>,
-    instances: Mutex<HashMap<InstanceId, MountedInstance>>,
-    order: Mutex<Vec<InstanceId>>,
+    entries: Mutex<BTreeMap<EntryId, MountedEntry>>,
+    order: Mutex<Vec<EntryId>>,
     reconcile: Mutex<Option<Arc<ReconcileCompletion>>>,
     pub(crate) loader_operations: tokio::sync::Mutex<()>,
     pub(crate) alive: AtomicBool,
-    pub(crate) loader: Loader,
     initial: Mutex<Option<ExtensionsConfig>>,
 }
 
@@ -218,268 +185,312 @@ impl LoaderInner {
         config: ExtensionsConfig,
         revision: Option<String>,
     ) -> Result<LoaderSnapshot, LoaderError> {
-        if !self.alive.load(Ordering::Acquire) {
-            return Err(LoaderError::Runtime {
-                source: CoreError::ContextDisposed,
-            });
-        }
+        let prepared = prepare_tree(&self.catalog, &config)?;
         let completion = {
             let mut slot = self.reconcile.lock().expect("reconcile slot");
             if slot.is_some() {
                 return Err(LoaderError::ReconcileBusy);
             }
-            let plan = {
-                let instances = self.instances.lock().expect("instances");
-                let order = self.order.lock().expect("order");
-                reconcile::prepare(&self.catalog, &instances, &order, &config)?
-            };
             let completion = ReconcileCompletion::new();
             *slot = Some(completion.clone());
-            self.spawn_reconcile(completion.clone(), plan, config, revision);
+            self.spawn_reconcile(completion.clone(), prepared, config, revision);
             completion
         };
         completion.wait().await
     }
-
     pub(crate) async fn await_idle(self: &Arc<Self>) -> Result<LoaderSnapshot, LoaderError> {
-        let pending = self.reconcile.lock().expect("reconcile slot").clone();
-        if let Some(completion) = pending {
+        let completion = { self.reconcile.lock().expect("reconcile slot").clone() };
+        if let Some(completion) = completion {
             completion.wait().await
-        } else if self.alive.load(Ordering::Acquire) {
-            Ok(self.snapshot())
         } else {
-            Err(LoaderError::Runtime {
-                source: CoreError::ContextDisposed,
-            })
+            Ok(self.snapshot())
         }
     }
-
     fn spawn_reconcile(
         self: &Arc<Self>,
         completion: Arc<ReconcileCompletion>,
-        plan: ReconcilePlan,
+        prepared: Vec<PreparedEntry>,
         config: ExtensionsConfig,
         revision: Option<String>,
     ) {
         let inner = self.clone();
         let task_completion = completion.clone();
         let task = tokio::runtime::Handle::current().spawn(async move {
-            let mut guard = ReconcileFinishGuard {
-                inner: inner.clone(),
-                completion: task_completion.clone(),
-                finished: false,
-            };
             let worker_inner = inner.clone();
-            let worker = tokio::spawn(async move { worker_inner.run_reconcile(plan).await });
-            let result = match worker.await {
-                Ok(result) => result,
-                Err(error) => Err(LoaderError::ReconcileAborted {
-                    reason: format!("reconcile worker: {error}"),
-                }),
-            };
+            let result =
+                match tokio::spawn(async move { worker_inner.rebuild(prepared).await }).await {
+                    Ok(result) => result,
+                    Err(error) => Err(LoaderError::ReconcileAborted {
+                        reason: format!("reconcile worker: {error}"),
+                    }),
+                };
             if result.is_ok() {
                 *inner.desired.lock().expect("desired") = config;
                 if let Some(revision) = revision {
                     *inner.revision.lock().expect("revision") = Some(revision);
                 }
             }
-            inner.finish_reconcile(task_completion, result);
-            guard.finished = true;
+            let mut slot = inner.reconcile.lock().expect("reconcile slot");
+            if slot
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(current, &task_completion))
+            {
+                *slot = None;
+            }
+            drop(slot);
+            task_completion.finish(result);
         });
         completion.attach(task);
     }
-
-    fn finish_reconcile(
-        &self,
-        completion: Arc<ReconcileCompletion>,
-        result: Result<LoaderSnapshot, LoaderError>,
-    ) {
-        let mut slot = self.reconcile.lock().expect("reconcile slot");
-        if slot
-            .as_ref()
-            .is_some_and(|current| Arc::ptr_eq(current, &completion))
-        {
-            *slot = None;
-        }
-        drop(slot);
-        completion.finish(result);
+    async fn rebuild(&self, prepared: Vec<PreparedEntry>) -> Result<LoaderSnapshot, LoaderError> {
+        self.dispose_all().await?;
+        self.mount_entries(&prepared, None, self.context.clone(), false)
+            .await?;
+        Ok(self.snapshot())
     }
-
+    async fn dispose_all(&self) -> Result<(), LoaderError> {
+        let order = std::mem::take(&mut *self.order.lock().expect("entry order"));
+        let mut entries = std::mem::take(&mut *self.entries.lock().expect("entries"));
+        for path in order.into_iter().rev() {
+            if let Some(mut entry) = entries.remove(&path)
+                && let Some(mut fiber) = entry.fiber.take()
+            {
+                fiber
+                    .dispose_wait()
+                    .await
+                    .map_err(|source| LoaderError::Lifecycle {
+                        instance: path.to_string(),
+                        source,
+                    })?;
+            }
+        }
+        Ok(())
+    }
+    async fn mount_entries(
+        &self,
+        prepared: &[PreparedEntry],
+        parent: Option<EntryId>,
+        parent_context: Context,
+        parent_disabled: bool,
+    ) -> Result<(), LoaderError> {
+        for entry in prepared {
+            let context = parent_context
+                .extend()
+                .map_err(|source| LoaderError::Runtime { source })?;
+            let (context, dependencies) = self.catalog.resolve_injections(
+                entry.options.inject.as_ref(),
+                entry.path.as_str(),
+                context,
+            )?;
+            let enabled = !parent_disabled && !entry.options.disabled;
+            let (fiber, plugin_key) = if entry.options.group {
+                (
+                    Some(
+                        context
+                            .plugin(Arc::new(ConfiguredPlugin::new(
+                                Arc::new(GroupPlugin),
+                                dependencies,
+                            )))
+                            .await
+                            .map_err(|source| LoaderError::Lifecycle {
+                                instance: entry.path.to_string(),
+                                source,
+                            })?,
+                    ),
+                    Some(PluginKey::new("cordis.loader.group")),
+                )
+            } else if enabled {
+                let plugin = entry
+                    .plugin
+                    .clone()
+                    .expect("prepared enabled ordinary entry");
+                (
+                    Some(
+                        context
+                            .plugin(Arc::new(ConfiguredPlugin::new(plugin, dependencies)))
+                            .await
+                            .map_err(|source| LoaderError::Lifecycle {
+                                instance: entry.path.to_string(),
+                                source,
+                            })?,
+                    ),
+                    entry.plugin_key,
+                )
+            } else {
+                (None, None)
+            };
+            self.order
+                .lock()
+                .expect("entry order")
+                .push(entry.path.clone());
+            self.entries.lock().expect("entries").insert(
+                entry.path.clone(),
+                MountedEntry {
+                    parent: parent.clone(),
+                    name: entry.options.name.clone(),
+                    group: entry.options.group,
+                    enabled,
+                    fiber,
+                    plugin_key,
+                    context: context.clone(),
+                },
+            );
+            if entry.options.group {
+                Box::pin(self.mount_entries(
+                    &entry.children,
+                    Some(entry.path.clone()),
+                    context,
+                    parent_disabled || entry.options.disabled,
+                ))
+                .await?;
+            }
+        }
+        Ok(())
+    }
     fn snapshot(&self) -> LoaderSnapshot {
-        let instances = self.instances.lock().expect("instances");
-        let order = self.order.lock().expect("order");
+        let entries = self.entries.lock().expect("entries");
+        let order = self.order.lock().expect("entry order");
         LoaderSnapshot {
-            instances: order
+            entries: order
                 .iter()
-                .filter_map(|id| {
-                    let mounted = instances.get(id)?;
-                    Some(InstanceSnapshot {
-                        instance: id.clone(),
-                        factory: mounted.factory.clone(),
-                        plugin_key: mounted.plugin_key,
-                        fiber_id: mounted.fiber.id(),
-                        state: mounted.fiber.state(),
-                        last_error: mounted.fiber.last_error(),
+                .filter_map(|path| {
+                    entries.get(path).map(|entry| EntrySnapshot {
+                        path: path.clone(),
+                        parent: entry.parent.clone(),
+                        name: entry.name.clone(),
+                        group: entry.group,
+                        enabled: entry.enabled,
+                        plugin_key: entry.plugin_key,
+                        fiber_id: entry.fiber.as_ref().map(Fiber::id),
+                        state: entry.fiber.as_ref().map(Fiber::state),
+                        last_error: entry.fiber.as_ref().and_then(Fiber::last_error),
                     })
                 })
                 .collect(),
         }
     }
-
-    pub(crate) fn entry_context(&self, instance: &str) -> Result<Context, LoaderError> {
-        self.instances
+    pub(crate) fn entry_context(&self, path: &str) -> Result<Context, LoaderError> {
+        self.entries
             .lock()
-            .expect("instances")
-            .get(&InstanceId::from(instance))
-            .map(|mounted| mounted.context.clone())
+            .expect("entries")
+            .get(&EntryId::from(path))
+            .map(|entry| entry.context.clone())
             .ok_or_else(|| LoaderError::UnknownInstance {
-                instance: instance.to_string(),
+                instance: path.into(),
             })
     }
-
-    async fn run_reconcile(&self, plan: ReconcilePlan) -> Result<LoaderSnapshot, LoaderError> {
-        for id in plan.removes {
-            self.remove_instance(id).await?;
-        }
-        for item in plan.replaces {
-            self.replace_instance(item).await?;
-        }
-        for item in plan.adds {
-            self.add_instance(item).await?;
-        }
-        Ok(self.snapshot())
-    }
-
-    async fn remove_instance(&self, id: InstanceId) -> Result<(), LoaderError> {
-        let Some(mut mounted) = self.instances.lock().expect("instances").remove(&id) else {
-            self.order.lock().expect("order").retain(|item| item != &id);
-            return Ok(());
-        };
-        let result = mounted.fiber.dispose_wait().await;
-        if mounted.fiber.is_disposed() {
-            self.order.lock().expect("order").retain(|item| item != &id);
-        } else {
-            self.instances
-                .lock()
-                .expect("instances")
-                .insert(id.clone(), mounted);
-        }
-        result.map_err(|source| LoaderError::Lifecycle {
-            instance: id.to_string(),
-            source,
-        })
-    }
-
-    async fn replace_instance(&self, item: PreparedInstance) -> Result<(), LoaderError> {
-        let PreparedInstance {
-            instance,
-            factory,
-            config,
-            plugin,
-            plugin_key,
-        } = item;
-        let mut mounted = self
-            .instances
-            .lock()
-            .expect("instances")
-            .remove(&instance)
-            .ok_or_else(|| LoaderError::Lifecycle {
-                instance: instance.to_string(),
-                source: CoreError::FiberDisposed,
-            })?;
-        let outcome = match mounted.fiber.replace(plugin).await {
-            Err(CoreError::PluginKeyMismatch { expected, actual }) => {
-                Err(LoaderError::PluginKeyChanged {
-                    instance: instance.to_string(),
-                    expected,
-                    actual,
-                })
-            }
-            Err(source) => {
-                commit_mounted(&mut mounted, factory, plugin_key, config);
-                Err(lifecycle_error(&instance, source))
-            }
-            Ok(()) => {
-                commit_mounted(&mut mounted, factory, plugin_key, config);
-                failed_fiber_error(&instance, &mounted.fiber)
-            }
-        };
-        self.instances
-            .lock()
-            .expect("instances")
-            .insert(instance, mounted);
-        outcome
-    }
-
-    async fn add_instance(&self, item: PreparedInstance) -> Result<(), LoaderError> {
-        let PreparedInstance {
-            instance,
-            factory,
-            config,
-            plugin,
-            plugin_key,
-        } = item;
-        let entry_context = self
-            .context
-            .extend()
-            .map_err(|source| LoaderError::Runtime { source })?;
-        let fiber =
-            entry_context
-                .plugin(plugin)
-                .await
-                .map_err(|source| LoaderError::Lifecycle {
-                    instance: instance.to_string(),
-                    source,
-                })?;
-        let mut instances = self.instances.lock().expect("instances");
-        let mut order = self.order.lock().expect("order");
-        order.push(instance.clone());
-        instances.insert(
-            instance.clone(),
-            MountedInstance {
-                factory,
-                plugin_key,
-                config,
-                fiber,
-                context: entry_context,
-            },
-        );
-        failed_fiber_error(
-            &instance,
-            &instances.get(&instance).expect("inserted").fiber,
-        )
-    }
 }
 
-fn preflight(catalog: &ExtensionCatalog, config: &ExtensionsConfig) -> Result<(), LoaderError> {
-    reconcile::prepare(catalog, &HashMap::new(), &[], config).map(|_| ())
-}
-
-fn commit_mounted(
-    mounted: &mut MountedInstance,
-    factory: String,
-    plugin_key: PluginKey,
-    config: toml::Value,
-) {
-    mounted.factory = factory;
-    mounted.plugin_key = plugin_key;
-    mounted.config = config;
-}
-
-fn failed_fiber_error(instance: &InstanceId, fiber: &Fiber) -> Result<(), LoaderError> {
-    if fiber.state() == FiberState::Failed {
-        Err(lifecycle_error(
-            instance,
-            CoreError::PluginApply(fiber.last_error().unwrap_or_default()),
-        ))
-    } else {
+struct GroupPlugin;
+#[async_trait]
+impl Plugin for GroupPlugin {
+    fn key(&self) -> PluginKey {
+        PluginKey::new("cordis.loader.group")
+    }
+    async fn apply(&self, _: &Context) -> Result<(), CoreError> {
         Ok(())
     }
 }
-
-fn lifecycle_error(instance: &InstanceId, source: CoreError) -> LoaderError {
-    LoaderError::Lifecycle {
-        instance: instance.to_string(),
-        source,
+struct ConfiguredPlugin {
+    inner: Arc<dyn Plugin>,
+    dependencies: Vec<ServiceId>,
+}
+impl ConfiguredPlugin {
+    fn new(inner: Arc<dyn Plugin>, dependencies: Vec<ServiceId>) -> Self {
+        Self {
+            inner,
+            dependencies,
+        }
     }
+}
+#[async_trait]
+impl Plugin for ConfiguredPlugin {
+    fn key(&self) -> PluginKey {
+        self.inner.key()
+    }
+    fn inject(&self) -> Vec<ServiceId> {
+        let mut dependencies = self.dependencies.clone();
+        for dependency in self.inner.inject() {
+            if !dependencies.contains(&dependency) {
+                dependencies.push(dependency);
+            }
+        }
+        dependencies
+    }
+    async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
+        self.inner.apply(ctx).await
+    }
+}
+
+struct PreparedEntry {
+    path: EntryId,
+    options: EntryOptions,
+    plugin: Option<Arc<dyn Plugin>>,
+    plugin_key: Option<PluginKey>,
+    children: Vec<PreparedEntry>,
+}
+fn preflight(catalog: &ExtensionCatalog, config: &ExtensionsConfig) -> Result<(), LoaderError> {
+    prepare_tree(catalog, config).map(|_| ())
+}
+fn prepare_tree(
+    catalog: &ExtensionCatalog,
+    config: &ExtensionsConfig,
+) -> Result<Vec<PreparedEntry>, LoaderError> {
+    config.validate(catalog)?;
+    prepare_entries(catalog, &config.extensions, None, false)
+}
+fn prepare_entries(
+    catalog: &ExtensionCatalog,
+    entries: &[EntryOptions],
+    parent: Option<&str>,
+    parent_disabled: bool,
+) -> Result<Vec<PreparedEntry>, LoaderError> {
+    entries
+        .iter()
+        .map(|options| {
+            let path = EntryId::from(parent.map_or_else(
+                || options.id.clone(),
+                |parent| format!("{parent}:{id}", id = options.id),
+            ));
+            let effective_disabled = parent_disabled || options.disabled;
+            let children = if options.group {
+                prepare_entries(
+                    catalog,
+                    &options.children()?,
+                    Some(path.as_str()),
+                    effective_disabled,
+                )?
+            } else {
+                Vec::new()
+            };
+            let (plugin, plugin_key) = if !options.group && !effective_disabled {
+                let factory = catalog.get(&options.name).expect("validated factory");
+                let plugin = catch_unwind(AssertUnwindSafe(|| factory.build(&options.config)))
+                    .map_err(|payload| LoaderError::FactoryPanic {
+                        message: format_panic_message("extension factory build", payload),
+                    })?
+                    .map_err(|error| LoaderError::PluginBuild {
+                        instance: path.to_string(),
+                        factory: options.name.clone(),
+                        message: error.to_string(),
+                    })?;
+                let plugin_key =
+                    catch_unwind(AssertUnwindSafe(|| plugin.key())).map_err(|payload| {
+                        LoaderError::PluginPanic {
+                            message: format_panic_message("plugin key", payload),
+                        }
+                    })?;
+                (Some(plugin), Some(plugin_key))
+            } else {
+                (None, None)
+            };
+            Ok(PreparedEntry {
+                path,
+                options: options.clone(),
+                plugin,
+                plugin_key,
+                children,
+            })
+        })
+        .collect()
 }

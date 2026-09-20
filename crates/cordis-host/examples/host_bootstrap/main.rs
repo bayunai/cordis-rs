@@ -32,8 +32,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let greeting = loader.entry_context("default-greeting")?.get(GREETING)?;
     println!("{}", greeting.0);
     println!(
-        "mounted instances: {}",
-        loader.await_idle().await?.instances.len()
+        "mounted entries: {}",
+        loader.await_idle().await?.entries.len()
     );
 
     host.shutdown().await?;
