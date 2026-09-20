@@ -682,6 +682,13 @@ async fn replace_during_parent_dispose_keeps_disposed_and_skips_new_plugin() {
 
     let (fiber, result) = replace.await.expect("join");
     assert!(matches!(result, Err(CoreError::FiberDisposed)));
+    // `dispose()` 只启动父 Scope 的异步收敛。replace 已观察到终态时，父 Scope
+    // 的收尾任务仍可能尚未来得及发布 FiberState::Disposed；等待它的 Completion
+    // 后再断言可观察状态，避免将调度时序误当作生命周期合同。
+    parent_owner
+        .dispose_wait()
+        .await
+        .expect("parent dispose_wait");
     assert_eq!(fiber.state(), FiberState::Disposed);
     assert!(fiber.is_disposed());
     assert_eq!(replacement_applied.load(Ordering::SeqCst), 0);

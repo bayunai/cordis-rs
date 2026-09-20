@@ -4,7 +4,7 @@
 资源归属、事件与运行时诊断。它不是 HTTP 框架、数据库抽象或动态插件加载器；这些能力应由
 应用或独立扩展实现。
 
-> 当前版本为 `0.1.0`，公共 API 尚未稳定。升级 `0.x` 版本前请阅读变更说明并自行评估破坏性变更。
+> 当前版本为 [`0.2.0`](CHANGELOG.md#020---2026-09-20)，公共 API 尚未稳定。升级 `0.x` 版本前请阅读变更说明并自行评估破坏性变更。
 
 ## 适用场景
 
@@ -34,11 +34,11 @@
 ```toml
 [dependencies]
 async-trait = "0.1"
-cordis-core = { git = "https://github.com/bayunai/cordis-rs", rev = "490bef8" }
+cordis-core = { git = "https://github.com/bayunai/cordis-rs", tag = "v0.2.0" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
-> `rev` 应替换为你实际审计并固定的提交；在发布到 crates.io 前，不建议依赖浮动分支。
+> `tag` 应替换为你实际审计并固定的发布标签；不建议依赖浮动分支。
 
 ```rust
 use async_trait::async_trait;
