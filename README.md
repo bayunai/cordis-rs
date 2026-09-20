@@ -20,9 +20,10 @@
 | Crate | 用途 |
 | --- | --- |
 | [`cordis-core`](crates/cordis-core) | Runtime 内核：`Context`、`Service`、`inject`、`Effect`、`Plugin`、`Event` 与诊断。 |
-| [`cordis-loader`](crates/cordis-loader) | 可挂载的静态 Catalog EntryTree LoaderPlugin：v2 TOML 树、reconcile、管理服务与原子持久化。 |
+| [`cordis-loader`](crates/cordis-loader) | 可挂载的静态 Catalog EntryTree LoaderPlugin：v3 TOML 树、多树 reconcile、管理服务与原子持久化。 |
 | [`cordis-host`](crates/cordis-host) | 应用进程薄外壳：创建 Runtime、开放完整权限并受控关闭。 |
 | [`cordis-plugin-timer`](crates/cordis-plugin-timer) | Host 显式挂载的 Effect 作用域计时器能力（timeout / interval / throttle / debounce）。 |
+| [`cordis-plugin-include`](crates/cordis-plugin-include) | 可选：TOML 文件驱动的嵌套 EntryTree（`cordis:include`）；须 Catalog 显式注册。 |
 | [`cordis-testkit`](crates/cordis-testkit) | 测试辅助；不应用于生产宿主。 |
 
 ## 快速开始
@@ -112,7 +113,8 @@ cargo run -p cordis-host --example host_bootstrap
   `isolate_with` 复用父服务 identity，仅隔离指定 `ServiceKey` 的可见性。
 - `Context::intercept()` 只覆盖 `ConfigKey`，**复用父视图的 Service identity**，不会隔离服务。
 - Loader EntryTree 中：顶层条目共享 Loader 根服务域；服务隔离由条目 `isolate` 声明驱动（见 Host 文档）；
-  普通 Entry 默认不是服务边界。详见[Host 文档](docs/host.md)。
+  普通 Entry 默认不是服务边界。嵌套文件树由可选的 `cordis-plugin-include` 附着为独立
+  `RuntimeTree`（须 Catalog 显式注册）。详见[Host 文档](docs/host.md)。
 - `Plugin` 用 `PluginKey` 标识，并由 Fiber 管理加载、替换、卸载与依赖变更后的重启。
 - `Effect` 统一归属插件的任务、监听器和清理回调；长期任务使用 `spawn`，一次性异步清理使用
   `on_dispose_async`。

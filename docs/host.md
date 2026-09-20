@@ -58,6 +58,15 @@ disabled = true
 `name = "cordis:group"` 和 `group = true`，其 `config` 是子条目数组。路径以 `:` 拼接，以上
 示例的导出器路径为 `infrastructure:reports:exporter`。
 
+**Group vs Include：**
+
+| | Group | Include（`cordis-plugin-include`） |
+| --- | --- | --- |
+| 子项存放 | 内联在父条目 `config` 数组 | 独立 v3 `ExtensionsConfig` TOML 文件 |
+| 注册 | Loader 内建 | Catalog 显式 `register(IncludeFactory)` |
+| 持久化 | 写回父树文件 | 只写回 Include 自己的文件 |
+| 重载 | 根 `Loader::reload()` | `loader.subtree("path")?.reload()` |
+
 旧平面 v1 与 v2 不再被读取；需将配置显式迁移到 v3。
 
 ## Factory、inject 与 isolate
@@ -128,9 +137,12 @@ Group **只**组织 EntryTree / 生命周期 / 父子 Context，**不再** `exte
 
 ## 管理 API 与可见性
 
-`Loader` 提供 `entries()`、`factories()`、`injections()`、`isolations()`、`create()`、`update()`、
-`remove()`、`reload()` 和 `await_idle()`。`create` / `update` 接收父 Group 路径与位置；`update`
-可以移动条目，移动按「旧路径后序释放 → 新路径前序挂载」处理（不做隐式原地迁移）。
+`Loader` 提供 `entries()`、`factories()`、`injections()`、`isolations()`、`subtree()`、
+`attach_file_subtree()`、`create()`、`update()`、`remove()`、`reload()` 和 `await_idle()`。
+根控制面的 `create` / `update` / `remove` / `reload` 只操作根树；Include 内部用
+`LoaderSubtree`（`loader.subtree("reports")`）。`create` / `update` 接收父 Group 路径与位置；
+`update` 可以移动条目，移动按「旧路径后序释放 → 新路径前序挂载」处理（不做隐式原地迁移）。
+**跨树移动一律拒绝**（`CrossTreeMove`）。
 
 Loader reconcile 是**局部**的：仅创建、删除、移动、启停或配置/`inject`/`isolate` 变化的 Entry/子树
 参与生命周期；无关 Entry 保留原 Fiber ID、Context 与服务。普通 Entry 仅 `config` 变化且
@@ -138,6 +150,27 @@ Loader reconcile 是**局部**的：仅创建、删除、移动、启停或配�
 重建该 Group 整棵子树；仅 `disabled` 变化时保留 Group Fiber/Context，按祖先禁用规则启停后代。
 纯排序只更新 `LoaderSnapshot.entries` 前序与持久化文件顺序，**不**重启任何 Fiber。依赖关系仍须
 通过 `inject` 声明，排序不是业务依赖表达方式。成功 reconcile 后会清理目标树不再引用的命名隔离标签。
+全局 `await_idle()` / 快照按根树前序聚合，并在 Include 路径后插入对应子树。
+
+## Include（可选 crate）
+
+`cordis-plugin-include` 不是 Loader builtin。应用须：
+
+```rust
+catalog.register(IncludeFactory)?;
+```
+
+```toml
+[[extensions]]
+id = "reports"
+name = "cordis:include"
+[extensions.config]
+path = "reports.toml"   # 相对父配置文件目录；或绝对路径
+```
+
+`reports.toml` 必须是完整 v3 `ExtensionsConfig`。子条目完整路径形如 `reports:importer`。
+外部改动 Include 文件后必须 `loader.subtree("reports")?.reload()`；首版无文件监听、YAML/JSON、
+patches 或 HMR。重复附着同一规范化文件路径、Include 祖先循环引用会在挂载前失败。
 
 应用读取某一条目视图上的服务时使用路径：
 

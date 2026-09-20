@@ -126,6 +126,8 @@ Loader 读取 EntryTree → 反序列化为 `Factory::Config` → factory.build(
   条目上的 `isolate`（Catalog 须先 `register_isolation`）：`true` 独占运行期标签，非空字符串
   按 `(ServiceId, 标签名)` 在 Loader 内复用。`inject = { ... }` 只覆盖 `ConfigKey`。未隔离的
   Key 与父同槽，可共享也可 `ServiceConflict`。
+- **Include**：`cordis-plugin-include` 的 `cordis:include` 将独立 v3 TOML 附着为 Loader 子树；
+  须 Catalog 显式注册；管理用 `loader.subtree(path)`；外部改文件后须显式 `reload()`。
 
 ## ServiceKey / Event Key
 

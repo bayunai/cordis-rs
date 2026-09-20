@@ -6,6 +6,7 @@ members = [
     "crates/cordis-host",
     "crates/cordis-testkit",
     "crates/cordis-plugin-timer",
+    "crates/cordis-plugin-include",
 ]
 default-members = ["crates/cordis-core"]
 
@@ -26,6 +27,7 @@ cordis-core = { path = "crates/cordis-core" }
 cordis-host = { path = "crates/cordis-host" }
 cordis-loader = { path = "crates/cordis-loader" }
 cordis-plugin-timer = { path = "crates/cordis-plugin-timer" }
+cordis-plugin-include = { path = "crates/cordis-plugin-include" }
 cordis-testkit = { path = "crates/cordis-testkit" }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }

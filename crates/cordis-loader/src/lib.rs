@@ -3,16 +3,18 @@
 //! Core 仍只负责 Plugin、Fiber、Service、Effect 与生命周期。Loader 负责读取配置、
 //! 构造插件，并仅对创建、删除、移动、启停或配置变化的节点做生命周期操作；无关 Entry
 //! 保留原 Fiber、Context 与服务。首版不加载动态库、不监听文件、不提供 HTTP 管理接口。
-//! 纯排序只更新快照/文件顺序，不重启 Fiber。
+//! 纯排序只更新快照/文件顺序，不重启 Fiber。支持可附着的文件子树（Include）。
 
 mod bootstrap;
 mod catalog;
 mod config;
 mod error;
 mod loader;
+mod meta;
 mod plugin;
 mod reconcile;
 mod snapshot;
+mod tree;
 
 pub use bootstrap::{load_bootstrap, load_extensions};
 pub use catalog::{
@@ -24,7 +26,8 @@ pub use config::{
     ExtensionsConfig, GROUP_NAME, InjectConfig, IsolateConfig, IsolateValue,
 };
 pub use error::LoaderError;
-pub use loader::{EntryUpdate, LOADER, Loader, LoaderControlError};
+pub use loader::{EntryUpdate, LOADER, Loader, LoaderControlError, LoaderSubtree};
+pub use meta::{ENTRY_LOCATION, EntryLocation};
 pub use plugin::LoaderPlugin;
 pub use snapshot::{EntryId, EntrySnapshot, LoaderSnapshot};
 

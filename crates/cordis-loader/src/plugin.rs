@@ -2,26 +2,23 @@
 
 use crate::{
     bootstrap::{load_bootstrap, load_extensions_source},
-    catalog::{ExtensionCatalog, NamedIsolationLabels},
-    config::{EntryOptions, ExtensionsConfig},
+    catalog::ExtensionCatalog,
+    config::ExtensionsConfig,
     error::LoaderError,
     loader::{LOADER, Loader},
-    reconcile::{
-        DesiredNode, ReconcilePlan, build_plan_plugins, index_desired_tree, plan_reconcile,
-    },
-    snapshot::{EntryId, EntrySnapshot, LoaderSnapshot},
+    snapshot::{EntryId, LoaderSnapshot},
+    tree::{RuntimeTree, aggregate_snapshot, canonicalize_existing, resolve_include_path},
 };
 use async_trait::async_trait;
 use cordis_core::{Context, CoreError, Fiber, Plugin, PluginKey};
 use std::{
-    collections::BTreeMap,
+    collections::HashMap,
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
 };
-use tokio::{sync::Notify, task::JoinHandle};
 
 /// Loader 维护的运行时条目槽位；禁用或等待重挂载时可暂时没有 Fiber。
 pub(crate) struct RuntimeEntry {
@@ -35,7 +32,7 @@ pub(crate) struct RuntimeEntry {
     /// 普通 Entry 的工厂 id；Group 为 `None`。
     pub(crate) factory: Option<String>,
     /// 挂载时的自身配置（Group 的 children 嵌在 `config` 中，比较时单独处理）。
-    pub(crate) options: EntryOptions,
+    pub(crate) options: crate::config::EntryOptions,
 }
 
 enum ConfigSource {
@@ -92,23 +89,16 @@ impl LoaderPlugin {
                 revision,
             } => (config.clone(), Some(path.clone()), Some(revision.clone())),
         };
-        Arc::new(LoaderInner {
+        let root = RuntimeTree::new_root(self.catalog.clone(), context, extensions_path, revision);
+        let inner = Arc::new(LoaderInner {
             catalog: self.catalog.clone(),
-            context,
-            extensions_path: Mutex::new(extensions_path),
-            desired: Mutex::new(ExtensionsConfig {
-                version: crate::config::CONFIG_VERSION,
-                extensions: Vec::new(),
-            }),
-            revision: Mutex::new(revision),
-            entries: Mutex::new(BTreeMap::new()),
-            order: Mutex::new(Vec::new()),
-            named_labels: Mutex::new(NamedIsolationLabels::new()),
-            reconcile: Mutex::new(None),
-            loader_operations: tokio::sync::Mutex::new(()),
+            root: root.clone(),
+            subtrees: Mutex::new(SubtreeRegistry::default()),
             alive: AtomicBool::new(true),
             initial: Mutex::new(Some(config)),
-        })
+        });
+        *root.loader.lock().expect("loader weak") = Arc::downgrade(&inner);
+        inner
     }
 }
 
@@ -134,6 +124,7 @@ impl Plugin for LoaderPlugin {
             .take()
             .expect("LoaderPlugin applies once per state");
         inner
+            .root
             .apply(config, None)
             .await
             .map(|_| ())
@@ -141,201 +132,227 @@ impl Plugin for LoaderPlugin {
     }
 }
 
-struct ReconcileCompletion {
-    notify: Notify,
-    result: Mutex<Option<Result<LoaderSnapshot, LoaderError>>>,
-    retain: Mutex<Option<JoinHandle<()>>>,
-}
-
-impl ReconcileCompletion {
-    fn new() -> Arc<Self> {
-        Arc::new(Self {
-            notify: Notify::new(),
-            result: Mutex::new(None),
-            retain: Mutex::new(None),
-        })
-    }
-
-    fn attach(&self, task: JoinHandle<()>) {
-        *self.retain.lock().expect("reconcile retain") = Some(task);
-    }
-
-    fn finish(&self, result: Result<LoaderSnapshot, LoaderError>) {
-        let mut result_slot = self.result.lock().expect("reconcile completion");
-        if result_slot.is_none() {
-            *result_slot = Some(result);
-            self.notify.notify_waiters();
-        }
-    }
-
-    async fn wait(self: &Arc<Self>) -> Result<LoaderSnapshot, LoaderError> {
-        loop {
-            let notified = self.notify.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            if let Some(result) = self.result.lock().expect("reconcile completion").as_ref() {
-                return result.clone();
-            }
-            notified.await;
-        }
-    }
-}
-
 pub(crate) struct LoaderInner {
     pub(crate) catalog: ExtensionCatalog,
-    pub(crate) context: Context,
-    pub(crate) extensions_path: Mutex<Option<PathBuf>>,
-    pub(crate) desired: Mutex<ExtensionsConfig>,
-    pub(crate) revision: Mutex<Option<String>>,
-    pub(crate) entries: Mutex<BTreeMap<EntryId, RuntimeEntry>>,
-    pub(crate) order: Mutex<Vec<EntryId>>,
-    pub(crate) named_labels: Mutex<NamedIsolationLabels>,
-    reconcile: Mutex<Option<Arc<ReconcileCompletion>>>,
-    pub(crate) loader_operations: tokio::sync::Mutex<()>,
+    pub(crate) root: Arc<RuntimeTree>,
+    pub(crate) subtrees: Mutex<SubtreeRegistry>,
     pub(crate) alive: AtomicBool,
     initial: Mutex<Option<ExtensionsConfig>>,
 }
 
+/// 所有子树索引必须作为一个原子注册表读写。
+///
+/// `by_file` 保证一个配置文件只附着一次；`by_prefix` 提供路径定位与快照聚合。
+#[derive(Default)]
+pub(crate) struct SubtreeRegistry {
+    pub(crate) by_file: HashMap<PathBuf, Arc<RuntimeTree>>,
+    pub(crate) by_prefix: HashMap<EntryId, Arc<RuntimeTree>>,
+}
+
 impl LoaderInner {
-    pub(crate) async fn apply(
-        self: &Arc<Self>,
-        config: ExtensionsConfig,
-        revision: Option<String>,
-    ) -> Result<LoaderSnapshot, LoaderError> {
-        let (mut desired, roots) = index_desired_tree(&self.catalog, &config)?;
-        let plan = {
-            let entries = self.entries.lock().expect("entries");
-            plan_reconcile(&entries, &desired, &roots)?
-        };
-        build_plan_plugins(&self.catalog, &mut desired, &plan, &self.entries)?;
-        let completion = {
-            let mut slot = self.reconcile.lock().expect("reconcile slot");
-            if slot.is_some() {
-                return Err(LoaderError::ReconcileBusy);
-            }
-            let completion = ReconcileCompletion::new();
-            *slot = Some(completion.clone());
-            self.spawn_reconcile(completion.clone(), desired, plan, config, revision);
-            completion
-        };
-        completion.wait().await
+    pub(crate) async fn await_idle_all(self: &Arc<Self>) -> Result<LoaderSnapshot, LoaderError> {
+        let _ = self.root.await_idle().await?;
+        let subtrees: Vec<_> = self
+            .subtrees
+            .lock()
+            .expect("subtree registry")
+            .by_prefix
+            .values()
+            .cloned()
+            .collect();
+        for tree in subtrees {
+            let _ = tree.await_idle().await?;
+        }
+        Ok(self.aggregate_snapshot())
     }
 
-    pub(crate) async fn await_idle(self: &Arc<Self>) -> Result<LoaderSnapshot, LoaderError> {
-        let completion = { self.reconcile.lock().expect("reconcile slot").clone() };
-        if let Some(completion) = completion {
-            completion.wait().await
-        } else {
-            Ok(self.snapshot())
-        }
-    }
-
-    fn spawn_reconcile(
-        self: &Arc<Self>,
-        completion: Arc<ReconcileCompletion>,
-        desired: BTreeMap<EntryId, DesiredNode>,
-        plan: ReconcilePlan,
-        config: ExtensionsConfig,
-        revision: Option<String>,
-    ) {
-        let inner = self.clone();
-        let task_completion = completion.clone();
-        let task = tokio::runtime::Handle::current().spawn(async move {
-            let worker_inner = inner.clone();
-            let result =
-                match tokio::spawn(
-                    async move { worker_inner.execute_reconcile(desired, plan).await },
-                )
-                .await
-                {
-                    Ok(result) => result,
-                    Err(error) => Err(LoaderError::ReconcileAborted {
-                        reason: format!("reconcile worker: {error}"),
-                    }),
-                };
-            if result.is_ok() {
-                *inner.desired.lock().expect("desired") = config;
-                if let Some(revision) = revision {
-                    *inner.revision.lock().expect("revision") = Some(revision);
-                }
-                inner.prune_named_isolation_labels();
-            }
-            let mut slot = inner.reconcile.lock().expect("reconcile slot");
-            if slot
-                .as_ref()
-                .is_some_and(|current| Arc::ptr_eq(current, &task_completion))
-            {
-                *slot = None;
-            }
-            drop(slot);
-            task_completion.finish(result);
-        });
-        completion.attach(task);
-    }
-
-    pub(crate) fn snapshot(&self) -> LoaderSnapshot {
-        let entries = self.entries.lock().expect("entries");
-        let order = self.order.lock().expect("entry order");
-        // 生命周期失败可发生在最终目标顺序提交之前。先保留最近一次成功的顺序，
-        // 再补入实际已挂载、但尚未进入 order 的节点，确保 Failed/Pending 诊断可见。
-        let mut paths = order.clone();
-        for path in entries.keys() {
-            if !paths.contains(path) {
-                paths.push(path.clone());
-            }
-        }
-        LoaderSnapshot {
-            entries: paths
-                .iter()
-                .filter_map(|path| {
-                    entries.get(path).map(|entry| EntrySnapshot {
-                        path: path.clone(),
-                        parent: entry.parent.clone(),
-                        name: entry.name.clone(),
-                        group: entry.group,
-                        enabled: entry.enabled,
-                        plugin_key: entry.plugin_key,
-                        fiber_id: entry.fiber.as_ref().map(Fiber::id),
-                        state: entry.fiber.as_ref().map(Fiber::state),
-                        last_error: entry.fiber.as_ref().and_then(Fiber::last_error),
-                    })
-                })
-                .collect(),
-        }
+    pub(crate) fn aggregate_snapshot(&self) -> LoaderSnapshot {
+        let registry = self.subtrees.lock().expect("subtree registry");
+        aggregate_snapshot(&self.root, &registry.by_prefix)
     }
 
     pub(crate) fn entry_context(&self, path: &str) -> Result<Context, LoaderError> {
-        self.entries
-            .lock()
-            .expect("entries")
-            .get(&EntryId::from(path))
-            .map(|entry| entry.context.clone())
-            .ok_or_else(|| LoaderError::UnknownInstance {
-                instance: path.into(),
-            })
-    }
-
-    pub(crate) fn prune_named_isolation_labels(&self) {
-        let desired = self.desired.lock().expect("desired");
-        let mut live = std::collections::HashSet::new();
-        collect_named_isolation_refs(&self.catalog, &desired.extensions, &mut live);
-        let mut labels = self.named_labels.lock().expect("named labels");
-        labels.retain(|key, _| live.contains(key));
-    }
-}
-
-fn collect_named_isolation_refs(
-    catalog: &ExtensionCatalog,
-    entries: &[EntryOptions],
-    out: &mut std::collections::HashSet<(cordis_core::ServiceId, String)>,
-) {
-    for entry in entries {
-        catalog.collect_named_isolation_refs(entry.isolate.as_ref(), out);
-        if entry.group
-            && let Ok(children) = entry.children()
-        {
-            collect_named_isolation_refs(catalog, &children, out);
+        if let Some(ctx) = self.root.entry_context(path) {
+            return Ok(ctx);
         }
+        let subtrees: Vec<_> = self
+            .subtrees
+            .lock()
+            .expect("subtree registry")
+            .by_prefix
+            .values()
+            .cloned()
+            .collect();
+        for tree in subtrees {
+            if let Some(ctx) = tree.entry_context(path) {
+                return Ok(ctx);
+            }
+        }
+        Err(LoaderError::UnknownInstance {
+            instance: path.into(),
+        })
+    }
+
+    /// 路径是否属于某棵已附着子树的**内部**条目（不含 Include 载体自身路径）。
+    pub(crate) fn subtree_owning_path(&self, path: &str) -> Option<Arc<RuntimeTree>> {
+        let registry = self.subtrees.lock().expect("subtree registry");
+        let mut best: Option<Arc<RuntimeTree>> = None;
+        for (prefix, tree) in &registry.by_prefix {
+            let p = prefix.as_str();
+            if p.is_empty() {
+                continue;
+            }
+            if path.starts_with(&(p.to_string() + ":")) {
+                let deeper = best
+                    .as_ref()
+                    .map(|current| current.prefix.as_str().len() < p.len())
+                    .unwrap_or(true);
+                if deeper {
+                    best = Some(tree.clone());
+                }
+            }
+        }
+        best
+    }
+
+    pub(crate) async fn attach_file_subtree(
+        self: &Arc<Self>,
+        owner: &Context,
+        configured: &Path,
+    ) -> Result<Arc<RuntimeTree>, LoaderError> {
+        let location = owner
+            .config(crate::meta::ENTRY_LOCATION)
+            .map_err(|_| LoaderError::EntryLocationMissing)?;
+        let resolved = resolve_include_path(location.source_dir.as_deref(), configured)?;
+        if !resolved.is_file() {
+            return Err(LoaderError::Io {
+                path: resolved.clone(),
+                message: "include file does not exist".into(),
+            });
+        }
+        let file_key = canonicalize_existing(&resolved)?;
+
+        let (config, revision) = load_extensions_source(&resolved)?;
+        preflight(&self.catalog, &config)?;
+
+        let prefix = EntryId::from(location.path.as_str());
+        // 读取/预检在锁外；检查与保留在同一注册表临界区，不能被并发 attach 穿插。
+        let tree = {
+            let mut registry = self.subtrees.lock().expect("subtree registry");
+            let owner_tree = registry
+                .by_prefix
+                .get(&EntryId::from(location.tree_prefix.as_str()))
+                .cloned()
+                .unwrap_or_else(|| self.root.clone());
+
+            // 先检查祖先链，确保循环比一般重复来源得到更准确的诊断。
+            let parent_file = owner_tree.file_key.clone();
+            let mut cursor = parent_file.clone();
+            while let Some(current) = cursor {
+                if current == file_key {
+                    return Err(LoaderError::IncludeCycle { path: file_key });
+                }
+                cursor = registry
+                    .by_file
+                    .get(&current)
+                    .and_then(|tree| tree.parent_file.clone())
+                    .or_else(|| {
+                        if self.root.file_key.as_ref() == Some(&current) {
+                            self.root.parent_file.clone()
+                        } else {
+                            None
+                        }
+                    });
+            }
+
+            if registry.by_file.contains_key(&file_key)
+                || self
+                    .root
+                    .file_key
+                    .as_ref()
+                    .is_some_and(|root| root == &file_key)
+                || registry.by_prefix.contains_key(&prefix)
+            {
+                return Err(LoaderError::DuplicateSubtreeSource { path: file_key });
+            }
+
+            let tree = RuntimeTree::new_subtree(
+                self.catalog.clone(),
+                Arc::downgrade(self),
+                owner.clone(),
+                prefix.clone(),
+                resolved,
+                file_key.clone(),
+                parent_file,
+                revision.clone(),
+            );
+            registry.by_file.insert(file_key.clone(), tree.clone());
+            registry.by_prefix.insert(prefix, tree.clone());
+            tree
+        };
+
+        match tree.apply(config, Some(revision)).await {
+            Ok(_) => Ok(tree),
+            Err(error) => {
+                let _ = tree.dispose_all().await;
+                self.unregister_subtree(&tree);
+                Err(error)
+            }
+        }
+    }
+
+    pub(crate) fn unregister_subtree(&self, tree: &Arc<RuntimeTree>) {
+        let mut registry = self.subtrees.lock().expect("subtree registry");
+        if let Some(key) = &tree.file_key
+            && registry
+                .by_file
+                .get(key)
+                .is_some_and(|current| Arc::ptr_eq(current, tree))
+        {
+            registry.by_file.remove(key);
+        }
+        if registry
+            .by_prefix
+            .get(&tree.prefix)
+            .is_some_and(|current| Arc::ptr_eq(current, tree))
+        {
+            registry.by_prefix.remove(&tree.prefix);
+        }
+    }
+
+    pub(crate) async fn detach_subtree(&self, tree: &Arc<RuntimeTree>) -> Result<(), LoaderError> {
+        // 先卸嵌套子树（前缀以本树 prefix 开头的更长前缀）
+        let nested: Vec<_> = {
+            let registry = self.subtrees.lock().expect("subtree registry");
+            let base = tree.prefix.as_str();
+            registry
+                .by_prefix
+                .iter()
+                .filter(|(prefix, _)| {
+                    let p = prefix.as_str();
+                    !p.is_empty()
+                        && p != base
+                        && (base.is_empty() || p.starts_with(&(base.to_string() + ":")))
+                })
+                .map(|(_, t)| t.clone())
+                .collect()
+        };
+        // 深者优先
+        let mut nested = nested;
+        nested.sort_by(|a, b| {
+            b.prefix
+                .as_str()
+                .matches(':')
+                .count()
+                .cmp(&a.prefix.as_str().matches(':').count())
+        });
+        for child in nested {
+            child.dispose_all().await?;
+            self.unregister_subtree(&child);
+        }
+        tree.dispose_all().await?;
+        self.unregister_subtree(tree);
+        Ok(())
     }
 }
 

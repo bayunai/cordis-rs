@@ -100,6 +100,14 @@ pub enum LoaderError {
     ReconcileBusy,
     #[error("Loader reconcile 协调器异常终止: {reason}")]
     ReconcileAborted { reason: String },
+    #[error("配置文件已被其他树附着: {path}", path = path.display())]
+    DuplicateSubtreeSource { path: PathBuf },
+    #[error("Include 配置文件形成循环引用: {path}", path = path.display())]
+    IncludeCycle { path: PathBuf },
+    #[error("相对 Include 路径需要所属树具备文件配置源目录")]
+    RelativePathWithoutSource,
+    #[error("当前 Context 缺少 Loader 条目位置元数据")]
+    EntryLocationMissing,
 }
 
 impl LoaderError {

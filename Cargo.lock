@@ -263,6 +263,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "cordis-plugin-include"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "cordis-core",
+ "cordis-loader",
+ "cordis-testkit",
+ "schemars",
+ "serde",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "toml",
+]
+
+[[package]]
 name = "cordis-plugin-timer"
 version = "0.1.0"
 dependencies = [

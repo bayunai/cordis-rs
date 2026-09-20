@@ -1,0 +1,25 @@
+[package]
+name = "cordis-plugin-include"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+readme.workspace = true
+description = "TOML-driven nested EntryTree include plugin for cordis-loader hosts."
+
+[dependencies]
+async-trait.workspace = true
+cordis-core.workspace = true
+cordis-loader.workspace = true
+schemars.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+toml.workspace = true
+
+[dev-dependencies]
+cordis-testkit.workspace = true
+tempfile = "3"
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync"] }

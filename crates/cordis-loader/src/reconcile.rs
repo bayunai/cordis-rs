@@ -4,8 +4,9 @@ use crate::{
     catalog::ExtensionCatalog,
     config::{EntryOptions, ExtensionsConfig},
     error::{LoaderError, format_panic_message},
-    plugin::{LoaderInner, RuntimeEntry},
+    plugin::RuntimeEntry,
     snapshot::{EntryId, LoaderSnapshot},
+    tree::RuntimeTree,
 };
 use async_trait::async_trait;
 use cordis_core::{Context, CoreError, FiberState, Plugin, PluginKey, ServiceId};
@@ -39,7 +40,7 @@ pub(crate) struct ReconcilePlan {
     desired_order: Vec<EntryId>,
 }
 
-impl LoaderInner {
+impl RuntimeTree {
     pub(crate) async fn execute_reconcile(
         &self,
         desired: BTreeMap<EntryId, DesiredNode>,
@@ -92,10 +93,10 @@ impl LoaderInner {
 
         // 6) 纯排序 / 最终前序
         *self.order.lock().expect("entry order") = plan.desired_order;
-        Ok(self.snapshot())
+        Ok(self.local_snapshot())
     }
 
-    async fn dispose_and_remove(&self, path: &EntryId) -> Result<(), LoaderError> {
+    pub(crate) async fn dispose_and_remove(&self, path: &EntryId) -> Result<(), LoaderError> {
         let mut fiber = {
             let mut entries = self.entries.lock().expect("entries");
             let Some(mut entry) = entries.remove(path) else {
@@ -205,7 +206,7 @@ impl LoaderInner {
             let entries = self.entries.lock().expect("entries");
             match &node.parent {
                 Some(parent) => entries.get(parent).map(|entry| entry.context.clone()),
-                None => Some(self.context.clone()),
+                None => Some(self.owner.clone()),
             }
         };
         let parent_context = parent_context.ok_or_else(|| LoaderError::UnknownInstance {
@@ -216,7 +217,6 @@ impl LoaderInner {
                 .unwrap_or_default(),
         })?;
 
-        // 已存在槽位（例如禁用后重新启用）：先丢掉旧 fiber（应已空）。
         let stale = {
             let mut entries = self.entries.lock().expect("entries");
             entries.get_mut(path).and_then(|entry| entry.fiber.take())
@@ -243,6 +243,7 @@ impl LoaderInner {
         let (context, dependencies) =
             self.catalog
                 .resolve_injections(node.options.inject.as_ref(), path.as_str(), domain)?;
+        let context = self.inject_entry_location(path, context);
 
         let (fiber, plugin_key, mount_failed, mount_error) = if node.options.group {
             let fiber = context
@@ -310,29 +311,40 @@ impl LoaderInner {
     }
 }
 
+// --- plan helpers ---
+
 pub(crate) fn index_desired_tree(
     catalog: &ExtensionCatalog,
     config: &ExtensionsConfig,
+    prefix: Option<&str>,
 ) -> Result<(BTreeMap<EntryId, DesiredNode>, Vec<EntryId>), LoaderError> {
     config.validate(catalog)?;
     let mut out = BTreeMap::new();
-    let roots = index_entries(&config.extensions, None, &mut out)?;
+    let roots = index_entries(&config.extensions, None, prefix, &mut out)?;
     Ok((out, roots))
 }
 
 fn index_entries(
     entries: &[EntryOptions],
     parent: Option<&str>,
+    prefix: Option<&str>,
     out: &mut BTreeMap<EntryId, DesiredNode>,
 ) -> Result<Vec<EntryId>, LoaderError> {
     let mut child_ids = Vec::new();
     for options in entries {
-        let path = EntryId::from(parent.map_or_else(
-            || options.id.clone(),
-            |parent| format!("{parent}:{id}", id = options.id),
-        ));
+        let path = EntryId::from(match parent {
+            Some(parent) => format!("{parent}:{id}", id = options.id),
+            None => match prefix {
+                Some(prefix) if !prefix.is_empty() => {
+                    format!("{prefix}:{id}", id = options.id)
+                }
+                _ => options.id.clone(),
+            },
+        });
+        // 子树顶层条目的 parent 为 None：mount 时挂到 RuntimeTree.owner。
+        let node_parent = parent.map(EntryId::from);
         let children = if options.group {
-            index_entries(&options.children()?, Some(path.as_str()), out)?
+            index_entries(&options.children()?, Some(path.as_str()), prefix, out)?
         } else {
             Vec::new()
         };
@@ -340,7 +352,7 @@ fn index_entries(
         out.insert(
             path.clone(),
             DesiredNode {
-                parent: parent.map(EntryId::from),
+                parent: node_parent,
                 options: options.clone(),
                 children,
                 plugin: None,
