@@ -1,14 +1,19 @@
-//! DB → Logger → HTTP 插件栈网页 Demo。
+//! Loader EntryTree 子树差分 reconcile 网页 Demo。
 //!
 //! ```bash
 //! cargo run -p cordis-core --example plugin_stack
 //! # 打开 http://127.0.0.1:3002
 //! ```
+//!
+//! 初始树：
+//! - `side`：根级旁路，观察 `app` 子树变更时 Fiber ID 是否保持
+//! - `app` Group：`db` → `logger` → `http`（同组共享服务域）
 
 mod db;
 mod http_client;
 mod keys;
 mod logger;
+mod side;
 
 use axum::{
     Json, Router,
@@ -20,29 +25,42 @@ use axum::{
     },
     routing::{get, post},
 };
-use cordis_core::{Context, Fiber, FiberStateSnapshot, Plugin, PluginKey, Runtime};
+use cordis_core::{FiberState, FiberStateSnapshot, Plugin, Runtime};
+use cordis_loader::{
+    EntryOptions, EntryUpdate, ExtensionCatalog, ExtensionFactory, ExtensionsConfig, LOADER,
+    Loader, LoaderError, LoaderPlugin, LoaderSnapshot,
+};
 use db::{DbPlugin, LogTx};
 use futures_util::stream::{Stream, unfold};
-use http_client::HttpPlugin;
-use keys::{DB, HTTP, KEY_DB, KEY_HTTP, KEY_LOGGER};
+use http_client::{HttpConfig, HttpPlugin};
+use keys::{DB, HTTP, KEY_DB, KEY_HTTP, KEY_LOGGER, KEY_SIDE};
 use logger::LoggerPlugin;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use std::{convert::Infallible, sync::Arc};
-use tokio::sync::{Mutex as AsyncMutex, broadcast};
+use side::SidePlugin;
+use std::{convert::Infallible, fs, path::PathBuf, sync::Arc};
+use tokio::sync::broadcast;
+
+#[derive(Clone, Deserialize, JsonSchema)]
+struct Empty {}
 
 struct AppState {
     runtime: Runtime,
-    /// 固定派生视图：三个插件 Fiber 都挂在同一语义下。
-    stack: Context,
-    db: AsyncMutex<Option<Fiber>>,
-    logger: AsyncMutex<Option<Fiber>>,
-    http: AsyncMutex<Option<Fiber>>,
+    loader: Loader,
+    _loader_fiber: cordis_core::Fiber,
     bus: LogTx,
+    _config_dir: PathBuf,
 }
 
 #[derive(Deserialize)]
-struct PluginBody {
-    plugin: String,
+struct PathBody {
+    path: String,
+}
+
+#[derive(Deserialize)]
+struct DisableBody {
+    path: String,
+    disabled: bool,
 }
 
 #[derive(Deserialize)]
@@ -59,18 +77,23 @@ struct ErrJson {
 }
 
 #[derive(Serialize)]
-struct StateJson {
-    plugins: PluginsJson,
-    db_logs: Vec<String>,
-    registry: Vec<GroupJson>,
-    graph: GraphJson,
+struct EntryJson {
+    path: String,
+    name: String,
+    group: bool,
+    enabled: bool,
+    fiber_id: Option<u64>,
+    state: Option<String>,
+    last_error: Option<String>,
 }
 
 #[derive(Serialize)]
-struct PluginsJson {
-    db: String,
-    logger: String,
-    http: String,
+struct StateJson {
+    entries: Vec<EntryJson>,
+    db_logs: Vec<String>,
+    registry: Vec<GroupJson>,
+    graph: GraphJson,
+    note: String,
 }
 
 #[derive(Serialize)]
@@ -87,7 +110,6 @@ struct FiberJson {
 
 #[derive(Serialize)]
 struct GraphJson {
-    /// 插件栈所在视图说明。
     view: String,
     stack_depth: usize,
     fibers: Vec<GraphFiberJson>,
@@ -137,6 +159,53 @@ struct RequestJson {
     body: String,
 }
 
+struct BusFactory<F> {
+    id: &'static str,
+    bus: LogTx,
+    build: F,
+}
+
+impl<F> ExtensionFactory for BusFactory<F>
+where
+    F: Fn(LogTx) -> Arc<dyn Plugin> + Send + Sync + 'static,
+{
+    type Config = Empty;
+    fn id(&self) -> &'static str {
+        self.id
+    }
+    fn build(&self, _: Empty) -> Result<Arc<dyn Plugin>, LoaderError> {
+        Ok((self.build)(self.bus.clone()))
+    }
+}
+
+struct HttpFactory {
+    bus: LogTx,
+}
+
+impl ExtensionFactory for HttpFactory {
+    type Config = HttpConfig;
+    fn id(&self) -> &'static str {
+        "demo.stack.http"
+    }
+    fn build(&self, config: HttpConfig) -> Result<Arc<dyn Plugin>, LoaderError> {
+        Ok(Arc::new(HttpPlugin {
+            bus: self.bus.clone(),
+            label: config.label,
+        }))
+    }
+}
+
+fn fiber_state_name(state: FiberState) -> &'static str {
+    match state {
+        FiberState::Pending => "Pending",
+        FiberState::Loading => "Loading",
+        FiberState::Active => "Active",
+        FiberState::Failed => "Failed",
+        FiberState::Unloading => "Unloading",
+        FiberState::Disposed => "Disposed",
+    }
+}
+
 fn snapshot_name(state: FiberStateSnapshot) -> &'static str {
     match state {
         FiberStateSnapshot::Pending => "Pending",
@@ -155,20 +224,15 @@ fn plugin_label(key: &str) -> &'static str {
         "Logger"
     } else if key == KEY_HTTP.as_str() {
         "HTTP"
+    } else if key == KEY_SIDE.as_str() {
+        "Side"
+    } else if key == "cordis.loader.group" {
+        "Group"
+    } else if key.starts_with("cordis.loader") {
+        "Loader"
     } else {
         "Plugin"
     }
-}
-
-fn plugin_state(runtime: &Runtime, key: &PluginKey) -> String {
-    runtime
-        .diagnostics()
-        .plugin_registry
-        .iter()
-        .find(|g| g.plugin_key == key.as_str())
-        .and_then(|g| g.fibers.first())
-        .map(|f| snapshot_name(f.state).to_string())
-        .unwrap_or_else(|| "off".into())
 }
 
 fn build_graph(runtime: &Runtime) -> GraphJson {
@@ -261,7 +325,7 @@ fn build_graph(runtime: &Runtime) -> GraphJson {
         .collect();
 
     GraphJson {
-        view: "Runtime → Root → stack(extend) → Fibers".into(),
+        view: "Loader EntryTree · app Group 共享服务域 · side 为根级旁路".into(),
         stack_depth,
         fibers,
         providers,
@@ -269,10 +333,17 @@ fn build_graph(runtime: &Runtime) -> GraphJson {
     }
 }
 
-fn build_state(app: &AppState) -> StateJson {
+async fn collect_state(app: &AppState) -> StateJson {
+    let snap = app
+        .loader
+        .await_idle()
+        .await
+        .unwrap_or(LoaderSnapshot { entries: vec![] });
     let db_logs = app
-        .stack
-        .get(DB)
+        .loader
+        .entry_context("app:db")
+        .ok()
+        .and_then(|ctx| ctx.get(DB).ok())
         .map(|db| db.recent(80))
         .unwrap_or_default();
     let registry = app
@@ -292,15 +363,25 @@ fn build_state(app: &AppState) -> StateJson {
                 .collect(),
         })
         .collect();
+    let entries = snap
+        .entries
+        .iter()
+        .map(|e| EntryJson {
+            path: e.path.to_string(),
+            name: e.name.clone(),
+            group: e.group,
+            enabled: e.enabled,
+            fiber_id: e.fiber_id,
+            state: e.state.map(fiber_state_name).map(str::to_string),
+            last_error: e.last_error.clone(),
+        })
+        .collect();
     StateJson {
-        plugins: PluginsJson {
-            db: plugin_state(&app.runtime, &KEY_DB),
-            logger: plugin_state(&app.runtime, &KEY_LOGGER),
-            http: plugin_state(&app.runtime, &KEY_HTTP),
-        },
+        entries,
         db_logs,
         registry,
         graph: build_graph(&app.runtime),
+        note: "对比 side 与 app:* 的 fiber_id：子树操作不应改动无关 Entry。".into(),
     }
 }
 
@@ -308,12 +389,16 @@ fn err(status: StatusCode, msg: impl Into<String>) -> (StatusCode, Json<ErrJson>
     (status, Json(ErrJson { error: msg.into() }))
 }
 
+fn map_loader(e: impl std::fmt::Display) -> (StatusCode, Json<ErrJson>) {
+    err(StatusCode::BAD_REQUEST, e.to_string())
+}
+
 async fn index() -> Html<&'static str> {
     Html(include_str!("index.html"))
 }
 
 async fn api_state(State(app): State<Arc<AppState>>) -> Json<StateJson> {
-    Json(build_state(&app))
+    Json(collect_state(&app).await)
 }
 
 async fn api_logs(
@@ -333,103 +418,141 @@ async fn api_logs(
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
-async fn api_mount(
+async fn api_disable(
     State(app): State<Arc<AppState>>,
-    Json(body): Json<PluginBody>,
+    Json(body): Json<DisableBody>,
 ) -> Result<Json<StateJson>, (StatusCode, Json<ErrJson>)> {
-    let stack = app.stack.clone();
-    match body.plugin.as_str() {
-        "db" => {
-            let mut slot = app.db.lock().await;
-            if slot.is_some() {
-                return Err(err(StatusCode::BAD_REQUEST, "db already mounted"));
-            }
-            let fiber = stack
-                .plugin(Arc::new(DbPlugin {
-                    bus: app.bus.clone(),
-                }) as Arc<dyn Plugin>)
-                .await
-                .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
-            *slot = Some(fiber);
-        }
-        "logger" => {
-            let mut slot = app.logger.lock().await;
-            if slot.is_some() {
-                return Err(err(StatusCode::BAD_REQUEST, "logger already mounted"));
-            }
-            let fiber = stack
-                .plugin(Arc::new(LoggerPlugin {
-                    bus: app.bus.clone(),
-                }) as Arc<dyn Plugin>)
-                .await
-                .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
-            *slot = Some(fiber);
-        }
-        "http" => {
-            let mut slot = app.http.lock().await;
-            if slot.is_some() {
-                return Err(err(StatusCode::BAD_REQUEST, "http already mounted"));
-            }
-            let fiber = stack
-                .plugin(Arc::new(HttpPlugin {
-                    bus: app.bus.clone(),
-                }) as Arc<dyn Plugin>)
-                .await
-                .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
-            *slot = Some(fiber);
-        }
-        other => {
-            return Err(err(
-                StatusCode::BAD_REQUEST,
-                format!("unknown plugin: {other}"),
-            ));
-        }
-    }
-    app.runtime.settle().await;
-    let _ = app.bus.send(format!("sys: mounted {}", body.plugin));
-    Ok(Json(build_state(&app)))
+    app.loader
+        .update(
+            &body.path,
+            EntryUpdate {
+                disabled: Some(body.disabled),
+                ..Default::default()
+            },
+            None,
+            None,
+        )
+        .await
+        .map_err(map_loader)?;
+    let _ = app
+        .bus
+        .send(format!("sys: {} disabled={}", body.path, body.disabled));
+    Ok(Json(collect_state(&app).await))
 }
 
-async fn api_unmount(
+async fn api_reorder(
     State(app): State<Arc<AppState>>,
-    Json(body): Json<PluginBody>,
 ) -> Result<Json<StateJson>, (StatusCode, Json<ErrJson>)> {
-    let fiber = match body.plugin.as_str() {
-        "db" => app.db.lock().await.take(),
-        "logger" => app.logger.lock().await.take(),
-        "http" => app.http.lock().await.take(),
-        other => {
-            return Err(err(
-                StatusCode::BAD_REQUEST,
-                format!("unknown plugin: {other}"),
-            ));
-        }
+    let snap = app.loader.await_idle().await.map_err(map_loader)?;
+    let children: Vec<_> = snap
+        .entries
+        .iter()
+        .filter(|e| e.parent.as_ref().is_some_and(|p| p.as_str() == "app") && !e.group)
+        .map(|e| e.path.as_str().to_string())
+        .collect();
+    let http_index = children
+        .iter()
+        .position(|p| p == "app:http")
+        .ok_or_else(|| err(StatusCode::BAD_REQUEST, "app:http 不存在，请先重建"))?;
+    // 在同父内把 http 挪到另一端，演示纯排序不改 Fiber ID。
+    let target = if http_index == 0 {
+        children.len().saturating_sub(1)
+    } else {
+        0
     };
-    let Some(mut fiber) = fiber else {
-        return Err(err(
-            StatusCode::BAD_REQUEST,
-            format!("{} not mounted", body.plugin),
-        ));
-    };
-    fiber
-        .dispose_wait()
+    app.loader
+        .update(
+            "app:http",
+            EntryUpdate::default(),
+            Some(Some("app")),
+            Some(target),
+        )
         .await
-        .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
-    app.runtime.settle().await;
-    let _ = app.bus.send(format!("sys: unmounted {}", body.plugin));
-    Ok(Json(build_state(&app)))
+        .map_err(map_loader)?;
+    let _ = app.bus.send(format!(
+        "sys: reorder app:http → position {target} (pure sort)"
+    ));
+    Ok(Json(collect_state(&app).await))
+}
+
+async fn api_replace_http_config(
+    State(app): State<Arc<AppState>>,
+) -> Result<Json<StateJson>, (StatusCode, Json<ErrJson>)> {
+    let label = format!("v{}", stamp());
+    app.loader
+        .update(
+            "app:http",
+            EntryUpdate {
+                config: Some(toml::Value::Table({
+                    let mut table = toml::Table::new();
+                    table.insert("label".into(), toml::Value::String(label.clone()));
+                    table
+                })),
+                ..Default::default()
+            },
+            None,
+            None,
+        )
+        .await
+        .map_err(map_loader)?;
+    let _ = app
+        .bus
+        .send(format!("sys: http config replace label={label}"));
+    Ok(Json(collect_state(&app).await))
+}
+
+fn stamp() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() % 10_000)
+        .unwrap_or(0)
+}
+
+async fn api_remove(
+    State(app): State<Arc<AppState>>,
+    Json(body): Json<PathBody>,
+) -> Result<Json<StateJson>, (StatusCode, Json<ErrJson>)> {
+    app.loader.remove(&body.path).await.map_err(map_loader)?;
+    let _ = app.bus.send(format!("sys: removed {}", body.path));
+    Ok(Json(collect_state(&app).await))
+}
+
+async fn api_create_http(
+    State(app): State<Arc<AppState>>,
+) -> Result<Json<StateJson>, (StatusCode, Json<ErrJson>)> {
+    let entry = EntryOptions::new("http", "demo.stack.http").with_config({
+        let mut table = toml::Table::new();
+        table.insert("label".into(), toml::Value::String("recreated".into()));
+        toml::Value::Table(table)
+    });
+    app.loader
+        .create(entry, Some("app"), None)
+        .await
+        .map_err(map_loader)?;
+    let _ = app.bus.send("sys: created app:http".into());
+    Ok(Json(collect_state(&app).await))
 }
 
 async fn api_request(
     State(app): State<Arc<AppState>>,
     Json(body): Json<RequestBody>,
 ) -> Result<Json<RequestJson>, (StatusCode, Json<ErrJson>)> {
-    let http = app.stack.get(HTTP).map_err(|_| {
-        err(
-            StatusCode::BAD_REQUEST,
-            "HTTP 插件未 Active（请先挂载 DB → Logger → HTTP）",
-        )
-    })?;
+    let http = app
+        .loader
+        .entry_context("app:http")
+        .map_err(|_| {
+            err(
+                StatusCode::BAD_REQUEST,
+                "HTTP 未 Active（检查 app Group / db / logger 是否启用）",
+            )
+        })?
+        .get(HTTP)
+        .map_err(|_| {
+            err(
+                StatusCode::BAD_REQUEST,
+                "HTTP 未 Active（检查 app Group / db / logger 是否启用）",
+            )
+        })?;
     let body_opt = if body.body.trim().is_empty() {
         None
     } else {
@@ -439,7 +562,6 @@ async fn api_request(
         .request(&body.method, &body.url, body_opt)
         .await
         .map_err(|e| err(StatusCode::BAD_GATEWAY, e))?;
-    // 给异步落库一点时间
     tokio::time::sleep(std::time::Duration::from_millis(30)).await;
     Ok(Json(RequestJson {
         status: result.status,
@@ -449,46 +571,109 @@ async fn api_request(
 
 async fn api_clear_db(
     State(app): State<Arc<AppState>>,
-    Json(_body): Json<serde_json::Value>,
 ) -> Result<Json<StateJson>, (StatusCode, Json<ErrJson>)> {
-    match app.stack.get(DB) {
-        Ok(db) => {
-            db.clear();
-            let _ = app.bus.send("sys: db logs cleared".into());
-            Ok(Json(build_state(&app)))
-        }
-        Err(_) => Err(err(StatusCode::BAD_REQUEST, "DB 未挂载")),
-    }
+    let ctx = app
+        .loader
+        .entry_context("app:db")
+        .map_err(|_| err(StatusCode::BAD_REQUEST, "DB 未挂载"))?;
+    let db = ctx
+        .get(DB)
+        .map_err(|_| err(StatusCode::BAD_REQUEST, "DB 未挂载"))?;
+    db.clear();
+    let _ = app.bus.send("sys: db logs cleared".into());
+    Ok(Json(collect_state(&app).await))
+}
+
+fn build_catalog(bus: LogTx) -> Result<ExtensionCatalog, LoaderError> {
+    let mut catalog = ExtensionCatalog::new();
+    catalog.register(BusFactory {
+        id: "demo.stack.side",
+        bus: bus.clone(),
+        build: |bus| Arc::new(SidePlugin { bus }) as Arc<dyn Plugin>,
+    })?;
+    catalog.register(BusFactory {
+        id: "demo.stack.db",
+        bus: bus.clone(),
+        build: |bus| Arc::new(DbPlugin { bus }) as Arc<dyn Plugin>,
+    })?;
+    catalog.register(BusFactory {
+        id: "demo.stack.logger",
+        bus: bus.clone(),
+        build: |bus| Arc::new(LoggerPlugin { bus }) as Arc<dyn Plugin>,
+    })?;
+    catalog.register(HttpFactory { bus })?;
+    Ok(catalog)
+}
+
+fn initial_extensions() -> Result<ExtensionsConfig, LoaderError> {
+    let mut http_cfg = toml::Table::new();
+    http_cfg.insert("label".into(), toml::Value::String("default".into()));
+    let app = EntryOptions::group(
+        "app",
+        vec![
+            EntryOptions::new("db", "demo.stack.db"),
+            EntryOptions::new("logger", "demo.stack.logger"),
+            EntryOptions::new("http", "demo.stack.http").with_config(toml::Value::Table(http_cfg)),
+        ],
+    )?;
+    Ok(ExtensionsConfig {
+        version: 2,
+        extensions: vec![EntryOptions::new("side", "demo.stack.side"), app],
+    })
+}
+
+fn write_bootstrap_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let dir = std::env::temp_dir().join(format!("cordis-plugin-stack-{}", std::process::id()));
+    fs::create_dir_all(&dir)?;
+    fs::write(
+        dir.join("bootstrap.toml"),
+        "version = 2\n[config]\ndriver = \"file\"\npath = \"extensions.toml\"\n",
+    )?;
+    fs::write(
+        dir.join("extensions.toml"),
+        toml::to_string_pretty(&initial_extensions()?)?,
+    )?;
+    Ok(dir)
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (bus, _) = broadcast::channel(256);
+    let config_dir = write_bootstrap_dir()?;
+    let bootstrap = config_dir.join("bootstrap.toml");
+
     let runtime = Runtime::new()?;
-    // 仅创建一次固定插件栈视图；三次挂载都落在同一 Context 语义下。
-    let stack = runtime.root().extend()?;
+    let catalog = build_catalog(bus.clone())?;
+    let plugin = LoaderPlugin::bootstrap(catalog, &bootstrap)?;
+    let loader_fiber = runtime.root().plugin(Arc::new(plugin)).await?;
+    let loader = (*runtime.root().get(LOADER)?).clone();
+    let _ = loader.await_idle().await?;
+    let _ = bus.send("sys: Loader EntryTree ready (side + app/{db,logger,http})".into());
+
     let app = Arc::new(AppState {
         runtime,
-        stack,
-        db: AsyncMutex::new(None),
-        logger: AsyncMutex::new(None),
-        http: AsyncMutex::new(None),
+        loader,
+        _loader_fiber: loader_fiber,
         bus: bus.clone(),
+        _config_dir: config_dir,
     });
 
     let router = Router::new()
         .route("/", get(index))
         .route("/api/state", get(api_state))
         .route("/api/logs", get(api_logs))
-        .route("/api/mount", post(api_mount))
-        .route("/api/unmount", post(api_unmount))
+        .route("/api/disable", post(api_disable))
+        .route("/api/reorder", post(api_reorder))
+        .route("/api/replace-http-config", post(api_replace_http_config))
+        .route("/api/remove", post(api_remove))
+        .route("/api/create-http", post(api_create_http))
         .route("/api/request", post(api_request))
         .route("/api/clear-db", post(api_clear_db))
         .with_state(app);
 
     let addr = "127.0.0.1:3002";
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    println!("Plugin stack demo → http://{addr}");
+    println!("Plugin stack (Loader subtree reconcile) → http://{addr}");
     let _ = bus.send(format!("sys: listening on http://{addr}"));
     axum::serve(listener, router).await?;
     Ok(())

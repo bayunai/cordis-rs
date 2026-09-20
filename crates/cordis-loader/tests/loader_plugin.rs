@@ -393,27 +393,27 @@ async fn duplicate_provider_in_same_group_fails() {
         ],
     )
     .unwrap();
-    let (runtime, _loader_fiber, loader) =
-        mount(LoaderPlugin::new(dep_catalog(), config(vec![group])).unwrap()).await;
-    let snapshot = loader.await_idle().await.unwrap();
-    assert_eq!(
-        snapshot.entry("app:one").unwrap().state,
-        Some(FiberState::Active)
-    );
-    assert_eq!(
-        snapshot.entry("app:two").unwrap().state,
-        Some(FiberState::Failed)
-    );
-    let error = snapshot
-        .entry("app:two")
-        .unwrap()
-        .last_error
-        .as_deref()
-        .unwrap_or("");
+    let runtime = Runtime::new().unwrap();
+    let fiber = runtime
+        .root()
+        .plugin(Arc::new(
+            LoaderPlugin::new(dep_catalog(), config(vec![group])).unwrap(),
+        ))
+        .await
+        .expect("Loader Fiber handle is returned even when reconcile fails");
+    assert_eq!(fiber.state(), FiberState::Failed);
+    let error = fiber.last_error().unwrap_or_default();
     assert!(
-        error.contains("已在当前 Context 注册") || error.contains("ServiceConflict"),
+        error.contains("Lifecycle")
+            || error.contains("已在当前 Context 注册")
+            || error.contains("ServiceConflict"),
         "unexpected last_error: {error:?}"
     );
+    // 生命周期失败不提交 desired；LOADER 因 Fiber Failed 而不可用。
+    assert!(matches!(
+        runtime.root().get(LOADER),
+        Err(CoreError::ServiceUnavailable { .. })
+    ));
     runtime.shutdown().await.unwrap();
 }
 
@@ -732,5 +732,747 @@ async fn deleting_group_disposes_children_in_postorder() {
     .await;
     loader.remove("group").await.unwrap();
     assert_eq!(&*record.lock().unwrap(), &["demo.second", "demo.first"]);
+    runtime.shutdown().await.unwrap();
+}
+
+#[derive(Clone, serde::Deserialize, serde::Serialize, JsonSchema)]
+struct CountConfig {
+    #[serde(default)]
+    n: u32,
+}
+
+struct CountFactory;
+
+struct CountPlugin {
+    n: u32,
+}
+
+#[async_trait]
+impl Plugin for CountPlugin {
+    fn key(&self) -> PluginKey {
+        PluginKey::new("demo.count")
+    }
+
+    async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
+        ctx.provide(VALUE, self.n.to_string())?;
+        Ok(())
+    }
+}
+
+impl ExtensionFactory for CountFactory {
+    type Config = CountConfig;
+    fn id(&self) -> &'static str {
+        "demo.count"
+    }
+    fn build(&self, config: CountConfig) -> Result<Arc<dyn Plugin>, LoaderError> {
+        Ok(Arc::new(CountPlugin { n: config.n }))
+    }
+}
+
+#[derive(Clone, serde::Deserialize, serde::Serialize, JsonSchema)]
+struct KeySwitchConfig {
+    #[serde(default)]
+    alt: bool,
+}
+
+struct KeySwitchFactory;
+
+struct KeySwitchPlugin {
+    alt: bool,
+}
+
+#[async_trait]
+impl Plugin for KeySwitchPlugin {
+    fn key(&self) -> PluginKey {
+        if self.alt {
+            PluginKey::new("demo.key.alt")
+        } else {
+            PluginKey::new("demo.key.main")
+        }
+    }
+
+    async fn apply(&self, _: &Context) -> Result<(), CoreError> {
+        Ok(())
+    }
+}
+
+impl ExtensionFactory for KeySwitchFactory {
+    type Config = KeySwitchConfig;
+    fn id(&self) -> &'static str {
+        "demo.key"
+    }
+    fn build(&self, config: KeySwitchConfig) -> Result<Arc<dyn Plugin>, LoaderError> {
+        Ok(Arc::new(KeySwitchPlugin { alt: config.alt }))
+    }
+}
+
+#[derive(Clone, serde::Deserialize, serde::Serialize, JsonSchema)]
+struct FailConfig {
+    #[serde(default)]
+    fail: bool,
+}
+
+struct FailFactory;
+
+struct FailPlugin {
+    fail: bool,
+}
+
+#[async_trait]
+impl Plugin for FailPlugin {
+    fn key(&self) -> PluginKey {
+        PluginKey::new("demo.fail")
+    }
+
+    async fn apply(&self, _: &Context) -> Result<(), CoreError> {
+        if self.fail {
+            Err(CoreError::ProviderCheck("intentional apply failure".into()))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl ExtensionFactory for FailFactory {
+    type Config = FailConfig;
+    fn id(&self) -> &'static str {
+        "demo.fail"
+    }
+    fn build(&self, config: FailConfig) -> Result<Arc<dyn Plugin>, LoaderError> {
+        Ok(Arc::new(FailPlugin { fail: config.fail }))
+    }
+}
+
+fn fiber_id(snapshot: &cordis_loader::LoaderSnapshot, path: &str) -> u64 {
+    snapshot.entry(path).unwrap().fiber_id.unwrap()
+}
+
+async fn mount_with_file(
+    catalog: ExtensionCatalog,
+    entries: Vec<EntryOptions>,
+) -> (
+    Runtime,
+    Fiber,
+    Loader,
+    tempfile::TempDir,
+    std::path::PathBuf,
+) {
+    let directory = tempfile::tempdir().unwrap();
+    let bootstrap = directory.path().join("bootstrap.toml");
+    let extensions = directory.path().join("extensions.toml");
+    fs::write(
+        &bootstrap,
+        "version = 2\n[config]\ndriver = \"file\"\npath = \"extensions.toml\"\n",
+    )
+    .unwrap();
+    fs::write(&extensions, toml::to_string(&config(entries)).unwrap()).unwrap();
+    let (runtime, fiber, loader) =
+        mount(LoaderPlugin::bootstrap(catalog, &bootstrap).unwrap()).await;
+    (runtime, fiber, loader, directory, extensions)
+}
+
+#[tokio::test]
+async fn config_only_replace_keeps_fiber_ids() {
+    let mut catalog = catalog(vec![
+        Factory {
+            id: "demo.value",
+            needs_dep: false,
+            record: None,
+        },
+        Factory {
+            id: "demo.dep",
+            needs_dep: false,
+            record: None,
+        },
+    ]);
+    catalog.register(CountFactory).unwrap();
+    let group = EntryOptions::group(
+        "app",
+        vec![
+            EntryOptions::new("provider", "demo.dep"),
+            EntryOptions::new("count", "demo.count")
+                .with_config(toml::Value::try_from(CountConfig { n: 1 }).unwrap()),
+        ],
+    )
+    .unwrap();
+    let (runtime, _loader_fiber, loader, _dir, _) = mount_with_file(
+        catalog,
+        vec![EntryOptions::new("root", "demo.value"), group],
+    )
+    .await;
+    let before = loader.await_idle().await.unwrap();
+    let root_id = fiber_id(&before, "root");
+    let provider_id = fiber_id(&before, "app:provider");
+    let count_id = fiber_id(&before, "app:count");
+    let app_id = fiber_id(&before, "app");
+
+    loader
+        .update(
+            "app:count",
+            EntryUpdate {
+                config: Some(toml::Value::try_from(CountConfig { n: 2 }).unwrap()),
+                ..Default::default()
+            },
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let after = loader.await_idle().await.unwrap();
+    assert_eq!(fiber_id(&after, "root"), root_id);
+    assert_eq!(fiber_id(&after, "app"), app_id);
+    assert_eq!(fiber_id(&after, "app:provider"), provider_id);
+    assert_eq!(fiber_id(&after, "app:count"), count_id);
+    assert_eq!(
+        &*loader
+            .entry_context("app:count")
+            .unwrap()
+            .get(VALUE)
+            .unwrap(),
+        "2"
+    );
+    runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn pure_reorder_keeps_all_fiber_ids() {
+    let (runtime, _loader_fiber, loader, _dir, _) = mount_with_file(
+        catalog(vec![
+            Factory {
+                id: "demo.value",
+                needs_dep: false,
+                record: None,
+            },
+            Factory {
+                id: "demo.dep",
+                needs_dep: false,
+                record: None,
+            },
+        ]),
+        vec![
+            EntryOptions::new("one", "demo.value"),
+            EntryOptions::new("two", "demo.dep"),
+        ],
+    )
+    .await;
+    let before = loader.await_idle().await.unwrap();
+    let one_id = fiber_id(&before, "one");
+    let two_id = fiber_id(&before, "two");
+    assert_eq!(
+        before
+            .entries
+            .iter()
+            .map(|entry| entry.path.as_str())
+            .collect::<Vec<_>>(),
+        vec!["one", "two"]
+    );
+
+    loader
+        .update("two", EntryUpdate::default(), Some(None), Some(0))
+        .await
+        .unwrap();
+    let after = loader.await_idle().await.unwrap();
+    assert_eq!(
+        after
+            .entries
+            .iter()
+            .map(|entry| entry.path.as_str())
+            .collect::<Vec<_>>(),
+        vec!["two", "one"]
+    );
+    assert_eq!(fiber_id(&after, "one"), one_id);
+    assert_eq!(fiber_id(&after, "two"), two_id);
+    assert_eq!(
+        loader
+            .entries()
+            .unwrap()
+            .extensions
+            .iter()
+            .map(|entry| entry.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["two", "one"]
+    );
+    runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn factory_changed_on_reload_is_zero_runtime_change() {
+    let (runtime, _loader_fiber, loader, _dir, extensions) = mount_with_file(
+        catalog(vec![
+            Factory {
+                id: "demo.value",
+                needs_dep: false,
+                record: None,
+            },
+            Factory {
+                id: "demo.dep",
+                needs_dep: false,
+                record: None,
+            },
+        ]),
+        vec![EntryOptions::new("item", "demo.value")],
+    )
+    .await;
+    let before = loader.await_idle().await.unwrap();
+    let item_id = fiber_id(&before, "item");
+
+    fs::write(
+        &extensions,
+        toml::to_string(&config(vec![EntryOptions::new("item", "demo.dep")])).unwrap(),
+    )
+    .unwrap();
+    let error = loader.reload().await.unwrap_err();
+    assert!(
+        matches!(
+            error,
+            LoaderControlError::Loader(LoaderError::FactoryChanged { .. })
+        ),
+        "unexpected error: {error:?}"
+    );
+    let after = loader.await_idle().await.unwrap();
+    assert_eq!(fiber_id(&after, "item"), item_id);
+    assert_eq!(after.entry("item").unwrap().state, Some(FiberState::Active));
+    assert_eq!(loader.entries().unwrap().extensions[0].name, "demo.value");
+    runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn plugin_key_changed_on_config_update_is_zero_runtime_change() {
+    let mut catalog = ExtensionCatalog::new();
+    catalog.register(KeySwitchFactory).unwrap();
+    let (runtime, _loader_fiber, loader, _dir, _) = mount_with_file(
+        catalog,
+        vec![
+            EntryOptions::new("keyed", "demo.key")
+                .with_config(toml::Value::try_from(KeySwitchConfig { alt: false }).unwrap()),
+        ],
+    )
+    .await;
+    let before = loader.await_idle().await.unwrap();
+    let keyed_id = fiber_id(&before, "keyed");
+
+    let error = loader
+        .update(
+            "keyed",
+            EntryUpdate {
+                config: Some(toml::Value::try_from(KeySwitchConfig { alt: true }).unwrap()),
+                ..Default::default()
+            },
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            LoaderControlError::Loader(LoaderError::PluginKeyChanged { .. })
+        ),
+        "unexpected error: {error:?}"
+    );
+    let after = loader.await_idle().await.unwrap();
+    assert_eq!(fiber_id(&after, "keyed"), keyed_id);
+    assert_eq!(
+        after.entry("keyed").unwrap().state,
+        Some(FiberState::Active)
+    );
+    assert_eq!(
+        loader.entries().unwrap().extensions[0].config,
+        toml::Value::try_from(KeySwitchConfig { alt: false }).unwrap()
+    );
+    runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn plugin_key_changed_during_group_rebuild_is_zero_runtime_change() {
+    let mut catalog = ExtensionCatalog::new();
+    catalog.register(KeySwitchFactory).unwrap();
+    catalog
+        .register_injection(InjectionDescriptor::intercepted("dep", DEP, LABEL))
+        .unwrap();
+    let mut initial = EntryOptions::group(
+        "app",
+        vec![
+            EntryOptions::new("keyed", "demo.key")
+                .with_config(toml::Value::try_from(KeySwitchConfig { alt: false }).unwrap()),
+        ],
+    )
+    .unwrap();
+    initial.inject = Some(InjectConfig::Map(
+        [(
+            "dep".into(),
+            toml::Value::Table(toml::toml! { label = "before" }),
+        )]
+        .into(),
+    ));
+    let (runtime, _loader_fiber, loader, _dir, extensions) =
+        mount_with_file(catalog, vec![initial]).await;
+    let before = loader.await_idle().await.unwrap();
+    let keyed_id = fiber_id(&before, "app:keyed");
+
+    let mut target = EntryOptions::group(
+        "app",
+        vec![
+            EntryOptions::new("keyed", "demo.key")
+                .with_config(toml::Value::try_from(KeySwitchConfig { alt: true }).unwrap()),
+        ],
+    )
+    .unwrap();
+    target.inject = Some(InjectConfig::Map(
+        [(
+            "dep".into(),
+            toml::Value::Table(toml::toml! { label = "after" }),
+        )]
+        .into(),
+    ));
+    fs::write(&extensions, toml::to_string(&config(vec![target])).unwrap()).unwrap();
+
+    let error = loader.reload().await.unwrap_err();
+    assert!(
+        matches!(
+            error,
+            LoaderControlError::Loader(LoaderError::PluginKeyChanged { .. })
+        ),
+        "unexpected error: {error:?}"
+    );
+    let after = loader.await_idle().await.unwrap();
+    assert_eq!(fiber_id(&after, "app:keyed"), keyed_id);
+    assert_eq!(
+        loader.entries().unwrap().extensions[0].children().unwrap()[0].config,
+        toml::Value::try_from(KeySwitchConfig { alt: false }).unwrap()
+    );
+    runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn lifecycle_failure_keeps_unrelated_active_and_skips_desired_commit() {
+    let mut catalog = catalog(vec![Factory {
+        id: "demo.value",
+        needs_dep: false,
+        record: None,
+    }]);
+    catalog.register(FailFactory).unwrap();
+    let (runtime, _loader_fiber, loader, _dir, extensions) = mount_with_file(
+        catalog,
+        vec![
+            EntryOptions::new("stable", "demo.value"),
+            EntryOptions::new("flaky", "demo.fail")
+                .with_config(toml::Value::try_from(FailConfig { fail: false }).unwrap()),
+        ],
+    )
+    .await;
+    let before = loader.await_idle().await.unwrap();
+    let stable_id = fiber_id(&before, "stable");
+    let before_file = fs::read_to_string(&extensions).unwrap();
+
+    let error = loader
+        .update(
+            "flaky",
+            EntryUpdate {
+                config: Some(toml::Value::try_from(FailConfig { fail: true }).unwrap()),
+                ..Default::default()
+            },
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            LoaderControlError::Loader(LoaderError::Lifecycle { .. })
+        ),
+        "unexpected error: {error:?}"
+    );
+
+    let after = loader.await_idle().await.unwrap();
+    assert_eq!(fiber_id(&after, "stable"), stable_id);
+    assert_eq!(
+        after.entry("stable").unwrap().state,
+        Some(FiberState::Active)
+    );
+    assert_eq!(
+        after.entry("flaky").unwrap().state,
+        Some(FiberState::Failed)
+    );
+    assert_eq!(
+        loader.entries().unwrap().extensions[1].config,
+        toml::Value::try_from(FailConfig { fail: false }).unwrap()
+    );
+    assert_eq!(fs::read_to_string(&extensions).unwrap(), before_file);
+    runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn failed_external_reload_is_visible_and_retried_until_fixed() {
+    let mut catalog = ExtensionCatalog::new();
+    catalog.register(FailFactory).unwrap();
+    let initial = EntryOptions::new("flaky", "demo.fail")
+        .with_config(toml::Value::try_from(FailConfig { fail: false }).unwrap());
+    let (runtime, _loader_fiber, loader, _dir, extensions) =
+        mount_with_file(catalog, vec![initial.clone()]).await;
+
+    let failed = EntryOptions::new("flaky", "demo.fail")
+        .with_config(toml::Value::try_from(FailConfig { fail: true }).unwrap());
+    fs::write(&extensions, toml::to_string(&config(vec![failed])).unwrap()).unwrap();
+    assert!(matches!(
+        loader.reload().await,
+        Err(LoaderControlError::Loader(LoaderError::Lifecycle { .. }))
+    ));
+    assert_eq!(
+        loader
+            .await_idle()
+            .await
+            .unwrap()
+            .entry("flaky")
+            .unwrap()
+            .state,
+        Some(FiberState::Failed)
+    );
+    assert_eq!(
+        loader.entries().unwrap().extensions[0].config,
+        initial.config
+    );
+
+    assert!(matches!(
+        loader.reload().await,
+        Err(LoaderControlError::Loader(LoaderError::Lifecycle { .. }))
+    ));
+    assert_eq!(
+        loader
+            .await_idle()
+            .await
+            .unwrap()
+            .entry("flaky")
+            .unwrap()
+            .state,
+        Some(FiberState::Failed)
+    );
+    assert_eq!(
+        loader.entries().unwrap().extensions[0].config,
+        initial.config
+    );
+
+    fs::write(
+        &extensions,
+        toml::to_string(&config(vec![initial])).unwrap(),
+    )
+    .unwrap();
+    loader.reload().await.unwrap();
+    assert_eq!(
+        loader
+            .await_idle()
+            .await
+            .unwrap()
+            .entry("flaky")
+            .unwrap()
+            .state,
+        Some(FiberState::Active)
+    );
+    runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn reload_remounts_entry_after_runtime_unmount() {
+    let (runtime, _loader_fiber, loader, _dir, _) = mount_with_file(
+        catalog(vec![Factory {
+            id: "demo.value",
+            needs_dep: false,
+            record: None,
+        }]),
+        vec![EntryOptions::new("value", "demo.value")],
+    )
+    .await;
+    let before = loader.await_idle().await.unwrap();
+    let before_id = fiber_id(&before, "value");
+
+    assert_eq!(
+        runtime.unmount(PluginKey::new("demo.value")).await.unwrap(),
+        1
+    );
+    let disposed = loader.await_idle().await.unwrap();
+    assert_eq!(
+        disposed.entry("value").unwrap().state,
+        Some(FiberState::Disposed)
+    );
+    assert!(runtime.root().get(VALUE).is_err());
+
+    loader.reload().await.unwrap();
+    let remounted = loader.await_idle().await.unwrap();
+    assert_eq!(
+        remounted.entry("value").unwrap().state,
+        Some(FiberState::Active)
+    );
+    assert_ne!(fiber_id(&remounted, "value"), before_id);
+    assert_eq!(&*runtime.root().get(VALUE).unwrap(), "value");
+    runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn failed_create_is_visible_and_can_be_removed_before_a_later_success() {
+    let mut catalog = ExtensionCatalog::new();
+    catalog.register(FailFactory).unwrap();
+    let (runtime, _loader_fiber, loader, _dir, _) = mount_with_file(catalog, vec![]).await;
+
+    let failed = EntryOptions::new("flaky", "demo.fail")
+        .with_config(toml::Value::try_from(FailConfig { fail: true }).unwrap());
+    assert!(matches!(
+        loader.create(failed, None, None).await,
+        Err(LoaderControlError::Loader(LoaderError::Lifecycle { .. }))
+    ));
+    let snapshot = loader.await_idle().await.unwrap();
+    assert_eq!(
+        snapshot.entry("flaky").unwrap().state,
+        Some(FiberState::Failed)
+    );
+    assert!(loader.entries().unwrap().extensions.is_empty());
+
+    loader.reload().await.unwrap();
+    assert!(loader.await_idle().await.unwrap().entry("flaky").is_none());
+
+    let healthy = EntryOptions::new("flaky", "demo.fail")
+        .with_config(toml::Value::try_from(FailConfig { fail: false }).unwrap());
+    loader.create(healthy, None, None).await.unwrap();
+    assert_eq!(
+        loader
+            .await_idle()
+            .await
+            .unwrap()
+            .entry("flaky")
+            .unwrap()
+            .state,
+        Some(FiberState::Active)
+    );
+    runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn group_disabled_keeps_group_fiber_and_toggles_children() {
+    let record = Arc::new(Mutex::new(Vec::new()));
+    let (runtime, _loader_fiber, loader, _dir, _) = mount_with_file(
+        catalog(vec![Factory {
+            id: "demo.value",
+            needs_dep: false,
+            record: Some(record.clone()),
+        }]),
+        vec![EntryOptions::group("group", vec![EntryOptions::new("child", "demo.value")]).unwrap()],
+    )
+    .await;
+    let before = loader.await_idle().await.unwrap();
+    let group_id = fiber_id(&before, "group");
+    assert_eq!(
+        before.entry("group:child").unwrap().state,
+        Some(FiberState::Active)
+    );
+
+    loader
+        .update(
+            "group",
+            EntryUpdate {
+                disabled: Some(true),
+                ..Default::default()
+            },
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let disabled = loader.await_idle().await.unwrap();
+    assert_eq!(fiber_id(&disabled, "group"), group_id);
+    assert!(disabled.entry("group").unwrap().state.is_some());
+    assert!(!disabled.entry("group:child").unwrap().enabled);
+    assert!(disabled.entry("group:child").unwrap().state.is_none());
+    assert_eq!(&*record.lock().unwrap(), &["demo.value"]);
+
+    loader
+        .update(
+            "group",
+            EntryUpdate {
+                disabled: Some(false),
+                ..Default::default()
+            },
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let enabled = loader.await_idle().await.unwrap();
+    assert_eq!(fiber_id(&enabled, "group"), group_id);
+    assert_eq!(
+        enabled.entry("group:child").unwrap().state,
+        Some(FiberState::Active)
+    );
+    runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn group_inject_change_rebuilds_subtree_only() {
+    let mut catalog = dep_catalog();
+    catalog
+        .register_injection(InjectionDescriptor::intercepted("dep", DEP, LABEL))
+        .unwrap();
+    catalog
+        .register(Factory {
+            id: "demo.sibling",
+            needs_dep: false,
+            record: None,
+        })
+        .unwrap();
+
+    let mut group = EntryOptions::group(
+        "app",
+        vec![
+            EntryOptions::new("provider", "demo.dep"),
+            EntryOptions::new("label", "demo.label"),
+        ],
+    )
+    .unwrap();
+    group.inject = Some(InjectConfig::Map(
+        [(
+            "dep".into(),
+            toml::Value::Table(toml::toml! { label = "before" }),
+        )]
+        .into(),
+    ));
+    let (runtime, _loader_fiber, loader, _dir, _) = mount_with_file(
+        catalog,
+        vec![EntryOptions::new("sibling", "demo.sibling"), group],
+    )
+    .await;
+    let before = loader.await_idle().await.unwrap();
+    let sibling_id = fiber_id(&before, "sibling");
+    let provider_id = fiber_id(&before, "app:provider");
+    let label_id = fiber_id(&before, "app:label");
+
+    loader
+        .update(
+            "app",
+            EntryUpdate {
+                inject: Some(Some(InjectConfig::Map(
+                    [(
+                        "dep".into(),
+                        toml::Value::Table(toml::toml! { label = "after" }),
+                    )]
+                    .into(),
+                ))),
+                ..Default::default()
+            },
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let after = loader.await_idle().await.unwrap();
+    assert_eq!(fiber_id(&after, "sibling"), sibling_id);
+    assert_ne!(fiber_id(&after, "app:provider"), provider_id);
+    assert_ne!(fiber_id(&after, "app:label"), label_id);
+    assert_eq!(
+        &*loader
+            .entry_context("app:label")
+            .unwrap()
+            .get(VALUE)
+            .unwrap(),
+        "after"
+    );
     runtime.shutdown().await.unwrap();
 }

@@ -116,7 +116,9 @@ Loader 读取 EntryTree → 反序列化为 `Factory::Config` → factory.build(
 - 工厂由应用调用 `ExtensionCatalog::register` 显式登记，不使用自动注册宏。`JsonSchema` 会被
   `Loader` 公开给管理界面生成配置表单。
 - 校验或反序列化失败时，Loader 不执行 reconcile，也不写回配置文件。
-- 配置、父 Group 或条目顺序变更会由 Loader 重建受影响的 Context 子树；插件不得自行保存可变 Loader 配置。
+- Loader 按 Entry/子树差分更新：仅受影响节点参与生命周期；纯排序不重启 Fiber。
+  `inject`/父 Context 不变的普通配置更新走 `Fiber::replace`；Group `inject` 变化重建该子树。
+- 插件不得自行保存可变 Loader 配置。
 - 不得修改已挂载实例的内部配置后调用 `restart()`；`restart()` 仅用于配置未变的重新执行。
 - **服务域**：顶层条目共享 Loader 根域；每个 Group 是独立服务边界；同 Group 子项互相可见。
   `inject = { ... }` 只覆盖 `ConfigKey`，不会把条目变成独立服务域。跨 Group 的 `provide`

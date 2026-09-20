@@ -111,7 +111,14 @@ EntryTree 的服务可见性由 **父 Group（或 Loader 根）** 决定，而�
 
 `Loader` 提供 `entries()`、`factories()`、`injections()`、`create()`、`update()`、`remove()`、
 `reload()` 和 `await_idle()`。`create` / `update` 接收父 Group 路径与位置；`update` 可以移动条目，
-移动会重建该节点和后代的 Context 链。
+移动按「旧路径后序释放 → 新路径前序挂载」处理（不做隐式原地迁移）。
+
+Loader reconcile 是**局部**的：仅创建、删除、移动、启停或配置/`inject` 变化的 Entry/子树
+参与生命周期；无关 Entry 保留原 Fiber ID、Context 与服务。普通 Entry 仅 `config` 变化且
+`inject`/父 Context 不变时走 `Fiber::replace`。Group 的 `inject` 变化会重建该 Group 整棵子树；
+仅 `disabled` 变化时保留 Group Fiber/Context，按祖先禁用规则启停后代。纯排序只更新
+`LoaderSnapshot.entries` 前序与持久化文件顺序，**不**重启任何 Fiber。依赖关系仍须通过
+`inject` 声明，排序不是业务依赖表达方式。
 
 跨 Group 的服务不会泄漏。应用读取某一条目视图上的服务时使用路径：
 
@@ -122,6 +129,10 @@ let database = loader.entry_context("infrastructure:database")?.get(DATABASE)?;
 同一 Group（或顶层）内的兄弟条目共享服务域，因此也可以从任一同域 `entry_context` 解析到
 该域内已 `Active` 的 Provider。
 
-文件来源的变更先完成树预检与 reconcile，再原子写回完整 TOML。文件被外部修改时返回
-`ConfigConflict`；写回失败返回带已生效 `LoaderSnapshot` 的 `Persist`。`await_idle()` 只等待
-Loader 自己的树稳定，不等待 Runtime 的无关工作。
+文件来源的变更先完成树预检与 reconcile，再原子写回完整 TOML。预检失败（未知 Factory、
+`FactoryChanged`、`PluginKeyChanged`、无效 inject 等）零运行时变更。生命周期失败不回滚
+已触及节点、不提交 `desired`/revision、不由 Loader 发起写回；无关 Entry 继续运行。
+失败后的 `LoaderSnapshot` 仍包含实际已插入的 Failed/Pending 节点，即使该次 reconcile
+尚未来得及提交目标排序；对同一外部配置再次 `reload()` 会重试失败的启用 Entry。
+文件被外部修改时返回 `ConfigConflict`；写回失败返回带已生效 `LoaderSnapshot` 的 `Persist`。
+`await_idle()` 只等待 Loader 自己的本次 reconcile，不等待 Runtime 的无关工作。

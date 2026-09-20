@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Plugin Stack Demo</title>
+    <title>Loader Subtree Reconcile Demo</title>
     <style>
       :root {
         --bg: #0f1419;
@@ -26,7 +26,7 @@
         color: var(--text);
       }
       main {
-        max-width: 1100px;
+        max-width: 1140px;
         margin: 0 auto;
         padding: 24px 16px 48px;
       }
@@ -34,7 +34,7 @@
       .sub { color: var(--muted); margin-bottom: 20px; font-size: 0.9rem; }
       .grid {
         display: grid;
-        grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+        grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
         gap: 12px;
         margin-bottom: 16px;
       }
@@ -45,19 +45,7 @@
         padding: 14px;
       }
       .card h2 { margin: 0 0 8px; font-size: 1rem; }
-      .deps { color: var(--muted); font-size: 0.8rem; margin-bottom: 10px; }
-      .pill {
-        display: inline-block;
-        padding: 2px 8px;
-        border-radius: 999px;
-        font-size: 0.75rem;
-        background: #243044;
-        color: var(--muted);
-        margin-bottom: 10px;
-      }
-      .pill.Active { color: var(--ok); }
-      .pill.Pending, .pill.Loading, .pill.Unloading { color: var(--warn); }
-      .pill.off, .pill.Disposed, .pill.Failed { color: var(--off); }
+      .hint { color: var(--muted); font-size: 0.8rem; margin: 0 0 10px; line-height: 1.4; }
       .row { display: flex; flex-wrap: wrap; gap: 8px; }
       button, select, input, textarea {
         font: inherit;
@@ -94,8 +82,39 @@
       @media (max-width: 800px) {
         .cols { grid-template-columns: 1fr; }
       }
+      table.entries {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 0.82rem;
+      }
+      table.entries th, table.entries td {
+        border-bottom: 1px solid var(--line);
+        padding: 6px 8px;
+        text-align: left;
+      }
+      table.entries th { color: var(--muted); font-weight: 600; }
+      .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+      .pill {
+        display: inline-block;
+        padding: 2px 8px;
+        border-radius: 999px;
+        font-size: 0.75rem;
+        background: #243044;
+        color: var(--muted);
+      }
+      .pill.Active { color: var(--ok); }
+      .pill.Pending, .pill.Loading, .pill.Unloading { color: var(--warn); }
+      .pill.off, .pill.Disposed, .pill.Failed { color: var(--off); }
+      .note {
+        margin: 0 0 12px;
+        padding: 10px 12px;
+        border-radius: 8px;
+        border: 1px solid #35507a;
+        background: #152033;
+        color: #c5d4ef;
+        font-size: 0.85rem;
+      }
 
-      /* —— Dify 风格节点连线视图 —— */
       .graph-section { margin-top: 20px; }
       .graph-meta {
         color: var(--muted);
@@ -140,7 +159,6 @@
         stroke-dasharray: 6 5;
         stroke-width: 2.4;
       }
-      .flow-svg path.edge.dim { opacity: 0.25; }
       .flow-svg marker path { fill: currentColor; }
       .fn {
         position: absolute;
@@ -152,12 +170,6 @@
         color: var(--text);
         cursor: default;
         user-select: none;
-        transition: border-color 0.15s, box-shadow 0.15s, transform 0.15s;
-      }
-      .fn:hover {
-        transform: translateY(-1px);
-        box-shadow: 0 12px 28px rgba(0, 0, 0, 0.45);
-        z-index: 3;
       }
       .fn .hd {
         display: flex;
@@ -171,14 +183,8 @@
         text-transform: uppercase;
         letter-spacing: 0.04em;
       }
-      .fn .bd {
-        padding: 8px 10px 10px;
-      }
-      .fn .title {
-        font-size: 0.95rem;
-        font-weight: 650;
-        margin: 0 0 4px;
-      }
+      .fn .bd { padding: 8px 10px 10px; }
+      .fn .title { font-size: 0.95rem; font-weight: 650; margin: 0 0 4px; }
       .fn .sub {
         margin: 0;
         font-size: 0.72rem;
@@ -202,7 +208,7 @@
       .fn.context { border-color: #5b8def; width: 150px; }
       .fn.fiber.Active { border-color: #3ecf8e; }
       .fn.fiber.Pending, .fn.fiber.Loading, .fn.fiber.Unloading { border-color: #e6a23c; }
-      .fn.fiber.Failed, .fn.fiber.error { border-color: #f87171; box-shadow: 0 0 0 1px rgba(248,113,113,0.35); }
+      .fn.fiber.Failed, .fn.fiber.error { border-color: #f87171; }
       .fn.fiber.off { border-color: #475569; opacity: 0.55; }
       .fn.provider { border-color: #c084fc; width: 156px; }
       .fn.provider.missing {
@@ -267,38 +273,54 @@
   </head>
   <body>
     <main>
-      <h1>DB → Logger → HTTP 插件栈</h1>
+      <h1>Loader 子树差分 Reconcile</h1>
       <p class="sub">
-        自由装卸三个插件；HTTP Active 后可随意发请求，调用会经 Logger 异步写入 DB。
-        三者挂在同一固定 <code>stack</code> 派生视图下。
+        EntryTree：根级 <code>side</code> + Group <code>app</code>（<code>db → logger → http</code>）。
+        操作只触及受影响子树；看表格里的 <code>fiber_id</code> 是否保持。
       </p>
+      <p class="note" id="note">加载中…</p>
+
+      <section class="card" style="margin-bottom: 16px">
+        <h2>Entry 快照</h2>
+        <p class="hint">侧重点：禁用 Group 时 Group Fiber 保留；纯排序 / 仅改 config 时 Fiber ID 不变；删建叶子只影响该路径。</p>
+        <table class="entries">
+          <thead>
+            <tr>
+              <th>path</th>
+              <th>fiber_id</th>
+              <th>state</th>
+              <th>enabled</th>
+            </tr>
+          </thead>
+          <tbody id="entries-body"></tbody>
+        </table>
+      </section>
 
       <div class="grid">
-        <section class="card" data-plugin="db">
-          <h2>DB</h2>
-          <div class="deps">无依赖 · 内存库（可换成 SQLite/PG）</div>
-          <div id="st-db" class="pill off">off</div>
+        <section class="card">
+          <h2>Group / 启停</h2>
+          <p class="hint">禁用 <code>app</code>：后代后序释放，Group Fiber/Context 保留。</p>
           <div class="row">
-            <button data-act="mount">挂载</button>
-            <button data-act="unmount">卸载</button>
+            <button data-disable="app" data-val="true">禁用 app</button>
+            <button data-disable="app" data-val="false">启用 app</button>
+            <button data-disable="app:db" data-val="true">禁用 db</button>
+            <button data-disable="app:db" data-val="false">启用 db</button>
           </div>
         </section>
-        <section class="card" data-plugin="logger">
-          <h2>Logger</h2>
-          <div class="deps">inject DB · 对外 Logger::info</div>
-          <div id="st-logger" class="pill off">off</div>
+        <section class="card">
+          <h2>排序 / replace</h2>
+          <p class="hint">同父移动 = 纯排序；HTTP 改 label = <code>Fiber::replace</code>。</p>
           <div class="row">
-            <button data-act="mount">挂载</button>
-            <button data-act="unmount">卸载</button>
+            <button id="btn-reorder">交换 http 位置</button>
+            <button id="btn-replace">HTTP 仅改 config</button>
           </div>
         </section>
-        <section class="card" data-plugin="http">
-          <h2>HTTP</h2>
-          <div class="deps">inject Logger · 对外 HttpCaller::request</div>
-          <div id="st-http" class="pill off">off</div>
+        <section class="card">
+          <h2>叶子删建</h2>
+          <p class="hint">删除 / 重建 <code>app:http</code>；观察 <code>side</code> Fiber ID。</p>
           <div class="row">
-            <button data-act="mount">挂载</button>
-            <button data-act="unmount">卸载</button>
+            <button id="btn-remove-http">删除 http</button>
+            <button id="btn-create-http">重建 http</button>
           </div>
         </section>
       </div>
@@ -319,7 +341,6 @@
           <textarea id="body" placeholder='{"hello":"cordis"}'></textarea>
           <div class="row" style="margin-top: 10px">
             <button class="primary" id="send">发送请求</button>
-            <button id="mount-all">一键挂满</button>
             <button id="clear-db">清空 DB 日志</button>
           </div>
           <label>响应</label>
@@ -358,7 +379,7 @@
         </div>
         <div class="flow-tip" id="graph-tip"></div>
         <div class="legend">
-          <span class="l-contain">stack 包含</span>
+          <span class="l-contain">Group 包含</span>
           <span class="l-provide">provide</span>
           <span class="l-inject">inject</span>
           <span class="l-error">缺失 / 错误</span>
@@ -373,19 +394,16 @@
       const graphFlow = document.getElementById("graph-flow");
       const graphSvg = document.getElementById("graph-svg");
       const graphTip = document.getElementById("graph-tip");
+      const entriesBody = document.getElementById("entries-body");
+      const noteEl = document.getElementById("note");
 
       const LAYOUT = {
         stack: { x: 36, y: 150, w: 150, h: 88 },
+        Side: { fiber: { x: 36, y: 40, w: 150, h: 88 } },
         DB: { fiber: { x: 260, y: 48, w: 168, h: 96 }, provider: { x: 266, y: 230, w: 156, h: 86 } },
         Logger: { fiber: { x: 520, y: 48, w: 168, h: 96 }, provider: { x: 526, y: 230, w: 156, h: 86 } },
         HTTP: { fiber: { x: 780, y: 48, w: 168, h: 96 }, provider: { x: 786, y: 230, w: 156, h: 86 } },
       };
-
-      function setPill(id, state) {
-        const el = document.getElementById(id);
-        el.textContent = state || "off";
-        el.className = "pill " + (state || "off");
-      }
 
       function esc(s) {
         return String(s)
@@ -505,6 +523,19 @@
         );
       }
 
+      function renderEntries(entries) {
+        entriesBody.innerHTML = (entries || [])
+          .map(
+            (e) => `<tr>
+              <td class="mono">${esc(e.path)}${e.group ? " · group" : ""}</td>
+              <td class="mono">${e.fiber_id != null ? "#" + e.fiber_id : "—"}</td>
+              <td><span class="pill ${esc(e.state || "off")}">${esc(e.state || "off")}</span></td>
+              <td>${e.enabled ? "yes" : "no"}</td>
+            </tr>`
+          )
+          .join("");
+      }
+
       function renderGraph(graph) {
         [...graphFlow.querySelectorAll(".fn")].forEach((n) => n.remove());
         const defs = graphSvg.querySelector("defs");
@@ -516,11 +547,12 @@
           return;
         }
 
+        const side = findFiber(graph, "Side");
         const db = findFiber(graph, "DB");
         const logger = findFiber(graph, "Logger");
         const http = findFiber(graph, "HTTP");
-        const mounted = [db, logger, http].filter(Boolean);
-        graphMeta.textContent = `${graph.view} · fibers=${mounted.length} · providers=${(graph.providers || []).length} · 悬停节点查看详情`;
+        const group = findFiber(graph, "Group");
+        graphMeta.textContent = `${graph.view} · fibers=${(graph.fibers || []).length} · providers=${(graph.providers || []).length}`;
 
         const nodes = [];
         const paths = [];
@@ -532,19 +564,41 @@
           makeNode({
             id: "stack",
             kind: "context",
-            kindLabel: "Context",
-            title: "stack",
-            subtitle: "root.extend() 固定视图",
-            state: "Active",
-            badge: "view",
+            kindLabel: "Group",
+            title: "app",
+            subtitle: group ? `fiber #${group.id}` : "cordis:group",
+            state: group ? group.state : "Active",
+            badge: group ? group.state : "group",
             box: stackBox,
-            tipHtml: tipLines("stack Context", [
-              "由 Runtime.root().extend() 创建一次",
-              "DB / Logger / HTTP 的 Fiber 都挂在此视图",
-              `context_depth ≈ ${graph.stack_depth}`,
+            tipHtml: tipLines("app Group", [
+              "Group extend() 一次，子条目共享服务域",
+              group ? `id=#${group.id}` : null,
+              "禁用 Group 时 Fiber/Context 保留",
             ]),
           })
         );
+
+        if (LAYOUT.Side) {
+          const f = side;
+          const fiberBox = LAYOUT.Side.fiber;
+          boxes["fiber-Side"] = fiberBox;
+          nodes.push(
+            makeNode({
+              id: "fiber-Side",
+              kind: "fiber",
+              kindLabel: "Fiber",
+              title: "Side",
+              subtitle: f ? `id=#${f.id}` : "未挂载",
+              state: f ? f.state : "off",
+              badge: f ? f.state : "off",
+              box: fiberBox,
+              tipHtml: tipLines("side（根级旁路）", [
+                f ? `id=#${f.id}` : "未挂载",
+                "app 子树变更时此 Fiber ID 应保持",
+              ]),
+            })
+          );
+        }
 
         const slots = [
           { label: "DB", fiber: db, expected: "demo.stack.db@1" },
@@ -569,7 +623,7 @@
               kind: "fiber",
               kindLabel: "Fiber",
               title: slot.label,
-              subtitle: f ? f.plugin : "未挂载",
+              subtitle: f ? `id=#${f.id}` : "未挂载",
               state,
               error: hasError,
               badge: f ? f.state : "off",
@@ -578,12 +632,10 @@
                 f ? `id=#${f.id}` : "未挂载",
                 f ? `plugin=${f.plugin}` : null,
                 f ? `state=${f.state}` : null,
-                f && f.root_effect != null ? `root_effect=#${f.root_effect}` : null,
                 f && f.dependencies?.length
                   ? `inject=${f.dependencies.join(", ")}`
                   : "inject=(none)",
                 missing.length ? `missing=${missing.join(", ")}` : null,
-                f && f.provides?.length ? `provides=${f.provides.join(", ")}` : null,
                 f && f.last_error ? `error=${f.last_error}` : null,
               ]),
             })
@@ -597,54 +649,27 @@
               provider = findProvider(graph, svc);
               if (provider) break;
             }
-            if (!provider) provider = findProvider(graph, slot.expected);
           }
-
-          const providerId = `provider-${slot.label}`;
-          if (provider) {
-            boxes[providerId] = providerBox;
+          if (provider || f) {
+            const pState = provider ? "Active" : "off";
+            boxes[`provider-${slot.label}`] = providerBox;
             nodes.push(
               makeNode({
-                id: providerId,
+                id: `provider-${slot.label}`,
                 kind: "provider",
                 kindLabel: "Provider",
-                title: shortSvc(provider.service),
-                subtitle: provider.service,
-                state: "Active",
-                badge: `#${provider.provider_id}`,
+                title: shortSvc(provider ? provider.service : slot.expected),
+                subtitle: provider ? `provider #${provider.provider_id}` : "无",
+                state: pState,
+                badge: provider ? "ok" : "off",
                 box: providerBox,
-                tipHtml: tipLines("Provider", [
-                  `service=${provider.service}`,
-                  `provider_id=#${provider.provider_id}`,
-                  provider.effect_id != null ? `effect_id=#${provider.effect_id}` : null,
-                  `context_depth=${provider.context_depth}`,
-                  provider.owner_fiber != null ? `owner_fiber=#${provider.owner_fiber}` : null,
-                  provider.owner_plugin ? `owner_plugin=${provider.owner_plugin}` : null,
+                tipHtml: tipLines(`${slot.label} Provider`, [
+                  provider ? `service=${provider.service}` : `expected=${slot.expected}`,
+                  provider ? `provider_id=#${provider.provider_id}` : null,
                 ]),
               })
             );
-            addEdge(paths, fiberBox, "bottom", providerBox, "top", "provide");
-          } else if (f) {
-            boxes[providerId] = providerBox;
-            const activeMissing = f.state === "Active";
-            nodes.push(
-              makeNode({
-                id: providerId,
-                kind: "provider",
-                kindLabel: "Provider",
-                title: shortSvc(slot.expected),
-                subtitle: activeMissing ? "尚未 provide" : "等待 Active",
-                state: "off",
-                missing: activeMissing,
-                badge: activeMissing ? "missing" : "waiting",
-                box: providerBox,
-                tipHtml: tipLines("Provider（空）", [
-                  `期望 service = ${slot.expected}`,
-                  "Fiber 尚未 provide，或 Effect 已释放",
-                ]),
-              })
-            );
-            if (activeMissing) addEdge(paths, fiberBox, "bottom", providerBox, "top", "error");
+            if (provider && f) addEdge(paths, fiberBox, "bottom", providerBox, "top", "provide");
           }
         }
 
@@ -666,7 +691,6 @@
           const ghostId = `ghost-${fromLabel}-${toLabel}`;
           if (!boxes[ghostId]) {
             const ghostBox = { ...LAYOUT[fromLabel].provider };
-            // if real provider node already occupies same spot and is missing-style, reuse
             boxes[ghostId] = ghostBox;
             const occupied = nodes.some((n) => n.dataset.id === `provider-${fromLabel}`);
             if (!occupied || missing) {
@@ -685,7 +709,6 @@
                     tipHtml: tipLines("缺失的 Provider", [
                       `consumer=${toLabel}`,
                       `需要=${dep}`,
-                      "上游未挂载、未 Active，或已被卸载",
                     ]),
                   })
                 );
@@ -705,9 +728,9 @@
 
       async function api(path, body) {
         const res = await fetch(path, {
-          method: body ? "POST" : "GET",
-          headers: body ? { "content-type": "application/json" } : undefined,
-          body: body ? JSON.stringify(body) : undefined,
+          method: body !== undefined ? "POST" : "GET",
+          headers: body !== undefined ? { "content-type": "application/json" } : undefined,
+          body: body !== undefined ? JSON.stringify(body) : undefined,
         });
         const data = await res.json().catch(() => ({}));
         if (!res.ok) throw new Error(data.error || res.statusText);
@@ -716,37 +739,57 @@
 
       async function refresh() {
         const s = await api("/api/state");
-        setPill("st-db", s.plugins.db);
-        setPill("st-logger", s.plugins.logger);
-        setPill("st-http", s.plugins.http);
+        noteEl.textContent = s.note || "";
+        renderEntries(s.entries);
         dbEl.textContent =
           s.db_logs && s.db_logs.length ? s.db_logs.join("\n") : "（空）";
         renderGraph(s.graph);
       }
 
-      document.querySelectorAll("[data-plugin]").forEach((card) => {
-        const plugin = card.dataset.plugin;
-        card.querySelectorAll("[data-act]").forEach((btn) => {
-          btn.addEventListener("click", async () => {
-            try {
-              const act = btn.dataset.act;
-              if (act === "mount") await api("/api/mount", { plugin });
-              else await api("/api/unmount", { plugin });
-              await refresh();
-            } catch (e) {
-              alert(e.message);
-            }
-          });
+      document.querySelectorAll("[data-disable]").forEach((btn) => {
+        btn.addEventListener("click", async () => {
+          try {
+            await api("/api/disable", {
+              path: btn.dataset.disable,
+              disabled: btn.dataset.val === "true",
+            });
+            await refresh();
+          } catch (e) {
+            alert(e.message);
+          }
         });
       });
 
-      document.getElementById("mount-all").onclick = async () => {
+      document.getElementById("btn-reorder").onclick = async () => {
         try {
-          for (const plugin of ["db", "logger", "http"]) {
-            try {
-              await api("/api/mount", { plugin });
-            } catch (_) {}
-          }
+          await api("/api/reorder", {});
+          await refresh();
+        } catch (e) {
+          alert(e.message);
+        }
+      };
+
+      document.getElementById("btn-replace").onclick = async () => {
+        try {
+          await api("/api/replace-http-config", {});
+          await refresh();
+        } catch (e) {
+          alert(e.message);
+        }
+      };
+
+      document.getElementById("btn-remove-http").onclick = async () => {
+        try {
+          await api("/api/remove", { path: "app:http" });
+          await refresh();
+        } catch (e) {
+          alert(e.message);
+        }
+      };
+
+      document.getElementById("btn-create-http").onclick = async () => {
+        try {
+          await api("/api/create-http", {});
           await refresh();
         } catch (e) {
           alert(e.message);

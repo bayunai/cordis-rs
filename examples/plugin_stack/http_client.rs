@@ -13,6 +13,17 @@ fn bus(tx: &LogTx, msg: impl Into<String>) {
     let _ = tx.send(msg.into());
 }
 
+/// Loader 可替换配置；仅改 label 时应走 `Fiber::replace` 且保留 Fiber ID。
+#[derive(Clone, Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct HttpConfig {
+    #[serde(default = "default_http_label")]
+    pub label: String,
+}
+
+fn default_http_label() -> String {
+    "default".into()
+}
+
 #[derive(Debug, Clone)]
 pub struct HttpResponse {
     pub status: u16,
@@ -68,6 +79,7 @@ impl HttpCaller {
 
 pub struct HttpPlugin {
     pub bus: LogTx,
+    pub label: String,
 }
 
 #[async_trait]
@@ -87,7 +99,10 @@ impl Plugin for HttpPlugin {
             .build()
             .map_err(|e| CoreError::PluginApply(e.to_string()))?;
         ctx.provide(HTTP, HttpCaller { logger, client })?;
-        bus(&self.bus, "sys: http apply");
+        bus(
+            &self.bus,
+            format!("sys: http apply (label={})", self.label),
+        );
         let bus_d = self.bus.clone();
         ctx.effect()?.on_dispose(move || {
             bus(&bus_d, "sys: http disposed");

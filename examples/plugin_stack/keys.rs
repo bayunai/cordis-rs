@@ -13,3 +13,4 @@ pub static HTTP: ServiceKey<HttpCaller> = ServiceKey::new("demo.stack.http@1");
 pub static KEY_DB: PluginKey = PluginKey::new("demo.stack.db");
 pub static KEY_LOGGER: PluginKey = PluginKey::new("demo.stack.logger");
 pub static KEY_HTTP: PluginKey = PluginKey::new("demo.stack.http");
+pub static KEY_SIDE: PluginKey = PluginKey::new("demo.stack.side");

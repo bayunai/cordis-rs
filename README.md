@@ -86,7 +86,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 - [`reactive`](examples/reactive.rs)：最小服务注入与响应式重算。
 - [`plugin_hotplug`](examples/plugin_hotplug.rs)：插件替换与卸载。
 - [`plugin_web`](examples/plugin_web.rs)：将运行时能力接入 HTTP 示例。
-- [`plugin_stack`](examples/plugin_stack/main.rs)：多插件应用栈。
+- [`plugin_stack`](examples/plugin_stack/main.rs)：Loader EntryTree 子树差分 reconcile 网页 Demo（`side` + `app/{db,logger,http}`）。
 - [`host_bootstrap`](crates/cordis-host/examples/host_bootstrap/main.rs)：可复制的 Host 模板，包含入口、静态 Catalog、插件目录与 TOML 扩展清单。
 - [架构与边界](docs/architecture.md)
 - [Host 编排](docs/host.md)
