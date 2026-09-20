@@ -4,7 +4,7 @@ use crate::{
     catalog::ExtensionCatalog,
     config::{EntryOptions, ExtensionsConfig},
     error::{LoaderError, format_panic_message},
-    plugin::{LoaderInner, MountedEntry},
+    plugin::{LoaderInner, RuntimeEntry},
     snapshot::{EntryId, LoaderSnapshot},
 };
 use async_trait::async_trait;
@@ -285,7 +285,7 @@ impl LoaderInner {
         let mut entries = self.entries.lock().expect("entries");
         entries.insert(
             path.clone(),
-            MountedEntry {
+            RuntimeEntry {
                 parent: node.parent.clone(),
                 name: node.options.name.clone(),
                 group: node.options.group,
@@ -352,7 +352,7 @@ fn index_entries(
 }
 
 pub(crate) fn plan_reconcile(
-    mounted: &BTreeMap<EntryId, MountedEntry>,
+    mounted: &BTreeMap<EntryId, RuntimeEntry>,
     desired: &BTreeMap<EntryId, DesiredNode>,
     roots: &[EntryId],
 ) -> Result<ReconcilePlan, LoaderError> {
@@ -504,7 +504,7 @@ pub(crate) fn plan_reconcile(
 fn plan_group_disable_toggle(
     group: &EntryId,
     desired: &BTreeMap<EntryId, DesiredNode>,
-    mounted: &BTreeMap<EntryId, MountedEntry>,
+    mounted: &BTreeMap<EntryId, RuntimeEntry>,
     dispose_fiber: &mut BTreeSet<EntryId>,
     mount: &mut BTreeSet<EntryId>,
     build: &mut BTreeSet<EntryId>,
@@ -532,10 +532,10 @@ fn plan_group_disable_toggle(
 
 fn subtree_paths_mounted(
     root: &EntryId,
-    mounted: &BTreeMap<EntryId, MountedEntry>,
+    mounted: &BTreeMap<EntryId, RuntimeEntry>,
 ) -> Vec<EntryId> {
     let mut out = Vec::new();
-    fn walk(path: &EntryId, mounted: &BTreeMap<EntryId, MountedEntry>, out: &mut Vec<EntryId>) {
+    fn walk(path: &EntryId, mounted: &BTreeMap<EntryId, RuntimeEntry>, out: &mut Vec<EntryId>) {
         let children: Vec<_> = mounted
             .iter()
             .filter(|(_, entry)| entry.parent.as_ref() == Some(path))
@@ -587,7 +587,7 @@ pub(crate) fn build_plan_plugins(
     catalog: &ExtensionCatalog,
     desired: &mut BTreeMap<EntryId, DesiredNode>,
     plan: &ReconcilePlan,
-    mounted: &Mutex<BTreeMap<EntryId, MountedEntry>>,
+    mounted: &Mutex<BTreeMap<EntryId, RuntimeEntry>>,
 ) -> Result<(), LoaderError> {
     let mounted = mounted.lock().expect("entries");
     for path in &plan.build {

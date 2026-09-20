@@ -23,7 +23,8 @@ use std::{
 };
 use tokio::{sync::Notify, task::JoinHandle};
 
-pub(crate) struct MountedEntry {
+/// Loader 维护的运行时条目槽位；禁用或等待重挂载时可暂时没有 Fiber。
+pub(crate) struct RuntimeEntry {
     pub(crate) parent: Option<EntryId>,
     pub(crate) name: String,
     pub(crate) group: bool,
@@ -186,7 +187,7 @@ pub(crate) struct LoaderInner {
     pub(crate) extensions_path: Mutex<Option<PathBuf>>,
     pub(crate) desired: Mutex<ExtensionsConfig>,
     pub(crate) revision: Mutex<Option<String>>,
-    pub(crate) entries: Mutex<BTreeMap<EntryId, MountedEntry>>,
+    pub(crate) entries: Mutex<BTreeMap<EntryId, RuntimeEntry>>,
     pub(crate) order: Mutex<Vec<EntryId>>,
     pub(crate) named_labels: Mutex<NamedIsolationLabels>,
     reconcile: Mutex<Option<Arc<ReconcileCompletion>>>,
