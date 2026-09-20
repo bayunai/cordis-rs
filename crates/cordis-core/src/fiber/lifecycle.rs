@@ -4,7 +4,7 @@
 
 use super::{
     Fiber, FiberInner, FiberState,
-    coordinator::{LifecycleCompletion, LifecycleOp},
+    coordinator::LifecycleOp,
     ownership::{EffectOwnership, FiberRelease},
 };
 use crate::{
@@ -313,11 +313,6 @@ impl FiberInner {
             Err(CoreError::FiberBusy) => Err(CoreError::FiberBusy),
             Err(error) => Err(error),
         }
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn current_lifecycle(&self) -> Option<Arc<LifecycleCompletion>> {
-        self.lifecycle.lock().ok().and_then(|slot| slot.clone())
     }
 }
 

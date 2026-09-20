@@ -251,9 +251,7 @@ pub struct EffectHandle {
     scope: EffectScope,
 }
 
-#[allow(dead_code)]
 impl EffectHandle {
-    #[allow(dead_code)]
     pub(crate) fn from_scope(scope: EffectScope) -> Self {
         Self { scope }
     }
@@ -288,11 +286,6 @@ impl EffectHandle {
 
     pub fn cleanup_count(&self) -> usize {
         self.scope.cleanup_count()
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn scope(&self) -> &EffectScope {
-        &self.scope
     }
 }
 

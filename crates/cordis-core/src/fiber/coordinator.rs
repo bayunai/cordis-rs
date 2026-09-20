@@ -17,7 +17,11 @@ pub(crate) enum HandleHandoff {
     Abandoned,
 }
 
-/// 一轮生命周期操作的共享 completion（同构 DisposeCompletion）。
+/// 一轮 Fiber 生命周期操作的共享完成结果。
+///
+/// `FiberInner` 在启动协调器前将它登记为唯一在途操作；`retain` 持有协调器任务，
+/// 因而任一调用方取消 `wait()` 都不会中断生命周期收敛。协调器只允许首次
+/// `finish()` 写入终态，所有当前与后续等待者读取同一结果。
 pub(crate) struct LifecycleCompletion {
     notify: Notify,
     result: Mutex<Option<Result<(), CoreError>>>,
@@ -37,6 +41,7 @@ impl LifecycleCompletion {
         *self.retain.lock().expect("lifecycle retain") = Some(handle);
     }
 
+    /// 写入唯一终态并唤醒所有等待者；重复完成不能改写首次结果。
     fn finish(&self, result: Result<(), CoreError>) {
         {
             let mut slot = self.result.lock().expect("lifecycle completion");
@@ -400,8 +405,33 @@ mod lifecycle_completion_tests {
     }
 
     #[tokio::test]
+    async fn lifecycle_completion_preserves_first_terminal_result() {
+        let completion = LifecycleCompletion::new();
+        completion.finish(Err(CoreError::CoordinatorAborted {
+            reason: "first completion".into(),
+        }));
+        completion.finish(Ok(()));
+
+        assert!(matches!(
+            completion.wait().await,
+            Err(CoreError::CoordinatorAborted { reason }) if reason == "first completion"
+        ));
+    }
+
+    #[tokio::test]
     async fn p1_lifecycle_supervisor_abort_finishes_waiters() {
         let completion = LifecycleCompletion::new();
+        let waiter = {
+            let completion = completion.clone();
+            tokio::spawn(async move {
+                tokio::time::timeout(Duration::from_secs(2), completion.wait())
+                    .await
+                    .expect("concurrent waiter must finish")
+            })
+        };
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
         let mut guard = LifecycleFinishGuardForTest {
             completion: completion.clone(),
             finished: false,
@@ -420,6 +450,10 @@ mod lifecycle_completion_tests {
             .await
             .expect("waiter must finish");
         assert!(matches!(result, Err(CoreError::CoordinatorAborted { .. })));
+        assert!(matches!(
+            waiter.await.expect("join concurrent waiter"),
+            Err(CoreError::CoordinatorAborted { .. })
+        ));
         tokio::time::timeout(Duration::from_secs(1), completion.wait())
             .await
             .expect("late waiter")

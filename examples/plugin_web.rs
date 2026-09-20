@@ -45,8 +45,7 @@ struct NoteService;
 struct Greeting(String);
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
-struct Counter(u64);
+struct Counter;
 
 static NOTE_SERVICE: ServiceKey<NoteService> = ServiceKey::new("demo.note@1");
 static GREETING: ServiceKey<Greeting> = ServiceKey::new("demo.greeting@1");
@@ -129,7 +128,7 @@ impl Plugin for CounterPlugin {
         let logger = ctx.logger()?;
         logger.info(format!("[counter] apply (seen greeting: {})", greeting.0));
         let ticks = self.ticks.clone();
-        ctx.provide(COUNTER, Counter(ticks.load(Ordering::SeqCst)))?;
+        ctx.provide(COUNTER, Counter)?;
         let effect = ctx.effect()?;
         let ticks_bg = ticks.clone();
         let logger_bg = logger.clone();

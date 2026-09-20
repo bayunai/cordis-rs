@@ -34,6 +34,14 @@ impl LogExporter for CaptureExporter {
     }
 }
 
+#[test]
+fn log_level_as_str_uses_stable_lowercase_labels() {
+    assert_eq!(LogLevel::Debug.as_str(), "debug");
+    assert_eq!(LogLevel::Info.as_str(), "info");
+    assert_eq!(LogLevel::Warn.as_str(), "warn");
+    assert_eq!(LogLevel::Error.as_str(), "error");
+}
+
 #[tokio::test]
 async fn isolate_and_extend_share_same_logger_service() {
     static KEY: ServiceKey<()> = ServiceKey::new("logger.test.isolate@1");

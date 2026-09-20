@@ -265,6 +265,27 @@ async fn effect_tree_appears_in_diagnostics_and_clears() {
     let effect = root.effect_named("named-fx").unwrap();
     let handle = effect.handle();
     assert_eq!(handle.name(), "named-fx");
+    assert!(!handle.is_disposed());
+    assert!(!handle.is_cancelled());
+    assert_eq!(handle.child_count(), 0);
+    assert_eq!(handle.task_count(), 0);
+    let cleanup_baseline = handle.cleanup_count();
+
+    let child = effect.as_context().effect_named("child-fx").unwrap();
+    let child_handle = child.handle();
+    assert_eq!(child_handle.parent_id(), Some(handle.id()));
+    assert_eq!(handle.child_count(), 1);
+    child.dispose_wait().await.unwrap();
+    assert_eq!(handle.child_count(), 0);
+
+    effect.on_dispose(|| {});
+    assert_eq!(handle.cleanup_count(), cleanup_baseline + 1);
+    effect
+        .spawn(|cancel| async move {
+            cancel.cancelled().await;
+        })
+        .unwrap();
+    assert_eq!(handle.task_count(), 1);
     assert!(
         runtime
             .diagnostics()
@@ -280,7 +301,9 @@ async fn effect_tree_appears_in_diagnostics_and_clears() {
             .iter()
             .any(|provider| provider.effect_id == Some(handle.id()))
     );
-    effect.dispose();
+    effect.dispose_wait().await.unwrap();
+    assert!(handle.is_disposed());
+    assert!(handle.is_cancelled());
     assert_eq!(runtime.diagnostics().effects.len(), before);
     assert!(runtime.diagnostics().providers.is_empty());
 }

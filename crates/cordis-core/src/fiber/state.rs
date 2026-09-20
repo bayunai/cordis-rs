@@ -111,7 +111,6 @@ impl FiberInner {
         }
     }
 
-    #[allow(dead_code)]
     pub(super) fn transition_disposing(&self) {
         let changed = {
             let Ok(mut state) = self.state.lock() else {

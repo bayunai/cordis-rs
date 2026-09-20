@@ -33,11 +33,6 @@ impl RuntimeToken {
             id: self.inner.next_label.fetch_add(1, Ordering::Relaxed),
         }
     }
-
-    #[allow(dead_code)]
-    pub(crate) fn same_runtime(&self, label: &IsolationLabel) -> bool {
-        Arc::ptr_eq(&self.inner, &label.token)
-    }
 }
 
 /// Runtime 所属的不可伪造隔离标签。
@@ -52,7 +47,6 @@ impl IsolationLabel {
         self.id
     }
 
-    #[allow(dead_code)] // Context 跨 Runtime 校验路径预留
     pub(crate) fn ensure_runtime(&self, token: &RuntimeToken) -> Result<(), CoreError> {
         if Arc::ptr_eq(&self.token, &token.inner) {
             Ok(())
