@@ -7,10 +7,12 @@
 | **Runtime 内核** | Context、Service、inject、Isolation、Fiber、Effect、Event、诊断 | `crates/cordis-core` |
 | **Loader** | 静态 Catalog、严格配置、reconcile 与管理服务 | `crates/cordis-loader` |
 | **应用 Host** | 创建 Runtime、显式挂载 LoaderPlugin、运行应用事件循环并受控关闭 | `crates/cordis-host`；应用再接入网络/持久化 |
+| **生命周期能力** | Timer 等须由 Host 显式挂载的 Effect 作用域能力；不属于 Core / Loader builtin | `crates/cordis-plugin-timer` 等 |
 | **扩展** | 实现 `Plugin`，`provide` / `inject` / `on`，不触碰宿主内部类型 | 插件 crate |
 
-`cordis-core` **不包含** HTTP、数据库、Redis、JSON 配置、Manifest、WASM 或网关语义。
+`cordis-core` **不包含** HTTP、数据库、Redis、JSON 配置、Manifest、WASM、网关或计时器语义。
 `cordis-loader` 首版只做进程内编排与文件配置源，不加载动态库、不提供管理后台。
+计时器由独立的 `cordis-plugin-timer` 提供：Host 在 Root 显式 `plugin(TimerPlugin)` 并保留 Fiber；业务插件通过静态 `inject([TIMER.id()])` 依赖，并在 `EffectContext` 上使用 `TimerExt`。
 
 ## Bootstrap 配置边界
 

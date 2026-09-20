@@ -16,6 +16,7 @@ cordis-loader.workspace = true
 
 [dev-dependencies]
 async-trait.workspace = true
+cordis-plugin-timer.workspace = true
 schemars.workspace = true
 serde.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

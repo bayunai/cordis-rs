@@ -11,6 +11,7 @@ mod plugins;
 
 use cordis_host::CordisHost;
 use cordis_loader::LoaderPlugin;
+use cordis_plugin_timer::TimerPlugin;
 use plugins::greeting::GREETING;
 use std::{path::PathBuf, sync::Arc};
 
@@ -24,6 +25,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
 
     let host = CordisHost::new()?;
+    // Timer 为 Host 显式能力，保留 Fiber 直至 shutdown；不进入 Loader builtin。
+    let _timer_fiber = host.root().plugin(Arc::new(TimerPlugin)).await?;
     let loader = LoaderPlugin::bootstrap(host::build_catalog()?, bootstrap_path)?;
     let _loader_fiber = host.root().plugin(Arc::new(loader)).await?;
 

@@ -237,6 +237,7 @@ dependencies = [
  "async-trait",
  "cordis-core",
  "cordis-loader",
+ "cordis-plugin-timer",
  "schemars",
  "serde",
  "tokio",
@@ -256,6 +257,20 @@ dependencies = [
  "thiserror",
  "tokio",
  "toml",
+]
+
+[[package]]
+name = "cordis-plugin-timer"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "cordis-core",
+ "cordis-host",
+ "cordis-testkit",
+ "futures-util",
+ "thiserror",
+ "tokio",
+ "tokio-util",
 ]
 
 [[package]]

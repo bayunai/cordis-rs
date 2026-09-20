@@ -136,8 +136,39 @@ Loader 读取 EntryTree → 反序列化为 `Factory::Config` → factory.build(
 - `Drop` / 未 `shutdown` 的进程退出不会启动尚未执行的 async disposer；受控关闭路径才会完整执行。
 - `dispose` 上收释放协调；热路径用 `dispose_wait` / `replace`。
 
+## Timer（`cordis-plugin-timer`）
+
+计时器是独立能力插件，不在 Core，也不在 Loader builtin。Host 须先挂载并保留 Fiber：
+
+```rust
+let _timer = host.root().plugin(Arc::new(TimerPlugin)).await?;
+```
+
+业务插件必须静态依赖 `TIMER`，并只在 `EffectContext` 上调用 `TimerExt`
+（`timeout` / `sleep` / `interval` / `ticks` / `throttle` / `debounce`）：
+
+```rust
+fn inject(&self) -> Vec<ServiceId> {
+    vec![TIMER.id()]
+}
+
+async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
+    let effect = ctx.effect_named("refresh")?;
+    let handle = effect.interval(|| { /* ... */ }, Duration::from_secs(5))?;
+    // TimerHandle Drop 会取消；挂到 Effect 上以跟随 Fiber 生命周期。
+    effect.on_dispose(move || {
+        drop(handle);
+    });
+    Ok(())
+}
+```
+
+取消语义：手动 `cancel` / Handle Drop、所属 Effect 或 Fiber 释放、Timer 依赖撤销、
+Runtime shutdown 都会停止未触发回调；等待中的 `sleep` / `ticks` 得到 `TimerError::Disposed`。
+
 ## 禁止事项
 
 - 不要依赖宿主 AppState / HTTP / DB / Redis / 配置文件。
 - 不要实现 Manifest、Loader/HMR——属 Loader 层。插件配置 Schema 由 Factory 的 `Config` 类型声明，并由 Loader 在调用 `build` 前校验。
 - `intercept` 仅派生配置（`ConfigKey`），不可替代 `provide` / Service。
+- 不要给 `Context` 做 Timer mixin；未挂载 `TimerPlugin` 时不得假定计时器可用。

@@ -1,0 +1,28 @@
+[package]
+name = "cordis-plugin-timer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+readme.workspace = true
+description = "Effect-scoped timer capability plugin for cordis-core hosts."
+
+[dependencies]
+async-trait.workspace = true
+cordis-core.workspace = true
+futures-util = { workspace = true, features = ["std"] }
+thiserror.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
+tokio-util.workspace = true
+
+[dev-dependencies]
+cordis-host.workspace = true
+cordis-testkit.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time", "test-util"] }
+
+[[example]]
+name = "timer"
+path = "examples/timer.rs"
