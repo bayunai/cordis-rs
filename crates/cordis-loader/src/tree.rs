@@ -181,7 +181,11 @@ impl RuntimeTree {
             self.spawn_reconcile(completion.clone(), desired, plan, config, revision);
             completion
         };
-        completion.wait().await
+        let result = completion.wait().await;
+        if let Some(loader) = self.loader.lock().expect("loader weak").upgrade() {
+            loader.publish_snapshot_changed();
+        }
+        result
     }
 
     pub(crate) async fn await_idle(self: &Arc<Self>) -> Result<LoaderSnapshot, LoaderError> {

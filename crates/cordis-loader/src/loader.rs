@@ -14,6 +14,16 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
+use tokio::sync::broadcast;
+
+/// Loader 的运行时快照已失效。
+///
+/// 订阅者必须重新读取快照，不能靠事件载荷重建树。一次 reconcile 即使返回错误，
+/// 也可能留下 `Failed` 节点或释放旧节点；只要已执行 reconcile，便会发送此事件。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoaderEvent {
+    SnapshotChanged { revision: u64 },
+}
 
 pub static LOADER: ServiceKey<Loader> = ServiceKey::new("cordis.loader@1");
 
@@ -83,6 +93,11 @@ impl Loader {
 
     pub async fn await_idle(&self) -> Result<LoaderSnapshot, LoaderControlError> {
         Ok(self.inner()?.await_idle_all().await?)
+    }
+
+    /// 订阅后续 Loader 事件。已发生的 revision 不会重放。
+    pub fn subscribe(&self) -> Result<broadcast::Receiver<LoaderEvent>, LoaderControlError> {
+        Ok(self.inner()?.events.subscribe())
     }
 
     /// 在 `owner` Context（须带 [`crate::ENTRY_LOCATION`]）上附着文件子树。

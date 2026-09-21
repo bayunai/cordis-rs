@@ -5,7 +5,7 @@ use crate::{
     catalog::ExtensionCatalog,
     config::ExtensionsConfig,
     error::LoaderError,
-    loader::{LOADER, Loader},
+    loader::{LOADER, Loader, LoaderEvent},
     snapshot::{EntryId, LoaderSnapshot},
     tree::{RuntimeTree, aggregate_snapshot, canonicalize_existing, resolve_include_path},
 };
@@ -16,9 +16,10 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
+use tokio::sync::broadcast;
 
 /// Loader 维护的运行时条目槽位；禁用或等待重挂载时可暂时没有 Fiber。
 pub(crate) struct RuntimeEntry {
@@ -90,11 +91,14 @@ impl LoaderPlugin {
             } => (config.clone(), Some(path.clone()), Some(revision.clone())),
         };
         let root = RuntimeTree::new_root(self.catalog.clone(), context, extensions_path, revision);
+        let (events, _) = broadcast::channel(64);
         let inner = Arc::new(LoaderInner {
             catalog: self.catalog.clone(),
             root: root.clone(),
             subtrees: Mutex::new(SubtreeRegistry::default()),
             alive: AtomicBool::new(true),
+            events,
+            change_revision: AtomicU64::new(0),
             initial: Mutex::new(Some(config)),
         });
         *root.loader.lock().expect("loader weak") = Arc::downgrade(&inner);
@@ -137,6 +141,8 @@ pub(crate) struct LoaderInner {
     pub(crate) root: Arc<RuntimeTree>,
     pub(crate) subtrees: Mutex<SubtreeRegistry>,
     pub(crate) alive: AtomicBool,
+    pub(crate) events: broadcast::Sender<LoaderEvent>,
+    change_revision: AtomicU64,
     initial: Mutex<Option<ExtensionsConfig>>,
 }
 
@@ -164,6 +170,12 @@ impl LoaderInner {
             let _ = tree.await_idle().await?;
         }
         Ok(self.aggregate_snapshot())
+    }
+
+    /// 发布运行树快照失效通知；消费者必须重新读取完整快照。
+    pub(crate) fn publish_snapshot_changed(&self) {
+        let revision = self.change_revision.fetch_add(1, Ordering::AcqRel) + 1;
+        let _ = self.events.send(LoaderEvent::SnapshotChanged { revision });
     }
 
     pub(crate) fn aggregate_snapshot(&self) -> LoaderSnapshot {
@@ -352,6 +364,7 @@ impl LoaderInner {
         }
         tree.dispose_all().await?;
         self.unregister_subtree(tree);
+        self.publish_snapshot_changed();
         Ok(())
     }
 }

@@ -5,7 +5,7 @@ use cordis_core::{
 use cordis_loader::{
     EntryOptions, EntryUpdate, ExtensionCatalog, ExtensionFactory, ExtensionsConfig, InjectConfig,
     InjectionDescriptor, IsolateValue, IsolationDescriptor, LOADER, Loader, LoaderControlError,
-    LoaderError, LoaderPlugin,
+    LoaderError, LoaderEvent, LoaderPlugin,
 };
 use schemars::JsonSchema;
 use std::{
@@ -1376,6 +1376,7 @@ async fn lifecycle_failure_keeps_unrelated_active_and_skips_desired_commit() {
     let before = loader.await_idle().await.unwrap();
     let stable_id = fiber_id(&before, "stable");
     let before_file = fs::read_to_string(&extensions).unwrap();
+    let mut events = loader.subscribe().unwrap();
 
     let error = loader
         .update(
@@ -1396,6 +1397,10 @@ async fn lifecycle_failure_keeps_unrelated_active_and_skips_desired_commit() {
         ),
         "unexpected error: {error:?}"
     );
+    assert!(matches!(
+        events.recv().await.unwrap(),
+        LoaderEvent::SnapshotChanged { .. }
+    ));
 
     let after = loader.await_idle().await.unwrap();
     assert_eq!(fiber_id(&after, "stable"), stable_id);
@@ -1920,5 +1925,50 @@ async fn named_isolate_labels_are_pruned_after_reload() {
         after.entry("b:consumer").unwrap().state,
         Some(FiberState::Active)
     );
+    runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn update_enable_disable_notifies_subscribers_with_increasing_revision() {
+    let (runtime, _fiber, loader, _directory, _extensions) = mount_with_file(
+        catalog(vec![Factory {
+            id: "demo.value",
+            needs_dep: false,
+            record: None,
+        }]),
+        vec![EntryOptions::new("value", "demo.value")],
+    )
+    .await;
+    loader.await_idle().await.unwrap();
+    let mut events = loader.subscribe().unwrap();
+
+    loader
+        .update(
+            "value",
+            EntryUpdate {
+                disabled: Some(true),
+                ..Default::default()
+            },
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let LoaderEvent::SnapshotChanged { revision: disabled } = events.recv().await.unwrap();
+
+    loader
+        .update(
+            "value",
+            EntryUpdate {
+                disabled: Some(false),
+                ..Default::default()
+            },
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let LoaderEvent::SnapshotChanged { revision: enabled } = events.recv().await.unwrap();
+    assert!(enabled > disabled);
     runtime.shutdown().await.unwrap();
 }

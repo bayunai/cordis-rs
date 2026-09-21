@@ -26,7 +26,7 @@ pub use config::{
     ExtensionsConfig, GROUP_NAME, InjectConfig, IsolateConfig, IsolateValue,
 };
 pub use error::LoaderError;
-pub use loader::{EntryUpdate, LOADER, Loader, LoaderControlError, LoaderSubtree};
+pub use loader::{EntryUpdate, LOADER, Loader, LoaderControlError, LoaderEvent, LoaderSubtree};
 pub use meta::{ENTRY_LOCATION, EntryLocation};
 pub use plugin::LoaderPlugin;
 pub use snapshot::{EntryId, EntrySnapshot, LoaderSnapshot};
