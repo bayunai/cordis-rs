@@ -187,4 +187,4 @@ let database = loader.entry_context("infrastructure:database")?.get(DATABASE)?;
 失败后的 `LoaderSnapshot` 仍包含实际已插入的 Failed/Pending 节点，即使该次 reconcile
 尚未来得及提交目标排序；对同一外部配置再次 `reload()` 会重试失败的启用 Entry。
 文件被外部修改时返回 `ConfigConflict`；写回失败返回带已生效 `LoaderSnapshot` 的 `Persist`。
-`await_idle()` 只等待 Loader 自己的本次 reconcile，不等待 Runtime 的无关工作。
+`await_idle()` 等待 Loader 自己的本次 reconcile，以及 EntryTree 受管 Fiber 的 Loading / Unloading 收敛；不等待 Runtime 上与本 Loader 无关的工作，也不等待仍缺依赖的 Pending。

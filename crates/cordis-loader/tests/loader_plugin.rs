@@ -162,6 +162,60 @@ async fn sibling_provider_unblocks_pending_consumer() {
     runtime.shutdown().await.unwrap();
 }
 
+#[tokio::test]
+async fn managed_fiber_activation_after_external_provider_invalidates_snapshot() {
+    let (runtime, _loader_fiber, loader) = mount(
+        LoaderPlugin::new(
+            catalog(vec![Factory {
+                id: "demo.consumer",
+                needs_dep: true,
+                record: None,
+            }]),
+            config(vec![EntryOptions::new("consumer", "demo.consumer")]),
+        )
+        .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        loader
+            .await_idle()
+            .await
+            .unwrap()
+            .entry("consumer")
+            .unwrap()
+            .state,
+        Some(FiberState::Pending)
+    );
+    let mut events = loader.subscribe().unwrap();
+
+    runtime
+        .root()
+        .plugin(Arc::new(TestPlugin {
+            id: "demo.dep",
+            needs_dep: false,
+            record: None,
+        }))
+        .await
+        .unwrap();
+
+    let snapshot = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            let LoaderEvent::SnapshotChanged { .. } = events.recv().await.unwrap();
+            let snapshot = loader.await_idle().await.unwrap();
+            if snapshot.entry("consumer").unwrap().state == Some(FiberState::Active) {
+                return snapshot;
+            }
+        }
+    })
+    .await
+    .expect("managed fiber became active");
+    assert_eq!(
+        snapshot.entry("consumer").unwrap().state,
+        Some(FiberState::Active)
+    );
+    runtime.shutdown().await.unwrap();
+}
+
 fn dep_catalog() -> ExtensionCatalog {
     catalog(vec![
         Factory {

@@ -16,7 +16,7 @@ use crate::{
         EventKey, ListenMeta, ListenOptions, Next, ParallelKey, SerialKey, Unsubscribe,
         WaterfallKey,
     },
-    fiber::{Fiber, FiberInner, FiberState},
+    fiber::{Fiber, FiberInner, FiberState, FiberStateChange},
     isolation::IsolationLabel,
     logger::{LOGGER_CONFIG, LogExporter, LogLevel, Logger, LoggerService},
     plugin::{Plugin, PluginKey, read_metadata},
@@ -395,6 +395,15 @@ impl Context {
             Err(error) => return Err(error),
         }
         Ok(Fiber { inner })
+    }
+
+    /// 订阅当前 Runtime 中 Plugin Fiber 的生命周期转换。
+    ///
+    /// 接收滞后时，订阅者必须从自己的事实来源重新读取状态，而不能以事件流重建。
+    pub fn subscribe_fiber_states(
+        &self,
+    ) -> Result<tokio::sync::broadcast::Receiver<FiberStateChange>, CoreError> {
+        Ok(self.registry()?.subscribe_fiber_states())
     }
 
     /// 订阅类型化事件；订阅归属当前 EffectScope。

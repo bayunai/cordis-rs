@@ -10,7 +10,7 @@ use crate::{
     tree::{RuntimeTree, aggregate_snapshot, canonicalize_existing, resolve_include_path},
 };
 use async_trait::async_trait;
-use cordis_core::{Context, CoreError, Fiber, Plugin, PluginKey};
+use cordis_core::{Context, CoreError, Fiber, FiberState, Plugin, PluginKey};
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
@@ -19,7 +19,7 @@ use std::{
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
-use tokio::sync::broadcast;
+use tokio::sync::{Notify, broadcast};
 
 /// Loader 维护的运行时条目槽位；禁用或等待重挂载时可暂时没有 Fiber。
 pub(crate) struct RuntimeEntry {
@@ -99,6 +99,7 @@ impl LoaderPlugin {
             alive: AtomicBool::new(true),
             events,
             change_revision: AtomicU64::new(0),
+            state_progress: Notify::new(),
             initial: Mutex::new(Some(config)),
         });
         *root.loader.lock().expect("loader weak") = Arc::downgrade(&inner);
@@ -116,6 +117,26 @@ impl Plugin for LoaderPlugin {
         self.state.lock().expect("loader plugin state").take();
         let inner = self.initial_state(ctx.clone());
         ctx.provide(LOADER, Loader::new(inner.clone()))?;
+        let mut fiber_states = ctx.subscribe_fiber_states()?;
+        let state_inner = inner.clone();
+        let state_task = tokio::spawn(async move {
+            loop {
+                match fiber_states.recv().await {
+                    Ok(change) => state_inner.observe_fiber_state(change.fiber_id),
+                    // 事件流只用于失效通知；滞后时重新投影完整快照即可。
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        state_inner.publish_snapshot_changed();
+                        state_inner.state_progress.notify_waiters();
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+                if !state_inner.alive.load(Ordering::Acquire) {
+                    break;
+                }
+            }
+        });
+        ctx.effect_named("loader-fiber-events")?
+            .on_dispose(move || state_task.abort());
         ctx.effect_named("loader-state")?.on_dispose({
             let inner = inner.clone();
             move || inner.alive.store(false, Ordering::Release)
@@ -143,6 +164,7 @@ pub(crate) struct LoaderInner {
     pub(crate) alive: AtomicBool,
     pub(crate) events: broadcast::Sender<LoaderEvent>,
     change_revision: AtomicU64,
+    state_progress: Notify,
     initial: Mutex<Option<ExtensionsConfig>>,
 }
 
@@ -157,25 +179,78 @@ pub(crate) struct SubtreeRegistry {
 
 impl LoaderInner {
     pub(crate) async fn await_idle_all(self: &Arc<Self>) -> Result<LoaderSnapshot, LoaderError> {
-        let _ = self.root.await_idle().await?;
-        let subtrees: Vec<_> = self
-            .subtrees
-            .lock()
-            .expect("subtree registry")
-            .by_prefix
-            .values()
-            .cloned()
-            .collect();
-        for tree in subtrees {
-            let _ = tree.await_idle().await?;
+        loop {
+            let state_progress = self.state_progress.notified();
+            tokio::pin!(state_progress);
+            state_progress.as_mut().enable();
+
+            let _ = self.root.await_idle().await?;
+            for tree in self.runtime_trees() {
+                let _ = tree.await_idle().await?;
+            }
+            if !self.has_transient_fibers() {
+                return Ok(self.aggregate_snapshot());
+            }
+            state_progress.await;
         }
-        Ok(self.aggregate_snapshot())
     }
 
     /// 发布运行树快照失效通知；消费者必须重新读取完整快照。
     pub(crate) fn publish_snapshot_changed(&self) {
         let revision = self.change_revision.fetch_add(1, Ordering::AcqRel) + 1;
         let _ = self.events.send(LoaderEvent::SnapshotChanged { revision });
+    }
+
+    /// 只观察本 Loader 条目树中的 Fiber；无关 Runtime 工作不会影响 Loader 稳定边界。
+    fn observe_fiber_state(&self, fiber_id: u64) {
+        if !self.manages_fiber(fiber_id) {
+            return;
+        }
+        self.publish_snapshot_changed();
+        self.state_progress.notify_waiters();
+    }
+
+    fn runtime_trees(&self) -> Vec<Arc<RuntimeTree>> {
+        self.subtrees
+            .lock()
+            .expect("subtree registry")
+            .by_prefix
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    fn manages_fiber(&self, fiber_id: u64) -> bool {
+        self.tree_has_fiber(&self.root, fiber_id)
+            || self
+                .runtime_trees()
+                .iter()
+                .any(|tree| self.tree_has_fiber(tree, fiber_id))
+    }
+
+    fn has_transient_fibers(&self) -> bool {
+        self.tree_has_transient_fibers(&self.root)
+            || self
+                .runtime_trees()
+                .iter()
+                .any(|tree| self.tree_has_transient_fibers(tree))
+    }
+
+    fn tree_has_fiber(&self, tree: &RuntimeTree, fiber_id: u64) -> bool {
+        tree.entries.lock().expect("entries").values().any(|entry| {
+            entry
+                .fiber
+                .as_ref()
+                .is_some_and(|fiber| fiber.id() == fiber_id)
+        })
+    }
+
+    fn tree_has_transient_fibers(&self, tree: &RuntimeTree) -> bool {
+        tree.entries.lock().expect("entries").values().any(|entry| {
+            entry.fiber.as_ref().is_some_and(|fiber| {
+                matches!(fiber.state(), FiberState::Loading | FiberState::Unloading)
+            })
+        })
     }
 
     pub(crate) fn aggregate_snapshot(&self) -> LoaderSnapshot {
