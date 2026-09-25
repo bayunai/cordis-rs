@@ -12,6 +12,7 @@ use std::{
     fs,
     sync::{Arc, Mutex},
 };
+use tokio::sync::oneshot;
 
 static DEP: ServiceKey<()> = ServiceKey::new("loader.tree.dep@1");
 static VALUE: ServiceKey<String> = ServiceKey::new("loader.tree.value@1");
@@ -70,6 +71,105 @@ impl ExtensionFactory for Factory {
             id: self.id,
             needs_dep: self.needs_dep,
             record: self.record.clone(),
+        }))
+    }
+}
+
+struct GatedLoadingFactory {
+    entered: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+    release: Arc<Mutex<Option<oneshot::Receiver<()>>>>,
+}
+
+struct GatedLoadingPlugin {
+    entered: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+    release: Arc<Mutex<Option<oneshot::Receiver<()>>>>,
+}
+
+#[async_trait]
+impl Plugin for GatedLoadingPlugin {
+    fn key(&self) -> PluginKey {
+        PluginKey::new("demo.gated-loading")
+    }
+
+    fn inject(&self) -> Vec<cordis_core::ServiceId> {
+        vec![DEP.id()]
+    }
+
+    async fn apply(&self, _: &Context) -> Result<(), CoreError> {
+        if let Some(sender) = self.entered.lock().expect("loading entered").take() {
+            let _ = sender.send(());
+        }
+        let receiver = self.release.lock().expect("loading release").take();
+        if let Some(receiver) = receiver {
+            let _ = receiver.await;
+        }
+        Ok(())
+    }
+}
+
+impl ExtensionFactory for GatedLoadingFactory {
+    type Config = Empty;
+
+    fn id(&self) -> &'static str {
+        "demo.gated-loading"
+    }
+
+    fn build(&self, _: Empty) -> Result<Arc<dyn Plugin>, LoaderError> {
+        Ok(Arc::new(GatedLoadingPlugin {
+            entered: self.entered.clone(),
+            release: self.release.clone(),
+        }))
+    }
+}
+
+struct GatedUnloadingFactory {
+    entered: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+    release: Arc<Mutex<Option<oneshot::Receiver<()>>>>,
+}
+
+struct GatedUnloadingPlugin {
+    entered: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+    release: Arc<Mutex<Option<oneshot::Receiver<()>>>>,
+}
+
+#[async_trait]
+impl Plugin for GatedUnloadingPlugin {
+    fn key(&self) -> PluginKey {
+        PluginKey::new("demo.gated-unloading")
+    }
+
+    fn inject(&self) -> Vec<cordis_core::ServiceId> {
+        vec![DEP.id()]
+    }
+
+    async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
+        let entered = self.entered.clone();
+        let release = self.release.clone();
+        ctx.effect()?.on_dispose_async(move || async move {
+            if let Some(sender) = entered.lock().expect("unloading entered").take() {
+                let _ = sender.send(());
+            }
+            let receiver = release.lock().expect("unloading release").take();
+            if let Some(receiver) = receiver {
+                let _ = receiver.await;
+            }
+            Ok(())
+        })?;
+        Ok(())
+    }
+}
+
+impl ExtensionFactory for GatedUnloadingFactory {
+    type Config = Empty;
+
+    fn id(&self) -> &'static str {
+        "demo.gated-unloading"
+    }
+
+    fn build(&self, _: Empty) -> Result<Arc<dyn Plugin>, LoaderError> {
+        Ok(Arc::new(GatedUnloadingPlugin {
+            entered: self.entered.clone(),
+            release: self.release.clone(),
         }))
     }
 }
@@ -212,6 +312,174 @@ async fn managed_fiber_activation_after_external_provider_invalidates_snapshot()
     assert_eq!(
         snapshot.entry("consumer").unwrap().state,
         Some(FiberState::Active)
+    );
+    runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn await_idle_waits_for_managed_loading_fiber() {
+    let (entered_tx, entered_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    let mut entry = EntryOptions::new("consumer", "demo.gated-loading");
+    entry.disabled = true;
+    let mut catalog = ExtensionCatalog::new();
+    catalog
+        .register(GatedLoadingFactory {
+            entered: Arc::new(Mutex::new(Some(entered_tx))),
+            release: Arc::new(Mutex::new(Some(release_rx))),
+        })
+        .unwrap();
+    let (runtime, _loader_fiber, loader, _directory, _extensions) =
+        mount_with_file(catalog, vec![entry]).await;
+    let _provider = runtime
+        .root()
+        .plugin(Arc::new(TestPlugin {
+            id: "demo.dep",
+            needs_dep: false,
+            record: None,
+        }))
+        .await
+        .unwrap();
+
+    let update = tokio::spawn({
+        let loader = loader.clone();
+        async move {
+            loader
+                .update(
+                    "consumer",
+                    EntryUpdate {
+                        disabled: Some(false),
+                        ..Default::default()
+                    },
+                    None,
+                    None,
+                )
+                .await
+        }
+    });
+    entered_rx.await.expect("managed plugin entered apply");
+
+    let mut idle = Box::pin(loader.await_idle());
+    tokio::select! {
+        result = &mut idle => panic!("await_idle returned while Fiber was Loading: {result:?}"),
+        _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
+    }
+
+    let _ = release_tx.send(());
+    update.await.expect("update task").expect("enable entry");
+    let snapshot = idle.await.expect("await idle");
+    assert_eq!(
+        snapshot.entry("consumer").unwrap().state,
+        Some(FiberState::Active)
+    );
+    runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn await_idle_waits_for_managed_unloading_fiber() {
+    let (entered_tx, entered_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    let mut catalog = ExtensionCatalog::new();
+    catalog
+        .register(GatedUnloadingFactory {
+            entered: Arc::new(Mutex::new(Some(entered_tx))),
+            release: Arc::new(Mutex::new(Some(release_rx))),
+        })
+        .unwrap();
+
+    let runtime = Runtime::new().unwrap();
+    let provider = runtime.root().effect_named("provider").unwrap();
+    provider.provide(DEP, ()).unwrap();
+    let root = runtime.root();
+    let loader_fiber = root
+        .plugin(Arc::new(
+            LoaderPlugin::new(
+                catalog,
+                config(vec![EntryOptions::new("consumer", "demo.gated-unloading")]),
+            )
+            .unwrap(),
+        ))
+        .await
+        .unwrap();
+    let loader = (*root.get(LOADER).unwrap()).clone();
+    assert_eq!(
+        loader
+            .await_idle()
+            .await
+            .unwrap()
+            .entry("consumer")
+            .unwrap()
+            .state,
+        Some(FiberState::Active)
+    );
+
+    provider.dispose();
+    entered_rx.await.expect("managed plugin entered disposer");
+    let mut idle = Box::pin(loader.await_idle());
+    tokio::select! {
+        result = &mut idle => panic!("await_idle returned while Fiber was Unloading: {result:?}"),
+        _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
+    }
+
+    let _ = release_tx.send(());
+    provider.dispose_wait().await.unwrap();
+    let snapshot = idle.await.expect("await idle");
+    assert_eq!(
+        snapshot.entry("consumer").unwrap().state,
+        Some(FiberState::Pending)
+    );
+    let mut loader_fiber = loader_fiber;
+    loader_fiber.dispose_wait().await.unwrap();
+    runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn unloading_loader_stops_events_and_releases_managed_subtree() {
+    let record = Arc::new(Mutex::new(Vec::new()));
+    let child = EntryOptions::new("child", "demo.value");
+    let group = EntryOptions::group("group", vec![child]).unwrap();
+    let (runtime, mut loader_fiber, loader) = mount(
+        LoaderPlugin::new(
+            catalog(vec![Factory {
+                id: "demo.value",
+                needs_dep: false,
+                record: Some(record.clone()),
+            }]),
+            config(vec![group]),
+        )
+        .unwrap(),
+    )
+    .await;
+    loader.await_idle().await.unwrap();
+    let mut events = loader.subscribe().unwrap();
+
+    loader_fiber.dispose_wait().await.unwrap();
+    assert!(runtime.root().get(LOADER).is_err());
+    assert!(matches!(
+        loader.entries(),
+        Err(LoaderControlError::LoaderUnavailable)
+    ));
+    assert_eq!(record.lock().unwrap().as_slice(), ["demo.value"]);
+    assert!(runtime.root().get(VALUE).is_err());
+    assert!(runtime.diagnostics().plugin_fibers.iter().all(|fiber| {
+        fiber.plugin_key != "cordis.loader.group" && fiber.plugin_key != "demo.value"
+    }));
+
+    while events.try_recv().is_ok() {}
+    let mut unrelated = runtime
+        .root()
+        .plugin(Arc::new(TestPlugin {
+            id: "demo.unrelated",
+            needs_dep: false,
+            record: None,
+        }))
+        .await
+        .unwrap();
+    unrelated.dispose_wait().await.unwrap();
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), events.recv())
+            .await
+            .is_err()
     );
     runtime.shutdown().await.unwrap();
 }
