@@ -8,14 +8,14 @@ repository.workspace = true
 homepage.workspace = true
 documentation.workspace = true
 readme.workspace = true
-description = "Thin application host shell for cordis-loader."
+description = "Thin application host shell for cordis-core runtimes."
 
 [dependencies]
 cordis-core.workspace = true
-cordis-loader.workspace = true
 
 [dev-dependencies]
 async-trait.workspace = true
+cordis-loader.workspace = true
 cordis-plugin-logger-console.workspace = true
 cordis-plugin-timer.workspace = true
 schemars.workspace = true

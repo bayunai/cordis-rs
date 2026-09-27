@@ -2,8 +2,7 @@
 //!
 //! LoaderPlugin 由应用入口显式挂载；此 crate 不假定某个插件一定存在。
 
-use cordis_core::{Context, Runtime};
-use cordis_loader::LoaderError;
+use cordis_core::{Context, CoreError, Runtime};
 
 /// 应用进程的薄 Host。
 ///
@@ -16,9 +15,9 @@ pub struct CordisHost {
 
 impl CordisHost {
     /// 创建应用唯一的 Runtime。
-    pub fn new() -> Result<Self, LoaderError> {
+    pub fn new() -> Result<Self, CoreError> {
         Ok(Self {
-            runtime: Runtime::new().map_err(|source| LoaderError::Runtime { source })?,
+            runtime: Runtime::new()?,
         })
     }
 
@@ -33,10 +32,7 @@ impl CordisHost {
     }
 
     /// 关闭 Runtime 及其全部根插件。
-    pub async fn shutdown(self) -> Result<(), LoaderError> {
-        self.runtime
-            .shutdown()
-            .await
-            .map_err(|source| LoaderError::Runtime { source })
+    pub async fn shutdown(self) -> Result<(), CoreError> {
+        self.runtime.shutdown().await
     }
 }
