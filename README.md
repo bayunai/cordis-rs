@@ -126,7 +126,7 @@ cargo run -p cordis-host --example host_bootstrap
 
 ## 开发
 
-需要 Rust `1.98.1` 或更高版本：
+需要 Rust `1.99.0` 或更高版本：
 
 ```bash
 cargo fmt --check
