@@ -85,6 +85,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## 示例与文档
 
+- [`volatile_config`](crates/cordis-loader/examples/volatile_config.rs)：类型化热配置、Effect 托管订阅与普通配置替换。运行 `cargo run -p cordis-loader --example volatile_config`。
+
 - [`reactive`](examples/reactive.rs)：最小服务注入与响应式重算。
 - [`plugin_hotplug`](examples/plugin_hotplug.rs)：插件替换与卸载。
 - [`plugin_web`](examples/plugin_web.rs)：将运行时能力接入 HTTP 示例。

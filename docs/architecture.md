@@ -93,12 +93,25 @@ Context::plugin(Arc<dyn Plugin>)
 - **首次 `plugin()`**：调用方在返回 Handle 前取消 wait → 协调器撤销临时 Scope、注销 Fiber，视为从未成功挂载。
 - **`restart()` / `replace()`**：一旦开始（`replace` 在候选 `key()`/`inject()` 预检成功后即提交），调用方取消不回滚；协调器继续完成卸载与后续重激活。
 - Provider 变化、`restart()` 与 `replace()` 都先经历 `Active → Unloading → Pending → Loading → Active`：Core 取消并等待旧 Effect 的受控任务退出后，才允许下一次 `apply()`。
-- 配置更新固定为：宿主读取并校验配置 → 构造新的不可变 Plugin 实例 → `Fiber::replace`（Core **无** `update(json)`）。
+- 普通配置更新为：宿主读取并校验配置 → 构造新的不可变 Plugin 实例 → `Fiber::replace`（Core **无** `update(json)`）。Loader 的 `VolatileExtensionFactory` 可将热参数独立为 `ConfigRef<Live>`；仅热部分变化时校验并原子提交快照，保留 Active Fiber。热引用和更新策略属于 Loader，Core 不保存可变插件配置。
 - 配置无效：宿主记录配置错误，**不得调用** `replace`；旧 Active 实例继续运行。
 - 新实例 `apply` 失败：旧实例已释放，Fiber 进入 `Failed`；Core 不回滚配置或恢复旧实例。
 - `restart()` 只用于配置未变时的重新执行、依赖变化或人工恢复，禁止作为可变配置更新入口。
 
 `Context::inject` 仍返回 `InjectionHandle`（派生依赖），与 Plugin Fiber 分开诊断。
+
+### Factory 接口设计备注
+
+Factory 是静态 Loader 的必要构造边界：Catalog 根据条目 `name` 找到 Factory，将配置
+解析、校验并构造为 `Plugin`；Core 只负责挂载和生命周期，不认识业务配置或插件发现。
+因此 Factory 本身不是冗余，也不应将这部分逻辑散回应用入口。
+
+当前 `ExtensionFactory` 与 `VolatileExtensionFactory` 分别表达普通配置替换和类型化热配置，
+`register()` / `register_volatile()` 是对应登记入口。双接口避免普通插件实现无意义的热配置
+类型和 `split()`，但也存在相似的接口结构与登记样板。
+
+后续可评估统一 Factory，并把热配置作为显式可选能力；前提是减少真实样板、不要求普通插件
+编写空热配置，也不将业务配置解析移入 Core。当前仅记录此收敛方向，不新增占位接口或兼容层。
 
 ### Provider 就绪状态
 

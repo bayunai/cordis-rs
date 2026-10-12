@@ -98,6 +98,8 @@ pub enum LoaderError {
     NoConfigSource,
     #[error("Loader reconcile 正在执行；同一时刻只允许一个编排操作")]
     ReconcileBusy,
+    #[error("实例 {instance} 在热配置提交前已离开原 Active Fiber")]
+    HotConfigStale { instance: String },
     #[error("Loader reconcile 协调器异常终止: {reason}")]
     ReconcileAborted { reason: String },
     #[error("配置文件已被其他树附着: {path}", path = path.display())]

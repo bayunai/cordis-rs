@@ -3,7 +3,33 @@
 面向在宿主中挂载的 `Plugin` 作者。Core 只提供挂载与 Fiber 生命周期；
 [`cordis-loader`](host.md) 负责显式 Factory 注册、EntryTree 配置校验与生命周期编排。
 
-## 最小 Plugin
+## 类型化热配置
+
+需要保留连接、服务和 Effect 而动态调整参数时，使用 `cordis_loader::VolatileExtensionFactory`
+并由 Catalog 调用 `register_volatile(factory)`。`Config` 是正常的 `Deserialize + JsonSchema`
+输入类型；`split()` 校验全部字段并返回普通配置 `Static` 与热配置 `Live`。
+`Static` 需要 `Clone + PartialEq`，以同一份已校验值构造插件并保存比较基准；`Live` 只需
+`PartialEq`。两者还须满足 `Send + Sync + 'static`。
+
+`build(static_config, ConfigRef<Live>)` 将只读引用交给插件。每次请求先调用一次 `get()`，
+使用返回快照中的全部字段，避免在一次操作中混用不同版本。引用本身不可写；热值由 Loader
+校验后整体原子替换。配置类型应使用普通不可变数据，不在其中放置业务可变状态。
+
+主动响应更新时，在自身 `ctx.effect()?.spawn(...)` 受管任务中等待
+`reference.subscribe().changed()`，同时观察任务的 cancellation token。
+订阅允许合并更新，`current()`/`get()` 返回最新值；Loader 不等待业务调整完成。
+Entry 释放后订阅返回 `ConfigClosed`，旧引用仍可读取最后快照。依赖暂时不可用导致的
+卸载/恢复不创建新引用，但非 Active 实例的配置更新会通过替换处理。
+
+普通配置变化必须重建插件；混合变化将完整候选值交给新插件，不先修改旧插件热值。
+需要关闭连接、修改服务依赖或重建 Context 的参数应归普通配置，而不是 `Live`。
+完整示例见 [`volatile_config`](../crates/cordis-loader/examples/volatile_config.rs)：
+
+```bash
+cargo run -p cordis-loader --example volatile_config
+```
+
+## 最小 Plugin 示例
 
 ```rust
 use async_trait::async_trait;

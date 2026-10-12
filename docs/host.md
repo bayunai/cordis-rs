@@ -74,6 +74,18 @@ disabled = true
 `name` 只匹配应用在 `host/catalog.rs` 编译期注册的 `ExtensionFactory`，不会加载动态库或第三方模块。
 `Loader::factories()` 返回业务 Factory 的 JSON Schema。
 
+支持热配置的包显式使用 `register_volatile()`。其完整输入 Schema 与普通 Factory 一样
+供管理界面使用；`ConfigRef`、revision 和写入端不进入 TOML 或 Schema。
+所有根树和 Include 子树的 `update/reload` 都经过相同的预检与局部 reconcile。
+仅普通配置相同、热配置变化且原 Fiber 仍 Active、上下文未变化时，才原地提交；
+所有生命周期操作成功后再提交热值，提交前再次核对 Fiber 身份与绑定。
+失败时目标配置与文件 revision 不提交；已经发生的生命周期操作或热提交不回滚。
+写回失败沿用 `Persist`，明确报告已生效、未保存。
+
+热配置 revision 从零开始，仅实际值变化递增。替换、禁用恢复、移动或 Group 重建为新实例
+创建新引用；无关条目不受影响。`await_idle()` 仅等待 Loader 完成提交，不等待订阅者。
+不自动监听文件；将来监听/HMR 插件可复用显式 reload 路径。
+
 除 Factory 外，宿主可注册可配置注入项与可隔离服务：
 
 ```rust

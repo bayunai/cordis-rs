@@ -254,6 +254,7 @@ version = "0.2.0"
 dependencies = [
  "async-trait",
  "cordis-core",
+ "cordis-plugin-include",
  "cordis-testkit",
  "schemars",
  "serde",

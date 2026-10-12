@@ -1,5 +1,6 @@
 //! 静态 Factory、可配置注入与服务隔离目录。
 
+use crate::volatile::{ConfigRef, ConfigSnapshot, channel};
 use crate::{
     config::{IsolateConfig, IsolateValue},
     error::{LoaderError, format_panic_message},
@@ -9,10 +10,131 @@ use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 use serde_json::Value as JsonValue;
 use std::{
+    any::Any,
     collections::HashMap,
     panic::{AssertUnwindSafe, catch_unwind},
     sync::Arc,
 };
+
+/// 显式选择原地热更新的 Factory。`split` 必须完成全部业务校验。
+pub trait VolatileExtensionFactory: Send + Sync + 'static {
+    type Config: DeserializeOwned + JsonSchema + Send + Sync + 'static;
+    type Static: Clone + PartialEq + Send + Sync + 'static;
+    type Live: PartialEq + Send + Sync + 'static;
+    fn id(&self) -> &'static str;
+    fn split(&self, config: Self::Config) -> Result<(Self::Static, Self::Live), LoaderError>;
+    fn build(
+        &self,
+        config: Self::Static,
+        live: ConfigRef<Self::Live>,
+    ) -> Result<Arc<dyn Plugin>, LoaderError>;
+}
+
+pub(crate) trait VolatileBinding: Any + Send + Sync {
+    fn as_any(&self) -> &dyn Any;
+}
+
+struct Binding<S, L> {
+    settings: S,
+    sender: tokio::sync::watch::Sender<ConfigSnapshot<L>>,
+}
+impl<S: Send + Sync + 'static, L: Send + Sync + 'static> VolatileBinding for Binding<S, L> {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+pub(crate) enum FactoryBuild {
+    Plugin {
+        plugin: Arc<dyn Plugin>,
+        binding: Option<Arc<dyn VolatileBinding>>,
+    },
+    Hot {
+        binding: Arc<dyn VolatileBinding>,
+        commit: Option<Box<dyn FnOnce() + Send>>,
+    },
+}
+
+struct VolatileFactoryAdapter<F> {
+    factory: F,
+}
+impl<F: VolatileExtensionFactory> ErasedExtensionFactory for VolatileFactoryAdapter<F> {
+    fn build(
+        &self,
+        config: &toml::Value,
+        current: Option<&Arc<dyn VolatileBinding>>,
+    ) -> Result<FactoryBuild, LoaderError> {
+        let config = parse_config::<F::Config>(config, self.factory.id())?;
+        let (settings, live) = self.factory.split(config)?;
+        let live = Arc::new(live);
+        if let Some(binding) = current {
+            let typed = binding
+                .as_any()
+                .downcast_ref::<Binding<F::Static, F::Live>>()
+                .expect("registered Factory binding type");
+            if settings == typed.settings {
+                let old = typed.sender.borrow().clone();
+                if *old.value == *live {
+                    return Ok(FactoryBuild::Hot {
+                        binding: binding.clone(),
+                        commit: None,
+                    });
+                }
+                let revision = old
+                    .revision
+                    .checked_add(1)
+                    .ok_or_else(|| LoaderError::invalid_config("hot config revision exhausted"))?;
+                let binding = binding.clone();
+                let retained = binding.clone();
+                return Ok(FactoryBuild::Hot {
+                    binding,
+                    commit: Some(Box::new(move || {
+                        let typed = retained
+                            .as_any()
+                            .downcast_ref::<Binding<F::Static, F::Live>>()
+                            .expect("registered Factory binding type");
+                        typed.sender.send_replace(ConfigSnapshot {
+                            revision,
+                            value: live,
+                        });
+                    })),
+                });
+            }
+        }
+        let retained_settings = settings.clone();
+        let (sender, reference) = channel(live);
+        let plugin = self.factory.build(settings, reference)?;
+        Ok(FactoryBuild::Plugin {
+            plugin,
+            binding: Some(Arc::new(Binding {
+                settings: retained_settings,
+                sender,
+            })),
+        })
+    }
+    fn descriptor(&self, id: &'static str) -> Result<FactoryDescriptor, LoaderError> {
+        schema_descriptor::<F::Config>(id)
+    }
+}
+
+fn parse_config<T: DeserializeOwned>(config: &toml::Value, id: &str) -> Result<T, LoaderError> {
+    config
+        .clone()
+        .try_into()
+        .map_err(|error| LoaderError::invalid_config(format!("factory `{id}` config: {error}")))
+}
+
+fn schema_descriptor<T: JsonSchema>(id: &'static str) -> Result<FactoryDescriptor, LoaderError> {
+    serde_json::to_value(schemars::schema_for!(T))
+        .map(|schema| FactoryDescriptor {
+            id: id.into(),
+            schema,
+        })
+        .map_err(|error| LoaderError::FactorySchema {
+            factory: id.into(),
+            message: error.to_string(),
+        })
+}
 
 type InjectionValidator = Arc<dyn Fn(&toml::Value) -> Result<(), String> + Send + Sync>;
 type InjectionApplier = Arc<dyn Fn(Context, &toml::Value) -> Result<Context, String> + Send + Sync>;
@@ -28,29 +150,30 @@ pub trait ExtensionFactory: Send + Sync + 'static {
 }
 
 pub(crate) trait ErasedExtensionFactory: Send + Sync {
-    fn build(&self, config: &toml::Value) -> Result<Arc<dyn Plugin>, LoaderError>;
+    fn build(
+        &self,
+        config: &toml::Value,
+        current: Option<&Arc<dyn VolatileBinding>>,
+    ) -> Result<FactoryBuild, LoaderError>;
     fn descriptor(&self, id: &'static str) -> Result<FactoryDescriptor, LoaderError>;
 }
 struct FactoryAdapter<F> {
     factory: F,
 }
 impl<F: ExtensionFactory> ErasedExtensionFactory for FactoryAdapter<F> {
-    fn build(&self, config: &toml::Value) -> Result<Arc<dyn Plugin>, LoaderError> {
-        let config = config.clone().try_into::<F::Config>().map_err(|error| {
-            LoaderError::invalid_config(format!("factory `{}` config: {error}", self.factory.id()))
-        })?;
-        self.factory.build(config)
+    fn build(
+        &self,
+        config: &toml::Value,
+        _: Option<&Arc<dyn VolatileBinding>>,
+    ) -> Result<FactoryBuild, LoaderError> {
+        let config = parse_config::<F::Config>(config, self.factory.id())?;
+        Ok(FactoryBuild::Plugin {
+            plugin: self.factory.build(config)?,
+            binding: None,
+        })
     }
     fn descriptor(&self, id: &'static str) -> Result<FactoryDescriptor, LoaderError> {
-        serde_json::to_value(schemars::schema_for!(F::Config))
-            .map(|schema| FactoryDescriptor {
-                id: id.into(),
-                schema,
-            })
-            .map_err(|error| LoaderError::FactorySchema {
-                factory: id.into(),
-                message: error.to_string(),
-            })
+        schema_descriptor::<F::Config>(id)
     }
 }
 
@@ -181,11 +304,35 @@ impl ExtensionCatalog {
                 message: format_panic_message("extension factory id", payload),
             }
         })?;
+        self.register_erased(id, Arc::new(FactoryAdapter { factory }))
+    }
+
+    pub fn register_volatile<F: VolatileExtensionFactory>(
+        &mut self,
+        factory: F,
+    ) -> Result<(), LoaderError> {
+        let id = catch_unwind(AssertUnwindSafe(|| factory.id())).map_err(|payload| {
+            LoaderError::FactoryPanic {
+                message: format_panic_message("extension factory id", payload),
+            }
+        })?;
+        self.register_erased(id, Arc::new(VolatileFactoryAdapter { factory }))
+    }
+
+    fn register_erased(
+        &mut self,
+        id: &'static str,
+        factory: Arc<dyn ErasedExtensionFactory>,
+    ) -> Result<(), LoaderError> {
         if self.factories.contains_key(id) {
             return Err(LoaderError::DuplicateFactory { id: id.into() });
         }
-        let factory: Arc<dyn ErasedExtensionFactory> = Arc::new(FactoryAdapter { factory });
-        let descriptor = factory.descriptor(id)?;
+        let descriptor =
+            catch_unwind(AssertUnwindSafe(|| factory.descriptor(id))).map_err(|payload| {
+                LoaderError::FactoryPanic {
+                    message: format_panic_message("extension factory schema", payload),
+                }
+            })??;
         self.factories.insert(
             id,
             FactoryRecord {

@@ -34,6 +34,7 @@ pub(crate) struct RuntimeEntry {
     pub(crate) factory: Option<String>,
     /// 挂载时的自身配置（Group 的 children 嵌在 `config` 中，比较时单独处理）。
     pub(crate) options: crate::config::EntryOptions,
+    pub(crate) volatile: Option<Arc<dyn crate::catalog::VolatileBinding>>,
 }
 
 enum ConfigSource {
@@ -125,6 +126,7 @@ impl Plugin for LoaderPlugin {
                     Ok(change) => state_inner.observe_fiber_state(change.fiber_id),
                     // 事件流只用于失效通知；滞后时重新投影完整快照即可。
                     Err(broadcast::error::RecvError::Lagged(_)) => {
+                        state_inner.prune_disposed_bindings();
                         state_inner.publish_snapshot_changed();
                         state_inner.state_progress.notify_waiters();
                     }
@@ -139,7 +141,14 @@ impl Plugin for LoaderPlugin {
             .on_dispose(move || state_task.abort());
         ctx.effect_named("loader-state")?.on_dispose({
             let inner = inner.clone();
-            move || inner.alive.store(false, Ordering::Release)
+            move || {
+                inner.alive.store(false, Ordering::Release);
+                for tree in std::iter::once(inner.root.clone()).chain(inner.runtime_trees()) {
+                    for entry in tree.entries.lock().expect("entries").values_mut() {
+                        entry.volatile = None;
+                    }
+                }
+            }
         });
         *self.state.lock().expect("loader plugin state") = Some(inner.clone());
         let config = inner
@@ -206,8 +215,19 @@ impl LoaderInner {
         if !self.manages_fiber(fiber_id) {
             return;
         }
+        self.prune_disposed_bindings();
         self.publish_snapshot_changed();
         self.state_progress.notify_waiters();
+    }
+
+    fn prune_disposed_bindings(&self) {
+        for tree in std::iter::once(self.root.clone()).chain(self.runtime_trees()) {
+            for entry in tree.entries.lock().expect("entries").values_mut() {
+                if entry.fiber.as_ref().is_some_and(Fiber::is_disposed) {
+                    entry.volatile = None;
+                }
+            }
+        }
     }
 
     fn runtime_trees(&self) -> Vec<Arc<RuntimeTree>> {

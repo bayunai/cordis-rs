@@ -111,7 +111,7 @@ vendor/
 | 激活 | `_setEpoch` → `_reload` → 跑 plugin callback | `claim_activation` → `apply` → Active |
 | 依赖掉了 | epoch=`INACTIVE` → `_unload` → Pending | Active 且 providers 变 → unload → Pending |
 | 并发串行 | 同 Fiber 的 `inertia` | 全局 scheduler + `EffectOwnership` / handoff |
-| 配置更新 | `update(config)` | 宿主构造新实例 → `replace`（Core 无 `update(json)`） |
+| 配置更新 | `update(config)`；Schema volatile 字段可原地更新 | 普通配置构造新实例 → `replace`；Loader 的 `VolatileExtensionFactory` 原子更新 `ConfigRef<Live>`（Core 无 `update(json)`） |
 
 ### 3.3 事件 / 配置 / 隔离
 

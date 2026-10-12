@@ -1,7 +1,7 @@
 //! Entry/子树差分 reconcile：目标索引、计划与生命周期执行。
 
 use crate::{
-    catalog::ExtensionCatalog,
+    catalog::{ExtensionCatalog, FactoryBuild, VolatileBinding},
     config::{EntryOptions, ExtensionsConfig},
     error::{LoaderError, format_panic_message},
     plugin::RuntimeEntry,
@@ -13,7 +13,10 @@ use cordis_core::{Context, CoreError, FiberState, Plugin, PluginKey, ServiceId};
 use std::{
     collections::{BTreeMap, BTreeSet},
     panic::{AssertUnwindSafe, catch_unwind},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 /// 目标树节点（预检索引；Plugin 按需填充）。
@@ -23,6 +26,7 @@ pub(crate) struct DesiredNode {
     children: Vec<EntryId>,
     plugin: Option<Arc<dyn Plugin>>,
     plugin_key: Option<PluginKey>,
+    volatile: Option<Arc<dyn VolatileBinding>>,
 }
 
 pub(crate) struct ReconcilePlan {
@@ -38,6 +42,13 @@ pub(crate) struct ReconcilePlan {
     build: BTreeSet<EntryId>,
     /// 目标前序。
     desired_order: Vec<EntryId>,
+    hot: BTreeMap<EntryId, HotCommit>,
+}
+
+struct HotCommit {
+    fiber_id: u64,
+    binding: Arc<dyn VolatileBinding>,
+    commit: Box<dyn FnOnce() + Send>,
 }
 
 impl RuntimeTree {
@@ -91,6 +102,31 @@ impl RuntimeTree {
             }
         }
 
+        // 所有生命周期成功后才提交热值，不等待业务订阅者。
+        for (path, hot) in plan.hot {
+            let entries = self.entries.lock().expect("entries");
+            let current = entries.get(&path);
+            let valid = !self.owner.is_disposed()
+                && current.is_some_and(|entry| {
+                    entry.fiber.as_ref().is_some_and(|fiber| {
+                        fiber.id() == hot.fiber_id && fiber.state() == FiberState::Active
+                    }) && entry
+                        .volatile
+                        .as_ref()
+                        .is_some_and(|binding| Arc::ptr_eq(binding, &hot.binding))
+                });
+            if !valid {
+                return Err(LoaderError::HotConfigStale {
+                    instance: path.to_string(),
+                });
+            }
+            catch_unwind(AssertUnwindSafe(hot.commit)).map_err(|payload| {
+                LoaderError::FactoryPanic {
+                    message: format_panic_message("hot config commit", payload),
+                }
+            })?;
+        }
+
         // 6) 纯排序 / 最终前序
         *self.order.lock().expect("entry order") = plan.desired_order;
         Ok(self.local_snapshot())
@@ -128,6 +164,7 @@ impl RuntimeTree {
             };
             entry.enabled = false;
             entry.plugin_key = None;
+            entry.volatile = None;
             entry.fiber.take()
         };
         if let Some(mut fiber) = fiber.take() {
@@ -165,14 +202,21 @@ impl RuntimeTree {
             entry.options = node.options.clone();
             entry.fiber.take().expect("replace requires existing fiber")
         };
-        let replace_result = fiber
-            .replace(Arc::new(ConfiguredPlugin::new(plugin, dependencies)))
-            .await;
+        let replacement = Arc::new(ConfiguredPlugin::new(plugin, dependencies));
+        let replace_result = fiber.replace(replacement.clone()).await;
         let failed = fiber.state() == FiberState::Failed;
         let last_error = fiber.last_error();
         {
             let mut entries = self.entries.lock().expect("entries");
             let entry = entries.get_mut(path).expect("mounted replace target");
+            // Busy / 旧 disposer 失败时，Core 可能尚未安装候选插件。
+            // 成功返回（包括 Pending）或已进入候选 apply 才切换绑定。
+            if replace_result.is_ok() || replacement.applied.load(Ordering::Acquire) {
+                entry.volatile = node.volatile.clone();
+            }
+            if fiber.is_disposed() {
+                entry.volatile = None;
+            }
             if replace_result.is_ok() && !failed {
                 entry.plugin_key = node.plugin_key;
             }
@@ -219,7 +263,10 @@ impl RuntimeTree {
 
         let stale = {
             let mut entries = self.entries.lock().expect("entries");
-            entries.get_mut(path).and_then(|entry| entry.fiber.take())
+            entries.get_mut(path).and_then(|entry| {
+                entry.volatile = None;
+                entry.fiber.take()
+            })
         };
         if let Some(mut fiber) = stale {
             fiber
@@ -296,6 +343,7 @@ impl RuntimeTree {
                 context,
                 factory: (!node.options.group).then(|| node.options.name.clone()),
                 options: node.options.clone(),
+                volatile: enabled.then(|| node.volatile.clone()).flatten(),
             },
         );
         drop(entries);
@@ -357,6 +405,7 @@ fn index_entries(
                 children,
                 plugin: None,
                 plugin_key: None,
+                volatile: None,
             },
         );
     }
@@ -510,6 +559,7 @@ pub(crate) fn plan_reconcile(
         mount,
         build,
         desired_order,
+        hot: BTreeMap::new(),
     })
 }
 
@@ -598,22 +648,76 @@ fn preorder_from_desired(
 pub(crate) fn build_plan_plugins(
     catalog: &ExtensionCatalog,
     desired: &mut BTreeMap<EntryId, DesiredNode>,
-    plan: &ReconcilePlan,
+    plan: &mut ReconcilePlan,
     mounted: &Mutex<BTreeMap<EntryId, RuntimeEntry>>,
 ) -> Result<(), LoaderError> {
     let mounted = mounted.lock().expect("entries");
-    for path in &plan.build {
+    let mut candidates = plan.build.clone();
+    for (path, entry) in mounted.iter() {
+        if entry.volatile.is_some()
+            && desired.contains_key(path)
+            && !plan.remove.contains(path)
+            && !plan.mount.contains(path)
+            && !plan.dispose_fiber.contains(path)
+            && entry
+                .fiber
+                .as_ref()
+                .is_some_and(|fiber| fiber.state() == FiberState::Active)
+        {
+            candidates.insert(path.clone());
+        }
+    }
+    for path in &candidates {
         let node = desired.get_mut(path).expect("build target");
         let factory = catalog.get(&node.options.name).expect("validated factory");
-        let plugin = catch_unwind(AssertUnwindSafe(|| factory.build(&node.options.config)))
-            .map_err(|payload| LoaderError::FactoryPanic {
-                message: format_panic_message("extension factory build", payload),
-            })?
-            .map_err(|error| LoaderError::PluginBuild {
-                instance: path.to_string(),
-                factory: node.options.name.clone(),
-                message: error.to_string(),
-            })?;
+        let current = mounted.get(path).filter(|entry| {
+            !plan.mount.contains(path)
+                && !plan.dispose_fiber.contains(path)
+                && !plan.remove.contains(path)
+                && entry
+                    .fiber
+                    .as_ref()
+                    .is_some_and(|fiber| fiber.state() == FiberState::Active)
+        });
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            factory.build(
+                &node.options.config,
+                current.and_then(|entry| entry.volatile.as_ref()),
+            )
+        }))
+        .map_err(|payload| LoaderError::FactoryPanic {
+            message: format_panic_message("extension factory build", payload),
+        })?
+        .map_err(|error| LoaderError::PluginBuild {
+            instance: path.to_string(),
+            factory: node.options.name.clone(),
+            message: error.to_string(),
+        })?;
+        let (plugin, binding) = match result {
+            FactoryBuild::Hot { binding, commit } => {
+                let fiber_id = current
+                    .and_then(|entry| entry.fiber.as_ref())
+                    .expect("hot active fiber")
+                    .id();
+                plan.replace.remove(path);
+                if let Some(commit) = commit {
+                    plan.hot.insert(
+                        path.clone(),
+                        HotCommit {
+                            fiber_id,
+                            binding,
+                            commit,
+                        },
+                    );
+                }
+                continue;
+            }
+            FactoryBuild::Plugin { plugin, binding } => (plugin, binding),
+        };
+        // Binding 不同但原始 options 相同仍必须替换（失败后的实际配置差分）。
+        if !plan.mount.contains(path) {
+            plan.replace.insert(path.clone());
+        }
         let plugin_key = catch_unwind(AssertUnwindSafe(|| plugin.key())).map_err(|payload| {
             LoaderError::PluginPanic {
                 message: format_panic_message("plugin key", payload),
@@ -633,6 +737,7 @@ pub(crate) fn build_plan_plugins(
         }
         node.plugin = Some(plugin);
         node.plugin_key = Some(plugin_key);
+        node.volatile = binding;
     }
     Ok(())
 }
@@ -693,6 +798,7 @@ impl Plugin for GroupPlugin {
 struct ConfiguredPlugin {
     inner: Arc<dyn Plugin>,
     dependencies: Vec<ServiceId>,
+    applied: AtomicBool,
 }
 
 impl ConfiguredPlugin {
@@ -700,6 +806,7 @@ impl ConfiguredPlugin {
         Self {
             inner,
             dependencies,
+            applied: AtomicBool::new(false),
         }
     }
 }
@@ -721,6 +828,7 @@ impl Plugin for ConfiguredPlugin {
     }
 
     async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
+        self.applied.store(true, Ordering::Release);
         self.inner.apply(ctx).await
     }
 }

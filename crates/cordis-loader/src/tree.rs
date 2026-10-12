@@ -166,11 +166,11 @@ impl RuntimeTree {
             Some(self.prefix.as_str())
         };
         let (mut desired, roots) = index_desired_tree(&self.catalog, &config, prefix)?;
-        let plan = {
+        let mut plan = {
             let entries = self.entries.lock().expect("entries");
             plan_reconcile(&entries, &desired, &roots)?
         };
-        build_plan_plugins(&self.catalog, &mut desired, &plan, &self.entries)?;
+        build_plan_plugins(&self.catalog, &mut desired, &mut plan, &self.entries)?;
         let completion = {
             let mut slot = self.reconcile.lock().expect("reconcile slot");
             if slot.is_some() {
