@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use cordis_core::{Context, CoreError, Plugin, PluginKey, ServiceKey};
-use cordis_loader::{ExtensionFactory, LoaderError};
+use cordis_loader::{ExtensionFactory, LoaderError, PreparedExtension};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use std::sync::Arc;
@@ -25,9 +25,11 @@ impl ExtensionFactory for GreetingFactory {
         "demo.greeting"
     }
 
-    fn build(&self, config: GreetingConfig) -> Result<Arc<dyn Plugin>, LoaderError> {
-        Ok(Arc::new(GreetingPlugin {
-            message: config.message,
+    fn prepare(&self, config: GreetingConfig) -> Result<PreparedExtension, LoaderError> {
+        Ok(PreparedExtension::ordinary(move || {
+            Ok(Arc::new(GreetingPlugin {
+                message: config.message,
+            }))
         }))
     }
 }

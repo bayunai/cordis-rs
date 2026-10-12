@@ -5,13 +5,19 @@
 
 ## 类型化热配置
 
-需要保留连接、服务和 Effect 而动态调整参数时，使用 `cordis_loader::VolatileExtensionFactory`
-并由 Catalog 调用 `register_volatile(factory)`。`Config` 是正常的 `Deserialize + JsonSchema`
-输入类型；`split()` 校验全部字段并返回普通配置 `Static` 与热配置 `Live`。
-`Static` 需要 `Clone + PartialEq`，以同一份已校验值构造插件并保存比较基准；`Live` 只需
+所有插件统一实现 `ExtensionFactory::prepare()`，并由 Catalog 调用 `register(factory)`。
+`Config` 是正常的 `Deserialize + JsonSchema` 输入类型；`prepare()` 校验全部字段并返回
+延迟构造的 `PreparedExtension`。普通插件使用 `PreparedExtension::ordinary(build)`，无需
+空 Live、配置引用或额外划分方法。
+
+需要保留连接、服务和 Effect 而动态调整参数时，返回
+`PreparedExtension::volatile(settings, live, build)`。`settings` 需要 `Clone + PartialEq`，
+以同一份已校验值构造插件并保存比较基准；`live` 只需
 `PartialEq`。两者还须满足 `Send + Sync + 'static`。
 
-`build(static_config, ConfigRef<Live>)` 将只读引用交给插件。每次请求先调用一次 `get()`，
+热配置构造闭包接收 `(settings, ConfigRef<Live>)`，仅需要新实例时执行。
+闭包必须拥有配置及依赖，共享数据通过 `Arc` 捕获，不得借用 Factory。
+每次请求先调用一次 `get()`，
 使用返回快照中的全部字段，避免在一次操作中混用不同版本。引用本身不可写；热值由 Loader
 校验后整体原子替换。配置类型应使用普通不可变数据，不在其中放置业务可变状态。
 
@@ -127,7 +133,7 @@ ctx.logger()?.info("hello");
 
 ```rust
 use cordis_core::Plugin;
-use cordis_loader::{ExtensionFactory, LoaderError};
+use cordis_loader::{ExtensionFactory, LoaderError, PreparedExtension};
 use serde::Deserialize;
 use schemars::JsonSchema;
 use std::sync::Arc;
@@ -147,17 +153,19 @@ impl ExtensionFactory for GreeterFactory {
         "demo.greeter"
     }
 
-    fn build(&self, config: GreeterConfig) -> Result<Arc<dyn Plugin>, LoaderError> {
-        Ok(Arc::new(Greeter { name: config.name }))
+    fn prepare(&self, config: GreeterConfig) -> Result<PreparedExtension, LoaderError> {
+        Ok(PreparedExtension::ordinary(move || {
+            Ok(Arc::new(Greeter { name: config.name }))
+        }))
     }
 }
 ```
 
 ```text
-Loader 读取 EntryTree → 反序列化为 `Factory::Config` → factory.build(config) → 构造不可变实例 → 挂载到所属服务域 Context
+Loader 读取 EntryTree → 反序列化为 `Factory::Config` → factory.prepare(config) → 选择热提交或执行延迟构造 → 挂载到所属服务域 Context
 ```
 
-- `build` 必须无副作用；I/O 与任务只出现在 `Plugin::apply`。
+- `prepare` 与构造闭包必须无业务副作用；I/O 与任务只出现在 `Plugin::apply`。
 - 工厂由应用调用 `ExtensionCatalog::register` 显式登记，不使用自动注册宏。`JsonSchema` 会被
   `Loader` 公开给管理界面生成配置表单。
 - 校验或反序列化失败时，Loader 不执行 reconcile，也不写回配置文件。
@@ -220,6 +228,6 @@ Runtime shutdown 都会停止未触发回调；等待中的 `sleep` / `ticks` �
 ## 禁止事项
 
 - 不要依赖宿主 AppState / HTTP / DB / Redis / 配置文件。
-- 不要实现 Manifest、Loader/HMR——属 Loader 层。插件配置 Schema 由 Factory 的 `Config` 类型声明，并由 Loader 在调用 `build` 前校验。
+- 不要实现 Manifest、Loader/HMR——属 Loader 层。插件配置 Schema 由 Factory 的 `Config` 类型声明，并由 Loader 在调用 `prepare` 前进行类型化反序列化；业务约束由 `prepare` 校验。
 - `intercept` 仅派生配置（`ConfigKey`），不可替代 `provide` / Service。
 - 不要给 `Context` 做 Timer mixin；未挂载 `TimerPlugin` 时不得假定计时器可用。

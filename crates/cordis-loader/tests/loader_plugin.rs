@@ -5,7 +5,7 @@ use cordis_core::{
 use cordis_loader::{
     EntryOptions, EntryUpdate, ExtensionCatalog, ExtensionFactory, ExtensionsConfig, InjectConfig,
     InjectionDescriptor, IsolateValue, IsolationDescriptor, LOADER, Loader, LoaderControlError,
-    LoaderError, LoaderEvent, LoaderPlugin,
+    LoaderError, LoaderEvent, LoaderPlugin, PreparedExtension,
 };
 use schemars::JsonSchema;
 use std::{
@@ -66,11 +66,16 @@ impl ExtensionFactory for Factory {
     fn id(&self) -> &'static str {
         self.id
     }
-    fn build(&self, _: Empty) -> Result<Arc<dyn Plugin>, LoaderError> {
-        Ok(Arc::new(TestPlugin {
-            id: self.id,
-            needs_dep: self.needs_dep,
-            record: self.record.clone(),
+    fn prepare(&self, _: Empty) -> Result<PreparedExtension, LoaderError> {
+        let id = self.id;
+        let needs_dep = self.needs_dep;
+        let record = self.record.clone();
+        Ok(PreparedExtension::ordinary(move || {
+            Ok(Arc::new(TestPlugin {
+                id,
+                needs_dep,
+                record,
+            }))
         }))
     }
 }
@@ -114,10 +119,11 @@ impl ExtensionFactory for GatedLoadingFactory {
         "demo.gated-loading"
     }
 
-    fn build(&self, _: Empty) -> Result<Arc<dyn Plugin>, LoaderError> {
-        Ok(Arc::new(GatedLoadingPlugin {
-            entered: self.entered.clone(),
-            release: self.release.clone(),
+    fn prepare(&self, _: Empty) -> Result<PreparedExtension, LoaderError> {
+        let entered = self.entered.clone();
+        let release = self.release.clone();
+        Ok(PreparedExtension::ordinary(move || {
+            Ok(Arc::new(GatedLoadingPlugin { entered, release }))
         }))
     }
 }
@@ -166,10 +172,11 @@ impl ExtensionFactory for GatedUnloadingFactory {
         "demo.gated-unloading"
     }
 
-    fn build(&self, _: Empty) -> Result<Arc<dyn Plugin>, LoaderError> {
-        Ok(Arc::new(GatedUnloadingPlugin {
-            entered: self.entered.clone(),
-            release: self.release.clone(),
+    fn prepare(&self, _: Empty) -> Result<PreparedExtension, LoaderError> {
+        let entered = self.entered.clone();
+        let release = self.release.clone();
+        Ok(PreparedExtension::ordinary(move || {
+            Ok(Arc::new(GatedUnloadingPlugin { entered, release }))
         }))
     }
 }
@@ -1293,8 +1300,10 @@ impl ExtensionFactory for CountFactory {
     fn id(&self) -> &'static str {
         "demo.count"
     }
-    fn build(&self, config: CountConfig) -> Result<Arc<dyn Plugin>, LoaderError> {
-        Ok(Arc::new(CountPlugin { n: config.n }))
+    fn prepare(&self, config: CountConfig) -> Result<PreparedExtension, LoaderError> {
+        Ok(PreparedExtension::ordinary(move || {
+            Ok(Arc::new(CountPlugin { n: config.n }))
+        }))
     }
 }
 
@@ -1330,8 +1339,10 @@ impl ExtensionFactory for KeySwitchFactory {
     fn id(&self) -> &'static str {
         "demo.key"
     }
-    fn build(&self, config: KeySwitchConfig) -> Result<Arc<dyn Plugin>, LoaderError> {
-        Ok(Arc::new(KeySwitchPlugin { alt: config.alt }))
+    fn prepare(&self, config: KeySwitchConfig) -> Result<PreparedExtension, LoaderError> {
+        Ok(PreparedExtension::ordinary(move || {
+            Ok(Arc::new(KeySwitchPlugin { alt: config.alt }))
+        }))
     }
 }
 
@@ -1367,8 +1378,10 @@ impl ExtensionFactory for FailFactory {
     fn id(&self) -> &'static str {
         "demo.fail"
     }
-    fn build(&self, config: FailConfig) -> Result<Arc<dyn Plugin>, LoaderError> {
-        Ok(Arc::new(FailPlugin { fail: config.fail }))
+    fn prepare(&self, config: FailConfig) -> Result<PreparedExtension, LoaderError> {
+        Ok(PreparedExtension::ordinary(move || {
+            Ok(Arc::new(FailPlugin { fail: config.fail }))
+        }))
     }
 }
 
@@ -2057,8 +2070,8 @@ async fn named_isolate_labels_do_not_cross_service_keys() {
         fn id(&self) -> &'static str {
             "demo.other"
         }
-        fn build(&self, _: Empty) -> Result<Arc<dyn Plugin>, LoaderError> {
-            Ok(Arc::new(OtherPlugin))
+        fn prepare(&self, _: Empty) -> Result<PreparedExtension, LoaderError> {
+            Ok(PreparedExtension::ordinary(|| Ok(Arc::new(OtherPlugin))))
         }
     }
 

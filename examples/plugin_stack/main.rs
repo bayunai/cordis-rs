@@ -33,6 +33,7 @@ use cordis_core::{CoreError, FiberState, FiberStateSnapshot, Plugin, Runtime};
 use cordis_loader::{
     EntryOptions, EntryUpdate, ExtensionCatalog, ExtensionFactory, ExtensionsConfig, IsolateValue,
     IsolationDescriptor, LOADER, Loader, LoaderError, LoaderPlugin, LoaderSnapshot,
+    PreparedExtension,
 };
 use cordis_plugin_logger_console::ConsoleLoggerPlugin;
 use db::DbPlugin;
@@ -171,14 +172,15 @@ struct SimpleFactory<F> {
 
 impl<F> ExtensionFactory for SimpleFactory<F>
 where
-    F: Fn() -> Arc<dyn Plugin> + Send + Sync + 'static,
+    F: Fn() -> Arc<dyn Plugin> + Clone + Send + Sync + 'static,
 {
     type Config = Empty;
     fn id(&self) -> &'static str {
         self.id
     }
-    fn build(&self, _: Empty) -> Result<Arc<dyn Plugin>, LoaderError> {
-        Ok((self.build)())
+    fn prepare(&self, _: Empty) -> Result<PreparedExtension, LoaderError> {
+        let build = self.build.clone();
+        Ok(PreparedExtension::ordinary(move || Ok(build())))
     }
 }
 
@@ -189,9 +191,11 @@ impl ExtensionFactory for HttpFactory {
     fn id(&self) -> &'static str {
         "demo.stack.http"
     }
-    fn build(&self, config: HttpConfig) -> Result<Arc<dyn Plugin>, LoaderError> {
-        Ok(Arc::new(HttpPlugin {
-            label: config.label,
+    fn prepare(&self, config: HttpConfig) -> Result<PreparedExtension, LoaderError> {
+        Ok(PreparedExtension::ordinary(move || {
+            Ok(Arc::new(HttpPlugin {
+                label: config.label,
+            }))
         }))
     }
 }

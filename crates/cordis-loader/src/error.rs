@@ -113,7 +113,7 @@ pub enum LoaderError {
 }
 
 impl LoaderError {
-    /// 工厂在 `build` 时报告的配置错误。
+    /// 工厂在准备或构造阶段报告的配置错误。
     pub fn invalid_config(message: impl Into<String>) -> Self {
         Self::InvalidConfig {
             message: message.into(),

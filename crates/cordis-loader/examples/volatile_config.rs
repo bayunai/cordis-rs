@@ -2,8 +2,8 @@
 use async_trait::async_trait;
 use cordis_core::{Context, CoreError, Plugin, PluginKey, Runtime, ServiceKey};
 use cordis_loader::{
-    ConfigRef, EntryOptions, EntryUpdate, ExtensionCatalog, ExtensionsConfig, LOADER, LoaderError,
-    LoaderPlugin, VolatileExtensionFactory,
+    ConfigRef, EntryOptions, EntryUpdate, ExtensionCatalog, ExtensionFactory, ExtensionsConfig,
+    LOADER, LoaderError, LoaderPlugin, PreparedExtension,
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -27,27 +27,22 @@ struct Gateway {
     live: ConfigRef<Limits>,
 }
 
-impl VolatileExtensionFactory for Factory {
+impl ExtensionFactory for Factory {
     type Config = Config;
-    type Static = String;
-    type Live = Limits;
     fn id(&self) -> &'static str {
         "gateway"
     }
-    fn split(&self, config: Config) -> Result<(String, Limits), LoaderError> {
+    fn prepare(&self, config: Config) -> Result<PreparedExtension, LoaderError> {
         if config.address.is_empty() || config.live.rate_limit == 0 || config.live.timeout_ms == 0 {
             return Err(LoaderError::invalid_config(
                 "address、rate_limit 与 timeout_ms 必须有效",
             ));
         }
-        Ok((config.address, config.live))
-    }
-    fn build(
-        &self,
-        address: String,
-        live: ConfigRef<Limits>,
-    ) -> Result<Arc<dyn Plugin>, LoaderError> {
-        Ok(Arc::new(Gateway { address, live }))
+        Ok(PreparedExtension::volatile(
+            config.address,
+            config.live,
+            |address, live| Ok(Arc::new(Gateway { address, live })),
+        ))
     }
 }
 
@@ -100,7 +95,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         toml::to_string(&initial)?,
     )?;
     let mut catalog = ExtensionCatalog::new();
-    catalog.register_volatile(Factory)?;
+    catalog.register(Factory)?;
     let runtime = Runtime::new()?;
     let mut loader_fiber = runtime
         .root()

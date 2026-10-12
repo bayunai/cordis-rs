@@ -34,7 +34,7 @@ pub(crate) struct RuntimeEntry {
     pub(crate) factory: Option<String>,
     /// 挂载时的自身配置（Group 的 children 嵌在 `config` 中，比较时单独处理）。
     pub(crate) options: crate::config::EntryOptions,
-    pub(crate) volatile: Option<Arc<dyn crate::catalog::VolatileBinding>>,
+    pub(crate) volatile: Option<Arc<dyn crate::prepared::VolatileBinding>>,
 }
 
 enum ConfigSource {

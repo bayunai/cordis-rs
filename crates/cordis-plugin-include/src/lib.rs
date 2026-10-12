@@ -7,7 +7,7 @@
 
 use async_trait::async_trait;
 use cordis_core::{Context, CoreError, Plugin, PluginKey};
-use cordis_loader::{ENTRY_LOCATION, ExtensionFactory, LoaderError};
+use cordis_loader::{ENTRY_LOCATION, ExtensionFactory, LoaderError, PreparedExtension};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use std::{path::PathBuf, sync::Arc};
@@ -30,8 +30,10 @@ impl ExtensionFactory for IncludeFactory {
         "cordis:include"
     }
 
-    fn build(&self, config: IncludeConfig) -> Result<Arc<dyn Plugin>, LoaderError> {
-        Ok(Arc::new(IncludePlugin { path: config.path }))
+    fn prepare(&self, config: IncludeConfig) -> Result<PreparedExtension, LoaderError> {
+        Ok(PreparedExtension::ordinary(move || {
+            Ok(Arc::new(IncludePlugin { path: config.path }))
+        }))
     }
 }
 

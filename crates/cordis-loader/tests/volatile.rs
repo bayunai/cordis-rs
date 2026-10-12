@@ -1,8 +1,8 @@
 use async_trait::async_trait;
 use cordis_core::{Context, CoreError, Fiber, FiberState, Plugin, PluginKey, Runtime, ServiceKey};
 use cordis_loader::{
-    ConfigRef, EntryOptions, EntryUpdate, ExtensionCatalog, ExtensionsConfig, LOADER, Loader,
-    LoaderControlError, LoaderError, LoaderPlugin, VolatileExtensionFactory,
+    ConfigRef, EntryOptions, EntryUpdate, ExtensionCatalog, ExtensionFactory, ExtensionsConfig,
+    LOADER, Loader, LoaderControlError, LoaderError, LoaderPlugin, PreparedExtension,
 };
 use schemars::JsonSchema;
 use std::{
@@ -65,15 +65,13 @@ impl Drop for SubscriptionTask {
     }
 }
 
-impl VolatileExtensionFactory for Factory {
+impl ExtensionFactory for Factory {
     type Config = Input;
-    type Static = Settings;
-    type Live = Live;
     fn id(&self) -> &'static str {
         "live"
     }
-    fn split(&self, input: Input) -> Result<(Settings, Live), LoaderError> {
-        assert_ne!(input.address, "split-panic");
+    fn prepare(&self, input: Input) -> Result<PreparedExtension, LoaderError> {
+        assert_ne!(input.address, "prepare-panic");
         if input.limit == 0 || input.timeout < input.limit {
             return Err(LoaderError::invalid_config(
                 "limit must be positive and not exceed timeout",
@@ -83,34 +81,33 @@ impl VolatileExtensionFactory for Factory {
             fs::remove_file(&path).unwrap();
             fs::create_dir(path).unwrap();
         }
-        Ok((
-            Settings {
-                address: input.address,
-                provide: input.provide,
-                dependency: input.dependency,
-            },
-            Live {
-                limit: input.limit,
-                timeout: input.timeout,
-            },
-        ))
-    }
-    fn build(
-        &self,
-        settings: Settings,
-        live: ConfigRef<Live>,
-    ) -> Result<Arc<dyn Plugin>, LoaderError> {
-        self.0.builds.fetch_add(1, Ordering::SeqCst);
-        assert_ne!(settings.address, "build-panic");
-        if settings.address == "build-error" {
-            return Err(LoaderError::invalid_config("build error"));
-        }
-        self.0.refs.lock().unwrap().push(live.clone());
-        Ok(Arc::new(TestPlugin {
+        let settings = Settings {
+            address: input.address,
+            provide: input.provide,
+            dependency: input.dependency,
+        };
+        let live = Live {
+            limit: input.limit,
+            timeout: input.timeout,
+        };
+        let state = self.0.clone();
+        Ok(PreparedExtension::volatile(
             settings,
             live,
-            state: self.0.clone(),
-        }))
+            move |settings, live| {
+                state.builds.fetch_add(1, Ordering::SeqCst);
+                assert_ne!(settings.address, "build-panic");
+                if settings.address == "build-error" {
+                    return Err(LoaderError::invalid_config("build error"));
+                }
+                state.refs.lock().unwrap().push(live.clone());
+                Ok(Arc::new(TestPlugin {
+                    settings,
+                    live,
+                    state,
+                }))
+            },
+        ))
     }
 }
 #[async_trait]
@@ -184,7 +181,7 @@ fn entry(id: &str, address: &str, limit: u32) -> EntryOptions {
 }
 fn catalog(state: &Arc<State>) -> ExtensionCatalog {
     let mut catalog = ExtensionCatalog::new();
-    catalog.register_volatile(Factory(state.clone())).unwrap();
+    catalog.register(Factory(state.clone())).unwrap();
     catalog
         .register(cordis_plugin_include::IncludeFactory)
         .unwrap();
@@ -351,7 +348,7 @@ async fn invalid_candidates_and_panics_do_not_mutate_runtime_or_file() {
     for candidate in [
         config("db", 0, 20, false, false),
         config("db", 30, 2, false, false),
-        config("split-panic", 2, 20, false, false),
+        config("prepare-panic", 2, 20, false, false),
         config("build-panic", 2, 20, false, false),
         config("build-error", 2, 20, false, false),
         toml::from_str("address = 123").unwrap(),
@@ -724,7 +721,7 @@ async fn registration_shares_id_checks_and_schema_is_complete_raw_input() {
     let state = Arc::new(State::default());
     let mut catalog = catalog(&state);
     assert!(matches!(
-        catalog.register_volatile(Factory(state)),
+        catalog.register(Factory(state)),
         Err(LoaderError::DuplicateFactory { .. })
     ));
     let descriptor = catalog
@@ -742,8 +739,10 @@ async fn registration_shares_id_checks_and_schema_is_complete_raw_input() {
         fn id(&self) -> &'static str {
             "live"
         }
-        fn build(&self, _: Input) -> Result<Arc<dyn Plugin>, LoaderError> {
-            Err(LoaderError::invalid_config("test factory not mounted"))
+        fn prepare(&self, _: Input) -> Result<PreparedExtension, LoaderError> {
+            Ok(PreparedExtension::ordinary(|| {
+                Err(LoaderError::invalid_config("test factory not mounted"))
+            }))
         }
     }
     assert!(matches!(
@@ -753,7 +752,7 @@ async fn registration_shares_id_checks_and_schema_is_complete_raw_input() {
     let mut reverse = ExtensionCatalog::new();
     reverse.register(Ordinary).unwrap();
     assert!(matches!(
-        reverse.register_volatile(Factory(Arc::new(State::default()))),
+        reverse.register(Factory(Arc::new(State::default()))),
         Err(LoaderError::DuplicateFactory { .. })
     ));
 }

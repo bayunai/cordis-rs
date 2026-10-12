@@ -85,6 +85,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## 示例与文档
 
+Loader Factory 统一使用 `prepare()` 返回 `PreparedExtension::ordinary()` 或
+`PreparedExtension::volatile()`，均通过 `catalog.register()` 登记。外部应用需同步迁移
+Factory 实现；普通插件无需定义空热配置，配置文件格式保持不变。
+
 - [`volatile_config`](crates/cordis-loader/examples/volatile_config.rs)：类型化热配置、Effect 托管订阅与普通配置替换。运行 `cargo run -p cordis-loader --example volatile_config`。
 
 - [`reactive`](examples/reactive.rs)：最小服务注入与响应式重算。

@@ -1,10 +1,11 @@
 //! Entry/子树差分 reconcile：目标索引、计划与生命周期执行。
 
 use crate::{
-    catalog::{ExtensionCatalog, FactoryBuild, VolatileBinding},
+    catalog::ExtensionCatalog,
     config::{EntryOptions, ExtensionsConfig},
     error::{LoaderError, format_panic_message},
     plugin::RuntimeEntry,
+    prepared::{PreparedOutcome, VolatileBinding},
     snapshot::{EntryId, LoaderSnapshot},
     tree::RuntimeTree,
 };
@@ -38,7 +39,7 @@ pub(crate) struct ReconcilePlan {
     replace: BTreeSet<EntryId>,
     /// 新建或重新挂载 Fiber（含 Group 重建）。
     mount: BTreeSet<EntryId>,
-    /// 需 `factory.build` 的普通启用 Entry。
+    /// 需准备配置并选择构造/热提交的普通启用 Entry。
     build: BTreeSet<EntryId>,
     /// 目标前序。
     desired_order: Vec<EntryId>,
@@ -680,13 +681,12 @@ pub(crate) fn build_plan_plugins(
                     .is_some_and(|fiber| fiber.state() == FiberState::Active)
         });
         let result = catch_unwind(AssertUnwindSafe(|| {
-            factory.build(
-                &node.options.config,
-                current.and_then(|entry| entry.volatile.as_ref()),
-            )
+            factory
+                .prepare(&node.options.config)?
+                .resolve(current.and_then(|entry| entry.volatile.as_ref()))
         }))
         .map_err(|payload| LoaderError::FactoryPanic {
-            message: format_panic_message("extension factory build", payload),
+            message: format_panic_message("extension factory prepare/construct", payload),
         })?
         .map_err(|error| LoaderError::PluginBuild {
             instance: path.to_string(),
@@ -694,7 +694,7 @@ pub(crate) fn build_plan_plugins(
             message: error.to_string(),
         })?;
         let (plugin, binding) = match result {
-            FactoryBuild::Hot { binding, commit } => {
+            PreparedOutcome::Hot { binding, commit } => {
                 let fiber_id = current
                     .and_then(|entry| entry.fiber.as_ref())
                     .expect("hot active fiber")
@@ -712,7 +712,7 @@ pub(crate) fn build_plan_plugins(
                 }
                 continue;
             }
-            FactoryBuild::Plugin { plugin, binding } => (plugin, binding),
+            PreparedOutcome::Plugin { plugin, binding } => (plugin, binding),
         };
         // Binding 不同但原始 options 相同仍必须替换（失败后的实际配置差分）。
         if !plan.mount.contains(path) {

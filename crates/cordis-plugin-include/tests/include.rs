@@ -5,6 +5,7 @@ use cordis_core::{Context, CoreError, FiberState, Plugin, PluginKey, Runtime, Se
 use cordis_loader::{
     EntryOptions, EntryUpdate, ExtensionCatalog, ExtensionFactory, ExtensionsConfig, IsolateValue,
     IsolationDescriptor, LOADER, Loader, LoaderControlError, LoaderError, LoaderPlugin,
+    PreparedExtension,
 };
 use cordis_plugin_include::IncludeFactory;
 use std::{fs, path::PathBuf, sync::Arc};
@@ -25,10 +26,11 @@ impl ExtensionFactory for ValueFactory {
     fn id(&self) -> &'static str {
         self.id
     }
-    fn build(&self, _: Empty) -> Result<Arc<dyn Plugin>, LoaderError> {
-        Ok(Arc::new(ValuePlugin {
-            id: self.id,
-            label: self.label,
+    fn prepare(&self, _: Empty) -> Result<PreparedExtension, LoaderError> {
+        let id = self.id;
+        let label = self.label;
+        Ok(PreparedExtension::ordinary(move || {
+            Ok(Arc::new(ValuePlugin { id, label }))
         }))
     }
 }
