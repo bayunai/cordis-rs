@@ -155,6 +155,21 @@ impl RuntimeTree {
         })
     }
 
+    /// 初始声明通过预检后，业务生命周期失败不撤销树的控制面。
+    pub(crate) async fn initialize(
+        self: &Arc<Self>,
+        config: ExtensionsConfig,
+    ) -> Result<LoaderSnapshot, LoaderError> {
+        match self.apply(config.clone(), None).await {
+            Ok(snapshot) => Ok(snapshot),
+            Err(error) if error.is_entry_lifecycle_failure() => {
+                *self.desired.lock().expect("desired") = config;
+                Ok(self.local_snapshot())
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     pub(crate) async fn apply(
         self: &Arc<Self>,
         config: ExtensionsConfig,
@@ -191,10 +206,13 @@ impl RuntimeTree {
     pub(crate) async fn await_idle(self: &Arc<Self>) -> Result<LoaderSnapshot, LoaderError> {
         let completion = { self.reconcile.lock().expect("reconcile slot").clone() };
         if let Some(completion) = completion {
-            completion.wait().await
-        } else {
-            Ok(self.local_snapshot())
+            match completion.wait().await {
+                Ok(_) => {}
+                Err(error) if error.is_entry_lifecycle_failure() => {}
+                Err(error) => return Err(error),
+            }
         }
+        Ok(self.local_snapshot())
     }
 
     fn spawn_reconcile(
@@ -423,4 +441,56 @@ pub(crate) fn aggregate_snapshot(
 
     append_tree(root, subtrees_by_prefix, &mut seen, &mut entries);
     LoaderSnapshot { entries }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cordis_core::{CoreError, Runtime};
+
+    #[tokio::test]
+    async fn idle_observer_waits_for_failed_reconcile_but_returns_actual_snapshot() {
+        let runtime = Runtime::new().unwrap();
+        let tree = RuntimeTree::new_root(ExtensionCatalog::new(), runtime.root(), None, None);
+        let completion = ReconcileCompletion::new();
+        *tree.reconcile.lock().unwrap() = Some(completion.clone());
+        let mut observer = Box::pin(tree.await_idle());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut observer)
+                .await
+                .is_err()
+        );
+        completion.finish(Err(LoaderError::Lifecycle {
+            instance: "broken".into(),
+            source: CoreError::PluginApply("expected failure".into()),
+        }));
+        assert!(observer.await.unwrap().entries.is_empty());
+        assert!(matches!(
+            completion.wait().await,
+            Err(LoaderError::Lifecycle { .. })
+        ));
+        runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn idle_observer_does_not_hide_lifecycle_coordinator_failure() {
+        let runtime = Runtime::new().unwrap();
+        let tree = RuntimeTree::new_root(ExtensionCatalog::new(), runtime.root(), None, None);
+        let completion = ReconcileCompletion::new();
+        *tree.reconcile.lock().unwrap() = Some(completion.clone());
+        completion.finish(Err(LoaderError::Lifecycle {
+            instance: "broken".into(),
+            source: CoreError::CoordinatorAborted {
+                reason: "worker aborted".into(),
+            },
+        }));
+        assert!(matches!(
+            tree.await_idle().await,
+            Err(LoaderError::Lifecycle {
+                source: CoreError::CoordinatorAborted { .. },
+                ..
+            })
+        ));
+        runtime.shutdown().await.unwrap();
+    }
 }

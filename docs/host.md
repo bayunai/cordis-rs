@@ -200,7 +200,13 @@ let database = loader.entry_context("infrastructure:database")?.get(DATABASE)?;
 文件来源的变更先完成树预检与 reconcile，再原子写回完整 TOML。预检失败（未知 Factory、
 `FactoryChanged`、`PluginKeyChanged`、无效 inject/isolate、非 v3 等）零运行时变更。生命周期失败
 不回滚已触及节点、不提交 `desired`/revision、不由 Loader 发起写回；无关 Entry 继续运行。
+本轮继续尝试其他独立条目，逐项记录业务生命周期错误，控制调用返回首个错误；有失败时不提交待更新热值。
+根树或 Include 子树初次挂载时，通过完整预检的初始声明会保留，业务挂载失败标记为 Failed，
+不撤销树控制面或无关插件。`entries()` 返回初始加载或后续成功提交的声明，不代表全部条目已 Active。
+配置、Factory 预检和内部协调错误仍明确报错；父挂载上下文无效时停止其后代挂载，不转挂到根节点。
 失败后的 `LoaderSnapshot` 仍包含实际已插入的 Failed/Pending 节点，即使该次 reconcile
 尚未来得及提交目标排序；对同一外部配置再次 `reload()` 会重试失败的启用 Entry。
 文件被外部修改时返回 `ConfigConflict`；写回失败返回带已生效 `LoaderSnapshot` 的 `Persist`。
 `await_idle()` 等待 Loader 自己的本次 reconcile，以及 EntryTree 受管 Fiber 的 Loading / Unloading 收敛；不等待 Runtime 上与本 Loader 无关的工作，也不等待仍缺依赖的 Pending。
+它返回实际状态，包括 Failed/Pending；业务生命周期错误由发起变更的返回值、条目诊断及日志报告。
+Loader 关闭及内部协调错误仍返回错误。应用可另外检查自身必需条目的 Active 状态，决定是否继续启动。

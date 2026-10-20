@@ -113,6 +113,17 @@ pub enum LoaderError {
 }
 
 impl LoaderError {
+    /// 可隔离的业务挂载/清理失败；协调器或运行环境失效不能当作条目失败处理。
+    pub(crate) fn is_entry_lifecycle_failure(&self) -> bool {
+        matches!(
+            self,
+            Self::Lifecycle {
+                source: CoreError::PluginApply(_) | CoreError::DisposeFailed { .. },
+                ..
+            }
+        )
+    }
+
     /// 工厂在准备或构造阶段报告的配置错误。
     pub fn invalid_config(message: impl Into<String>) -> Self {
         Self::InvalidConfig {

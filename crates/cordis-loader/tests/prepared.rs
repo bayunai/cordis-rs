@@ -232,6 +232,35 @@ fn prepare_does_not_construct_even_when_closure_will_fail() {
 }
 
 #[tokio::test]
+async fn initial_factory_precheck_failure_still_fails_loader_without_applying_entries() {
+    for mode in [
+        Mode::Invalid,
+        Mode::PreparePanic,
+        Mode::BuildError,
+        Mode::BuildPanic,
+    ] {
+        let counts = Arc::new(Counts::default());
+        let mut catalog = ExtensionCatalog::new();
+        catalog.register(Factory(counts.clone())).unwrap();
+        let runtime = Runtime::new().unwrap();
+        let plugin = LoaderPlugin::new(
+            catalog,
+            ExtensionsConfig {
+                version: cordis_loader::CONFIG_VERSION,
+                extensions: vec![EntryOptions::new("a", "prepared").with_config(raw(mode, 1))],
+            },
+        )
+        .unwrap();
+        let fiber = runtime.root().plugin(Arc::new(plugin)).await.unwrap();
+        assert_eq!(fiber.state(), FiberState::Failed);
+        assert!(fiber.last_error().is_some());
+        assert!(runtime.root().get(LOADER).is_err());
+        assert_eq!(counts.applies.load(Ordering::SeqCst), 0);
+        runtime.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
 async fn capability_and_binding_types_replace_but_hot_values_do_not_construct() {
     let h = Harness::new(Mode::Ordinary, false).await;
     let original = h.view();

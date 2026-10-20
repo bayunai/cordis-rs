@@ -58,10 +58,19 @@ impl RuntimeTree {
         desired: BTreeMap<EntryId, DesiredNode>,
         plan: ReconcilePlan,
     ) -> Result<LoaderSnapshot, LoaderError> {
+        let logger = self
+            .owner
+            .logger()
+            .map_err(|source| LoaderError::Runtime { source })?;
+        let mut lifecycle_error = None;
         // 1) 后序删除整节点
         let remove_order = postorder_among(&plan.remove, &self.order.lock().expect("entry order"));
         for path in remove_order {
-            self.dispose_and_remove(&path).await?;
+            record_lifecycle_result(
+                self.dispose_and_remove(&path).await,
+                &mut lifecycle_error,
+                &logger,
+            )?;
         }
 
         // 2) 后序仅释放 Fiber（禁用）
@@ -70,7 +79,11 @@ impl RuntimeTree {
             &self.order.lock().expect("entry order"),
         );
         for path in dispose_order {
-            self.dispose_fiber_only(&path).await?;
+            record_lifecycle_result(
+                self.dispose_fiber_only(&path).await,
+                &mut lifecycle_error,
+                &logger,
+            )?;
         }
 
         // 3) 同步保留节点上的 options / enabled（含 Group disabled 开关）
@@ -93,14 +106,24 @@ impl RuntimeTree {
 
         // 4) replace
         for path in &plan.replace {
-            self.replace_entry(path, &desired).await?;
+            record_lifecycle_result(
+                self.replace_entry(path, &desired).await,
+                &mut lifecycle_error,
+                &logger,
+            )?;
         }
 
         // 5) 前序挂载
         for path in &plan.desired_order {
             if plan.mount.contains(path) {
-                self.mount_one(path, &desired).await?;
+                let result = self.mount_one(path, &desired).await;
+                record_lifecycle_result(result, &mut lifecycle_error, &logger)?;
             }
+        }
+
+        // 独立条目均已尝试；失败不提交热值、desired 或文件 revision。
+        if let Some(error) = lifecycle_error {
+            return Err(error);
         }
 
         // 所有生命周期成功后才提交热值，不等待业务订阅者。
@@ -250,16 +273,27 @@ impl RuntimeTree {
         let parent_context = {
             let entries = self.entries.lock().expect("entries");
             match &node.parent {
-                Some(parent) => entries.get(parent).map(|entry| entry.context.clone()),
+                Some(parent) => entries
+                    .get(parent)
+                    .filter(|entry| {
+                        !entry.context.is_disposed()
+                            && entry.fiber.as_ref().is_some_and(|fiber| {
+                                !matches!(fiber.state(), FiberState::Failed | FiberState::Disposed)
+                            })
+                    })
+                    .map(|entry| entry.context.clone()),
                 None => Some(self.owner.clone()),
             }
         };
-        let parent_context = parent_context.ok_or_else(|| LoaderError::UnknownInstance {
-            instance: node
-                .parent
-                .as_ref()
-                .map(|parent| parent.to_string())
-                .unwrap_or_default(),
+        let parent_context = parent_context.ok_or_else(|| LoaderError::Lifecycle {
+            instance: path.to_string(),
+            source: CoreError::PluginApply(format!(
+                "父条目 {} 未建立有效挂载上下文，不能挂载后代",
+                node.parent
+                    .as_ref()
+                    .map(EntryId::as_str)
+                    .unwrap_or("<root>"),
+            )),
         })?;
 
         let stale = {
@@ -361,6 +395,22 @@ impl RuntimeTree {
 }
 
 // --- plan helpers ---
+
+/// 每个业务错误均记录，调用方返回首个错误；非业务故障立即传播。
+fn record_lifecycle_result(
+    result: Result<(), LoaderError>,
+    first_error: &mut Option<LoaderError>,
+    logger: &cordis_core::Logger,
+) -> Result<(), LoaderError> {
+    match result {
+        Err(error) if error.is_entry_lifecycle_failure() => {
+            logger.error(error.to_string());
+            first_error.get_or_insert(error);
+            Ok(())
+        }
+        result => result,
+    }
+}
 
 pub(crate) fn index_desired_tree(
     catalog: &ExtensionCatalog,
@@ -466,7 +516,11 @@ pub(crate) fn plan_reconcile(
         }
 
         if node.options.group {
-            if current.options.inject != node.options.inject
+            let unavailable = current.fiber.as_ref().is_none_or(|fiber| {
+                matches!(fiber.state(), FiberState::Failed | FiberState::Disposed)
+            });
+            if unavailable
+                || current.options.inject != node.options.inject
                 || current.options.isolate != node.options.isolate
             {
                 rebuild_subtrees.insert(path.clone());
@@ -830,5 +884,67 @@ impl Plugin for ConfiguredPlugin {
     async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
         self.applied.store(true, Ordering::Release);
         self.inner.apply(ctx).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cordis_core::Runtime;
+
+    struct FailedParent;
+    #[async_trait]
+    impl Plugin for FailedParent {
+        fn key(&self) -> PluginKey {
+            PluginKey::new("failed.parent")
+        }
+        async fn apply(&self, _: &Context) -> Result<(), CoreError> {
+            Err(CoreError::PluginApply("parent failed".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_or_failed_parent_never_mounts_descendant_in_root_context() {
+        let runtime = Runtime::new().unwrap();
+        let parent = runtime.root().plugin(Arc::new(FailedParent)).await.unwrap();
+        let tree = RuntimeTree::new_root(ExtensionCatalog::new(), runtime.root(), None, None);
+        tree.entries.lock().unwrap().insert(
+            EntryId::from("blocked"),
+            RuntimeEntry {
+                parent: None,
+                name: "cordis:group".into(),
+                group: true,
+                enabled: true,
+                plugin_key: Some(PluginKey::new("failed.parent")),
+                fiber: Some(parent),
+                context: runtime.root(),
+                factory: None,
+                options: EntryOptions::group("blocked", vec![]).unwrap(),
+                volatile: None,
+            },
+        );
+        let path = EntryId::from("blocked:child");
+        let desired = BTreeMap::from([(
+            path.clone(),
+            DesiredNode {
+                parent: Some(EntryId::from("blocked")),
+                options: EntryOptions::new("child", "unused"),
+                children: vec![],
+                plugin: None,
+                plugin_key: None,
+                volatile: None,
+            },
+        )]);
+        for _ in 0..2 {
+            let error = tree.mount_one(&path, &desired).await.unwrap_err();
+            assert!(error.is_entry_lifecycle_failure());
+            assert!(error.to_string().contains("父条目 blocked"));
+            assert!(!tree.entries.lock().unwrap().contains_key(&path));
+            tree.entries
+                .lock()
+                .unwrap()
+                .remove(&EntryId::from("blocked"));
+        }
+        runtime.shutdown().await.unwrap();
     }
 }

@@ -83,11 +83,13 @@ impl ExtensionFactory for Factory {
 struct GatedLoadingFactory {
     entered: Arc<Mutex<Option<oneshot::Sender<()>>>>,
     release: Arc<Mutex<Option<oneshot::Receiver<()>>>>,
+    fail: bool,
 }
 
 struct GatedLoadingPlugin {
     entered: Arc<Mutex<Option<oneshot::Sender<()>>>>,
     release: Arc<Mutex<Option<oneshot::Receiver<()>>>>,
+    fail: bool,
 }
 
 #[async_trait]
@@ -108,7 +110,11 @@ impl Plugin for GatedLoadingPlugin {
         if let Some(receiver) = receiver {
             let _ = receiver.await;
         }
-        Ok(())
+        if self.fail {
+            Err(CoreError::PluginApply("gated apply failure".into()))
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -122,8 +128,13 @@ impl ExtensionFactory for GatedLoadingFactory {
     fn prepare(&self, _: Empty) -> Result<PreparedExtension, LoaderError> {
         let entered = self.entered.clone();
         let release = self.release.clone();
+        let fail = self.fail;
         Ok(PreparedExtension::ordinary(move || {
-            Ok(Arc::new(GatedLoadingPlugin { entered, release }))
+            Ok(Arc::new(GatedLoadingPlugin {
+                entered,
+                release,
+                fail,
+            }))
         }))
     }
 }
@@ -325,6 +336,15 @@ async fn managed_fiber_activation_after_external_provider_invalidates_snapshot()
 
 #[tokio::test]
 async fn await_idle_waits_for_managed_loading_fiber() {
+    assert_idle_waits_for_loading(false).await;
+}
+
+#[tokio::test]
+async fn await_idle_returns_failed_snapshot_when_concurrent_control_operation_fails() {
+    assert_idle_waits_for_loading(true).await;
+}
+
+async fn assert_idle_waits_for_loading(fail: bool) {
     let (entered_tx, entered_rx) = oneshot::channel();
     let (release_tx, release_rx) = oneshot::channel();
     let mut entry = EntryOptions::new("consumer", "demo.gated-loading");
@@ -334,6 +354,7 @@ async fn await_idle_waits_for_managed_loading_fiber() {
         .register(GatedLoadingFactory {
             entered: Arc::new(Mutex::new(Some(entered_tx))),
             release: Arc::new(Mutex::new(Some(release_rx))),
+            fail,
         })
         .unwrap();
     let (runtime, _loader_fiber, loader, _directory, _extensions) =
@@ -373,11 +394,24 @@ async fn await_idle_waits_for_managed_loading_fiber() {
     }
 
     let _ = release_tx.send(());
-    update.await.expect("update task").expect("enable entry");
+    let result = update.await.expect("update task");
+    if fail {
+        assert!(matches!(
+            result,
+            Err(LoaderControlError::Loader(LoaderError::Lifecycle { .. }))
+        ));
+        assert!(loader.entries().unwrap().extensions[0].disabled);
+    } else {
+        result.expect("enable entry");
+    }
     let snapshot = idle.await.expect("await idle");
     assert_eq!(
         snapshot.entry("consumer").unwrap().state,
-        Some(FiberState::Active)
+        Some(if fail {
+            FiberState::Failed
+        } else {
+            FiberState::Active
+        })
     );
     runtime.shutdown().await.unwrap();
 }
@@ -723,8 +757,22 @@ async fn group_without_isolate_shares_root_domain_and_conflicts() {
         ))
         .await
         .expect("handle returned");
-    // 无 isolate：Root 与 Group 内同名 DEP Provider 冲突 → Loader Failed。
-    assert_eq!(fiber.state(), FiberState::Failed);
+    assert_eq!(fiber.state(), FiberState::Active);
+    let snapshot = runtime
+        .root()
+        .get(LOADER)
+        .unwrap()
+        .await_idle()
+        .await
+        .unwrap();
+    assert_eq!(
+        snapshot.entry("root-provider").unwrap().state,
+        Some(FiberState::Active)
+    );
+    assert_eq!(
+        snapshot.entry("a:provider").unwrap().state,
+        Some(FiberState::Failed)
+    );
     runtime.shutdown().await.unwrap();
 }
 
@@ -936,19 +984,30 @@ async fn duplicate_provider_in_same_group_fails() {
         ))
         .await
         .expect("Loader Fiber handle is returned even when reconcile fails");
-    assert_eq!(fiber.state(), FiberState::Failed);
-    let error = fiber.last_error().unwrap_or_default();
+    assert_eq!(fiber.state(), FiberState::Active);
+    let loader = runtime.root().get(LOADER).unwrap();
+    let snapshot = loader.await_idle().await.unwrap();
+    assert_eq!(
+        snapshot.entry("app:one").unwrap().state,
+        Some(FiberState::Active)
+    );
+    assert_eq!(
+        snapshot.entry("app:two").unwrap().state,
+        Some(FiberState::Failed)
+    );
+    let error = snapshot
+        .entry("app:two")
+        .unwrap()
+        .last_error
+        .clone()
+        .unwrap();
     assert!(
         error.contains("Lifecycle")
             || error.contains("已在当前 Context 注册")
             || error.contains("ServiceConflict"),
         "unexpected last_error: {error:?}"
     );
-    // 生命周期失败不提交 desired；LOADER 因 Fiber Failed 而不可用。
-    assert!(matches!(
-        runtime.root().get(LOADER),
-        Err(CoreError::ServiceUnavailable { .. })
-    ));
+    assert_eq!(loader.entries().unwrap().extensions.len(), 1);
     runtime.shutdown().await.unwrap();
 }
 
@@ -1756,6 +1815,195 @@ async fn lifecycle_failure_keeps_unrelated_active_and_skips_desired_commit() {
 }
 
 #[tokio::test]
+async fn initial_failure_keeps_loader_and_later_entries_then_can_be_repaired() {
+    let mut catalog = dep_catalog();
+    catalog.register(FailFactory).unwrap();
+    let (runtime, fiber, loader, _dir, _) = mount_with_file(
+        catalog,
+        vec![
+            EntryOptions::new("broken", "demo.fail")
+                .with_config(toml::Value::try_from(FailConfig { fail: true }).unwrap()),
+            EntryOptions::new("provider", "demo.dep"),
+            EntryOptions::new("consumer", "demo.consumer"),
+        ],
+    )
+    .await;
+    assert_eq!(fiber.state(), FiberState::Active);
+    let snapshot = loader.await_idle().await.unwrap();
+    assert_eq!(
+        snapshot.entry("broken").unwrap().state,
+        Some(FiberState::Failed)
+    );
+    assert!(snapshot.entry("broken").unwrap().last_error.is_some());
+    assert_eq!(
+        snapshot.entry("provider").unwrap().state,
+        Some(FiberState::Active)
+    );
+    assert_eq!(
+        snapshot.entry("consumer").unwrap().state,
+        Some(FiberState::Active)
+    );
+    assert_eq!(loader.entries().unwrap().extensions.len(), 3);
+    let provider_id = fiber_id(&snapshot, "provider");
+    loader
+        .update(
+            "broken",
+            EntryUpdate {
+                config: Some(toml::Value::try_from(FailConfig { fail: false }).unwrap()),
+                ..Default::default()
+            },
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let recovered = loader.await_idle().await.unwrap();
+    assert_eq!(
+        recovered.entry("broken").unwrap().state,
+        Some(FiberState::Active)
+    );
+    assert_eq!(fiber_id(&recovered, "provider"), provider_id);
+    runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn initial_failed_entry_can_be_disabled_and_removed() {
+    let mut catalog = dep_catalog();
+    catalog.register(FailFactory).unwrap();
+    let (runtime, _loader_fiber, loader, _dir, _) = mount_with_file(
+        catalog,
+        vec![
+            EntryOptions::new("broken", "demo.fail")
+                .with_config(toml::Value::try_from(FailConfig { fail: true }).unwrap()),
+            EntryOptions::new("stable", "demo.dep"),
+        ],
+    )
+    .await;
+    let id = fiber_id(&loader.await_idle().await.unwrap(), "stable");
+    loader
+        .update(
+            "broken",
+            EntryUpdate {
+                disabled: Some(true),
+                ..Default::default()
+            },
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let disabled = loader.await_idle().await.unwrap();
+    assert!(!disabled.entry("broken").unwrap().enabled);
+    assert!(disabled.entry("broken").unwrap().state.is_none());
+    loader.remove("broken").await.unwrap();
+    let removed = loader.await_idle().await.unwrap();
+    assert!(removed.entry("broken").is_none());
+    assert_eq!(fiber_id(&removed, "stable"), id);
+    runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn failed_provider_leaves_consumer_pending_without_stopping_unrelated_entries() {
+    struct BrokenProvider;
+    #[async_trait]
+    impl Plugin for BrokenProvider {
+        fn key(&self) -> PluginKey {
+            PluginKey::new("broken.provider")
+        }
+        async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
+            ctx.provide(DEP, ())?;
+            Err(CoreError::PluginApply(
+                "provider failed after registration".into(),
+            ))
+        }
+    }
+    struct BrokenProviderFactory;
+    impl ExtensionFactory for BrokenProviderFactory {
+        type Config = Empty;
+        fn id(&self) -> &'static str {
+            "broken.provider"
+        }
+        fn prepare(&self, _: Empty) -> Result<PreparedExtension, LoaderError> {
+            Ok(PreparedExtension::ordinary(|| Ok(Arc::new(BrokenProvider))))
+        }
+    }
+    let mut catalog = dep_catalog();
+    catalog.register(BrokenProviderFactory).unwrap();
+    let (runtime, _fiber, loader, _dir, _) = mount_with_file(
+        catalog,
+        vec![
+            EntryOptions::new("broken", "broken.provider"),
+            EntryOptions::new("consumer", "demo.consumer"),
+            EntryOptions::new("stable", "demo.value"),
+        ],
+    )
+    .await;
+    let snapshot = loader.await_idle().await.unwrap();
+    assert_eq!(
+        snapshot.entry("broken").unwrap().state,
+        Some(FiberState::Failed)
+    );
+    assert_eq!(
+        snapshot.entry("consumer").unwrap().state,
+        Some(FiberState::Pending)
+    );
+    assert_eq!(
+        snapshot.entry("stable").unwrap().state,
+        Some(FiberState::Active)
+    );
+    assert!(runtime.root().get(DEP).is_err());
+    assert!(runtime.root().get(VALUE).is_ok());
+    runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn failed_reload_mounts_later_entries_and_retries_without_committing_declaration() {
+    let mut catalog = dep_catalog();
+    catalog.register(FailFactory).unwrap();
+    let (runtime, _loader_fiber, loader, _dir, file) = mount_with_file(catalog, vec![]).await;
+    let target = config(vec![
+        EntryOptions::new("broken", "demo.fail")
+            .with_config(toml::Value::try_from(FailConfig { fail: true }).unwrap()),
+        EntryOptions::new("provider", "demo.dep"),
+        EntryOptions::new("consumer", "demo.consumer"),
+    ]);
+    let text = toml::to_string(&target).unwrap();
+    fs::write(&file, &text).unwrap();
+    let mut provider_id = None;
+    for _ in 0..2 {
+        assert!(matches!(
+            loader.reload().await,
+            Err(LoaderControlError::Loader(LoaderError::Lifecycle { .. }))
+        ));
+        let snapshot = loader.await_idle().await.unwrap();
+        assert_eq!(
+            snapshot.entry("broken").unwrap().state,
+            Some(FiberState::Failed)
+        );
+        assert_eq!(
+            snapshot.entry("provider").unwrap().state,
+            Some(FiberState::Active)
+        );
+        assert_eq!(
+            snapshot.entry("consumer").unwrap().state,
+            Some(FiberState::Active)
+        );
+        if let Some(id) = provider_id {
+            assert_eq!(fiber_id(&snapshot, "provider"), id);
+        }
+        provider_id = Some(fiber_id(&snapshot, "provider"));
+        assert!(loader.entries().unwrap().extensions.is_empty());
+        assert_eq!(fs::read_to_string(&file).unwrap(), text);
+    }
+    // 失败 reload 未提交 revision：管理写操作仍应要求先处理外部文件变更。
+    assert!(matches!(
+        loader.remove("provider").await,
+        Err(LoaderControlError::ConfigConflict { .. })
+    ));
+    runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn failed_external_reload_is_visible_and_retried_until_fixed() {
     let mut catalog = ExtensionCatalog::new();
     catalog.register(FailFactory).unwrap();
@@ -2046,7 +2294,22 @@ async fn named_isolate_same_label_duplicate_provider_conflicts() {
         ))
         .await
         .expect("handle returned");
-    assert_eq!(fiber.state(), FiberState::Failed);
+    assert_eq!(fiber.state(), FiberState::Active);
+    let snapshot = runtime
+        .root()
+        .get(LOADER)
+        .unwrap()
+        .await_idle()
+        .await
+        .unwrap();
+    assert_eq!(
+        snapshot.entry("a:provider").unwrap().state,
+        Some(FiberState::Active)
+    );
+    assert_eq!(
+        snapshot.entry("b:provider").unwrap().state,
+        Some(FiberState::Failed)
+    );
     runtime.shutdown().await.unwrap();
 }
 

@@ -4,6 +4,7 @@
 //! [`LoaderSubtree::reload`](cordis_loader::LoaderSubtree::reload)，无文件监听。
 //!
 //! 管理子树请用 [`Loader::subtree`](cordis_loader::Loader::subtree)（路径为 Include 条目完整路径）。
+//! 子树业务插件挂载失败保留子树控制面与 Failed 条目；文件或预检失败则使对应 Include 条目失败。
 
 use async_trait::async_trait;
 use cordis_core::{Context, CoreError, Plugin, PluginKey};

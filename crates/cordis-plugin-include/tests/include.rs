@@ -311,7 +311,100 @@ async fn invalid_include_fails_apply_without_residue() {
         ))
         .await
         .expect("handle returned");
-    assert_eq!(fiber.state(), FiberState::Failed);
+    assert_eq!(fiber.state(), FiberState::Active);
+    let loader = runtime.root().get(LOADER).unwrap();
+    let snapshot = loader.await_idle().await.unwrap();
+    assert_eq!(
+        snapshot.entry("reports").unwrap().state,
+        Some(FiberState::Failed)
+    );
+    assert!(
+        snapshot
+            .entry("reports")
+            .unwrap()
+            .last_error
+            .as_deref()
+            .unwrap()
+            .contains("配置版本")
+    );
+    assert!(loader.subtree("reports").is_err());
+    runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn failed_child_keeps_include_control_plane_and_independent_sibling() {
+    struct Broken;
+    #[async_trait]
+    impl Plugin for Broken {
+        fn key(&self) -> PluginKey {
+            PluginKey::new("demo.broken")
+        }
+        async fn apply(&self, _: &Context) -> Result<(), CoreError> {
+            Err(CoreError::PluginApply("child apply failed".into()))
+        }
+    }
+    struct BrokenFactory;
+    impl ExtensionFactory for BrokenFactory {
+        type Config = Empty;
+        fn id(&self) -> &'static str {
+            "demo.broken"
+        }
+        fn prepare(&self, _: Empty) -> Result<PreparedExtension, LoaderError> {
+            Ok(PreparedExtension::ordinary(|| Ok(Arc::new(Broken))))
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let nested = ExtensionsConfig {
+        version: 3,
+        extensions: vec![
+            EntryOptions::new("broken", "demo.broken"),
+            EntryOptions::new("stable", "demo.value"),
+        ],
+    };
+    let bootstrap = write_tree(
+        dir.path(),
+        &ExtensionsConfig {
+            version: 3,
+            extensions: vec![include_entry("nested.toml")],
+        },
+        &nested,
+    );
+    let mut catalog = catalog();
+    catalog.register(BrokenFactory).unwrap();
+    let runtime = Runtime::new().unwrap();
+    let mut fiber = runtime
+        .root()
+        .plugin(Arc::new(
+            LoaderPlugin::bootstrap(catalog, bootstrap).unwrap(),
+        ))
+        .await
+        .unwrap();
+    let loader = runtime.root().get(LOADER).unwrap();
+    let snapshot = loader.await_idle().await.unwrap();
+    assert_eq!(fiber.state(), FiberState::Active);
+    assert_eq!(
+        snapshot.entry("reports").unwrap().state,
+        Some(FiberState::Active)
+    );
+    assert_eq!(
+        snapshot.entry("reports:broken").unwrap().state,
+        Some(FiberState::Failed)
+    );
+    let stable = snapshot.entry("reports:stable").unwrap();
+    assert_eq!(stable.state, Some(FiberState::Active));
+    let subtree = loader.subtree("reports").unwrap();
+    assert_eq!(subtree.snapshot().unwrap().entries.len(), 2);
+    assert!(subtree.reload().await.is_err());
+    subtree.remove("broken").await.unwrap();
+    let recovered = loader.await_idle().await.unwrap();
+    assert!(recovered.entry("reports:broken").is_none());
+    assert_eq!(
+        recovered.entry("reports:stable").unwrap().fiber_id,
+        stable.fiber_id
+    );
+    fiber.dispose_wait().await.unwrap();
+    assert!(runtime.diagnostics().plugin_fibers.is_empty());
+    assert!(loader.subtree("reports").is_err());
     runtime.shutdown().await.unwrap();
 }
 
@@ -375,12 +468,27 @@ async fn duplicate_include_file_fails() {
         ))
         .await
         .expect("handle");
-    assert_eq!(fiber.state(), FiberState::Failed);
+    assert_eq!(fiber.state(), FiberState::Active);
+    let loader = runtime.root().get(LOADER).unwrap();
+    let snapshot = loader.await_idle().await.unwrap();
+    assert_eq!(snapshot.entry("a").unwrap().state, Some(FiberState::Active));
+    assert_eq!(snapshot.entry("b").unwrap().state, Some(FiberState::Failed));
+    assert!(
+        snapshot
+            .entry("b")
+            .unwrap()
+            .last_error
+            .as_deref()
+            .unwrap()
+            .contains("其他树附着")
+    );
+    assert!(loader.subtree("a").is_ok());
+    assert!(loader.subtree("b").is_err());
     runtime.shutdown().await.unwrap();
 }
 
 #[tokio::test]
-async fn include_cycle_reports_include_cycle_without_registered_subtree() {
+async fn include_cycle_fails_only_cyclic_entry_without_registering_another_tree() {
     let dir = tempfile::tempdir().unwrap();
     let mut back_config = toml::Table::new();
     back_config.insert("path".into(), toml::Value::String("extensions.toml".into()));
@@ -405,14 +513,24 @@ async fn include_cycle_reports_include_cycle_without_registered_subtree() {
         ))
         .await
         .expect("handle returned");
-    assert_eq!(fiber.state(), FiberState::Failed);
+    assert_eq!(fiber.state(), FiberState::Active);
+    let loader = runtime.root().get(LOADER).unwrap();
+    let snapshot = loader.await_idle().await.unwrap();
+    let cyclic = snapshot.entry("reports:back").unwrap();
+    assert_eq!(cyclic.state, Some(FiberState::Failed));
     assert!(
-        fiber
-            .last_error()
+        cyclic
+            .last_error
             .as_deref()
             .is_some_and(|message| message.contains("循环引用"))
     );
+    assert_eq!(snapshot.entries.len(), 2);
+    assert!(loader.subtree("reports").is_ok());
+    assert!(loader.subtree("reports:back").is_err());
+    let mut fiber = fiber;
+    fiber.dispose_wait().await.unwrap();
     assert!(runtime.root().get(LOADER).is_err());
+    assert!(runtime.diagnostics().plugin_fibers.is_empty());
     runtime.shutdown().await.unwrap();
 }
 

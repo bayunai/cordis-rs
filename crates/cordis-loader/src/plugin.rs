@@ -143,6 +143,7 @@ impl Plugin for LoaderPlugin {
             let inner = inner.clone();
             move || {
                 inner.alive.store(false, Ordering::Release);
+                inner.state_progress.notify_waiters();
                 for tree in std::iter::once(inner.root.clone()).chain(inner.runtime_trees()) {
                     for entry in tree.entries.lock().expect("entries").values_mut() {
                         entry.volatile = None;
@@ -159,7 +160,7 @@ impl Plugin for LoaderPlugin {
             .expect("LoaderPlugin applies once per state");
         inner
             .root
-            .apply(config, None)
+            .initialize(config)
             .await
             .map(|_| ())
             .map_err(|error| CoreError::PluginApply(error.to_string()))
@@ -193,9 +194,20 @@ impl LoaderInner {
             tokio::pin!(state_progress);
             state_progress.as_mut().enable();
 
+            if !self.alive.load(Ordering::Acquire) {
+                return Err(LoaderError::Runtime {
+                    source: CoreError::ContextDisposed,
+                });
+            }
+
             let _ = self.root.await_idle().await?;
             for tree in self.runtime_trees() {
                 let _ = tree.await_idle().await?;
+            }
+            if !self.alive.load(Ordering::Acquire) {
+                return Err(LoaderError::Runtime {
+                    source: CoreError::ContextDisposed,
+                });
             }
             if !self.has_transient_fibers() {
                 return Ok(self.aggregate_snapshot());
@@ -398,7 +410,7 @@ impl LoaderInner {
             tree
         };
 
-        match tree.apply(config, Some(revision)).await {
+        match tree.initialize(config).await {
             Ok(_) => Ok(tree),
             Err(error) => {
                 let _ = tree.dispose_all().await;

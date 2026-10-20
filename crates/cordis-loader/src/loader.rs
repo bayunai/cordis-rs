@@ -71,6 +71,7 @@ impl Loader {
         Self { inner }
     }
 
+    /// 已加载的初始声明或后续成功提交的声明；不代表各条目均为 Active。
     pub fn entries(&self) -> Result<ExtensionsConfig, LoaderControlError> {
         Ok(self.inner()?.root.desired.lock().expect("desired").clone())
     }
@@ -91,8 +92,13 @@ impl Loader {
         Ok(self.inner()?.catalog.isolations())
     }
 
+    /// 等待受管运行树稳定并返回实际状态，包括 Failed/Pending 条目。
+    /// 业务生命周期错误由变更调用、条目诊断和日志报告，不使整棵树不可读取。
+    /// Loader 关闭及内部协调错误仍返回错误。
     pub async fn await_idle(&self) -> Result<LoaderSnapshot, LoaderControlError> {
-        Ok(self.inner()?.await_idle_all().await?)
+        let snapshot = self.inner()?.await_idle_all().await;
+        self.inner()?;
+        Ok(snapshot?)
     }
 
     /// 订阅后续 Loader 事件。已发生的 revision 不会重放。
@@ -233,7 +239,9 @@ impl LoaderSubtree {
 
     pub async fn await_idle(&self) -> Result<LoaderSnapshot, LoaderControlError> {
         self.ensure_alive()?;
-        Ok(self.tree.await_idle().await?)
+        let snapshot = self.tree.await_idle().await;
+        self.ensure_alive()?;
+        Ok(snapshot?)
     }
 
     pub async fn reload(&self) -> Result<LoaderSnapshot, LoaderControlError> {
