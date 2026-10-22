@@ -19,6 +19,8 @@ pub(crate) fn format_panic_message(boundary: &str, payload: Box<dyn Any + Send>)
 /// 配置与构造错误发生在变更之前；生命周期错误表示至少一步编排已经提交。
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum LoaderError {
+    #[error("无法生成配置控制面的树实例标识")]
+    ConfigIdentityUnavailable,
     #[error("读取配置失败 {path}: {message}", path = path.display())]
     Io { path: PathBuf, message: String },
     #[error("解析配置失败 {path}: {message}", path = path.display())]

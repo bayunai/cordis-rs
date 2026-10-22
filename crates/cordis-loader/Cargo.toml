@@ -12,6 +12,7 @@ description = "Static Catalog plugin loader: configuration, reconcile, and manag
 
 [dependencies]
 async-trait.workspace = true
+getrandom = "0.4"
 cordis-core.workspace = true
 serde.workspace = true
 serde_json.workspace = true

@@ -114,6 +114,15 @@ Factory 是静态 Loader 的必要构造边界：Catalog 根据条目 `name` 找
 普通/热配置能力切换或绑定类型变化会完整替换实例，重新校验 PluginKey 并关闭旧引用。
 该 API 为直接迁移，外部应用需同步更新；不保留双入口或旧构造接口。
 
+### 配置控制面
+
+Loader 从 Catalog Schema 和已加载的 Entry 声明生成安全配置描述，不依赖 Active Fiber。
+`describe_config()` / `mutate_config()` 统一提供脱敏、树实例级版本检查与字段编辑；
+后续仍进入原有 prepare、reconcile、热提交与文件写回，不建立独立 Settings 存储。
+普通配置和热配置都可管理，禁用或失败实例也可修复。Schema 的 `writeOnly` 是秘密投影
+标记，不参与普通/热配置划分。HTTP、鉴权、表单组件与 DTO 属于应用 Host，Core 不感知。
+持久化失败和局部生命周期失败继续遵循现有不回滚语义。详见 [Host 文档](host.md#面向管理界面的配置控制面)。
+
 ### Provider 就绪状态
 
 普通 `provide()` 注册的 Provider 默认 `Ready`。`provide_checked(key, value, check)` 会保存一个同步、无阻塞的状态检查函数，并返回 `ProviderHandle`；Provider 自己的健康任务在本地状态变化后调用 `refresh()`。Core 不轮询、不发网络请求。

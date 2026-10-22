@@ -705,6 +705,7 @@ pub(crate) fn build_plan_plugins(
     desired: &mut BTreeMap<EntryId, DesiredNode>,
     plan: &mut ReconcilePlan,
     mounted: &Mutex<BTreeMap<EntryId, RuntimeEntry>>,
+    mut prepared: Option<(EntryId, crate::PreparedExtension)>,
 ) -> Result<(), LoaderError> {
     let mounted = mounted.lock().expect("entries");
     let mut candidates = plan.build.clone();
@@ -735,9 +736,14 @@ pub(crate) fn build_plan_plugins(
                     .is_some_and(|fiber| fiber.state() == FiberState::Active)
         });
         let result = catch_unwind(AssertUnwindSafe(|| {
-            factory
-                .prepare(&node.options.config)?
-                .resolve(current.and_then(|entry| entry.volatile.as_ref()))
+            // 表单编辑已校验过目标配置；消费同一份预备结果，避免再次执行 prepare。
+            // 禁用或无需构造的目标不会进入 candidates，其闭包随预备结果释放。
+            let candidate = if prepared.as_ref().is_some_and(|(id, _)| id == path) {
+                prepared.take().expect("prepared target").1
+            } else {
+                factory.prepare(&node.options.config)?
+            };
+            candidate.resolve(current.and_then(|entry| entry.volatile.as_ref()))
         }))
         .map_err(|payload| LoaderError::FactoryPanic {
             message: format_panic_message("extension factory prepare/construct", payload),
@@ -907,7 +913,8 @@ mod tests {
     async fn missing_or_failed_parent_never_mounts_descendant_in_root_context() {
         let runtime = Runtime::new().unwrap();
         let parent = runtime.root().plugin(Arc::new(FailedParent)).await.unwrap();
-        let tree = RuntimeTree::new_root(ExtensionCatalog::new(), runtime.root(), None, None);
+        let tree =
+            RuntimeTree::new_root(ExtensionCatalog::new(), runtime.root(), None, None).unwrap();
         tree.entries.lock().unwrap().insert(
             EntryId::from("blocked"),
             RuntimeEntry {

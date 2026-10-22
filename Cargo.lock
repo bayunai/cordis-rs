@@ -256,6 +256,7 @@ dependencies = [
  "cordis-core",
  "cordis-plugin-include",
  "cordis-testkit",
+ "getrandom 0.4.3",
  "schemars",
  "serde",
  "serde_json",

@@ -90,6 +90,7 @@ Loader Factory 统一使用 `prepare()` 返回 `PreparedExtension::ordinary()` �
 Factory 实现；普通插件无需定义空热配置，配置文件格式保持不变。
 
 - [`volatile_config`](crates/cordis-loader/examples/volatile_config.rs)：类型化热配置、Effect 托管订阅与普通配置替换。运行 `cargo run -p cordis-loader --example volatile_config`。
+- [`config_control`](crates/cordis-loader/examples/config_control.rs)：禁用实例配置表单、秘密字段脱敏、版本检查与统一写回。运行 `cargo run -p cordis-loader --example config_control`。
 
 - [`reactive`](examples/reactive.rs)：最小服务注入与响应式重算。
 - [`plugin_hotplug`](examples/plugin_hotplug.rs)：插件替换与卸载。

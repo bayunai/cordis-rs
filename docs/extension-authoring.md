@@ -35,6 +35,33 @@ Entry 释放后订阅返回 `ConfigClosed`，旧引用仍可读取最后快照�
 cargo run -p cordis-loader --example volatile_config
 ```
 
+## 配置表单与秘密字段
+
+Factory 的 `Config: Deserialize + JsonSchema` 同时提供输入类型与表单描述。
+字段的 Rust 文档注释可提供说明；秘密字段使用标准 Schema 标记，不在另一份目录中登记：
+
+```rust
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct UploadConfig {
+    /// 上传服务地址。
+    endpoint: String,
+    #[serde(default)]
+    #[schemars(extend("writeOnly" = true))]
+    bearer_token: Option<String>,
+}
+```
+
+`writeOnly` 仅控制管理投影，不自动加密磁盘文件，也不意味着热更新。
+`prepare()` 必须校验完整配置，不挂载资源；通过 `ordinary()` / `volatile()` 表达实际更新能力。
+禁用实例的表单编辑也会调用 prepare，因此不要将启用期资源访问放到该阶段。
+不要在错误、panic 或日志中拼接 Token 或其他秘密。
+
+应用使用 `describe_config()` 展示表单，再通过 `mutate_config()` 提交有序字段操作和版本。
+未修改的秘密不要从脱敏表单补为空字符串；只有用户明确替换或删除时才提交相应操作。
+管理端无需依赖插件自身的客户端入口，未启用或失败的实例同样能修复配置。
+详细并发、持久化及 Schema 边界见 [Host 配置控制面](host.md#面向管理界面的配置控制面)。
+
 ## 最小 Plugin 示例
 
 ```rust

@@ -1,9 +1,11 @@
 //! 单棵可附着的运行时 EntryTree（根树或 Include 子树）。
 
 use crate::{
+    PreparedExtension,
     bootstrap::load_extensions_source,
     catalog::{ExtensionCatalog, NamedIsolationLabels},
     config::{EntryOptions, ExtensionsConfig},
+    config_control::ConfigRevision,
     error::LoaderError,
     meta::{ENTRY_LOCATION, EntryLocation},
     plugin::RuntimeEntry,
@@ -63,6 +65,8 @@ impl ReconcileCompletion {
 
 /// 一棵文件（或内存）驱动的 EntryTree 运行时状态。
 pub(crate) struct RuntimeTree {
+    pub(crate) config_identity: u128,
+    pub(crate) config_generation: std::sync::atomic::AtomicU64,
     pub(crate) catalog: ExtensionCatalog,
     /// 弱引用宿主，用于附着/注销子树；根树在构造后由 LoaderInner 回填。
     pub(crate) loader: Mutex<Weak<super::plugin::LoaderInner>>,
@@ -90,7 +94,7 @@ impl RuntimeTree {
         owner: Context,
         extensions_path: Option<PathBuf>,
         revision: Option<String>,
-    ) -> Arc<Self> {
+    ) -> Result<Arc<Self>, LoaderError> {
         let (file_key, source_dir) = match &extensions_path {
             Some(path) => {
                 let key = canonicalize_existing(path).ok();
@@ -99,7 +103,9 @@ impl RuntimeTree {
             }
             None => (None, None),
         };
-        Arc::new(Self {
+        Ok(Arc::new(Self {
+            config_identity: next_config_identity()?,
+            config_generation: std::sync::atomic::AtomicU64::new(0),
             catalog,
             loader: Mutex::new(Weak::new()),
             owner,
@@ -118,7 +124,7 @@ impl RuntimeTree {
             named_labels: Mutex::new(NamedIsolationLabels::new()),
             reconcile: Mutex::new(None),
             operations: tokio::sync::Mutex::new(()),
-        })
+        }))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -131,9 +137,11 @@ impl RuntimeTree {
         file_key: PathBuf,
         parent_file: Option<PathBuf>,
         revision: String,
-    ) -> Arc<Self> {
+    ) -> Result<Arc<Self>, LoaderError> {
         let source_dir = file_path.parent().map(Path::to_path_buf);
-        Arc::new(Self {
+        Ok(Arc::new(Self {
+            config_identity: next_config_identity()?,
+            config_generation: std::sync::atomic::AtomicU64::new(0),
             catalog,
             loader: Mutex::new(loader),
             owner,
@@ -152,7 +160,7 @@ impl RuntimeTree {
             named_labels: Mutex::new(NamedIsolationLabels::new()),
             reconcile: Mutex::new(None),
             operations: tokio::sync::Mutex::new(()),
-        })
+        }))
     }
 
     /// 初始声明通过预检后，业务生命周期失败不撤销树的控制面。
@@ -175,6 +183,23 @@ impl RuntimeTree {
         config: ExtensionsConfig,
         revision: Option<String>,
     ) -> Result<LoaderSnapshot, LoaderError> {
+        self.apply_prepared(config, revision, None).await
+    }
+
+    pub(crate) fn config_revision(&self) -> ConfigRevision {
+        ConfigRevision::new(
+            self.config_identity,
+            self.config_generation
+                .load(std::sync::atomic::Ordering::Acquire),
+        )
+    }
+
+    pub(crate) async fn apply_prepared(
+        self: &Arc<Self>,
+        config: ExtensionsConfig,
+        revision: Option<String>,
+        prepared: Option<(EntryId, PreparedExtension)>,
+    ) -> Result<LoaderSnapshot, LoaderError> {
         let prefix = if self.prefix.as_str().is_empty() {
             None
         } else {
@@ -185,13 +210,23 @@ impl RuntimeTree {
             let entries = self.entries.lock().expect("entries");
             plan_reconcile(&entries, &desired, &roots)?
         };
-        build_plan_plugins(&self.catalog, &mut desired, &mut plan, &self.entries)?;
+        build_plan_plugins(
+            &self.catalog,
+            &mut desired,
+            &mut plan,
+            &self.entries,
+            prepared,
+        )?;
         let completion = {
             let mut slot = self.reconcile.lock().expect("reconcile slot");
             if slot.is_some() {
                 return Err(LoaderError::ReconcileBusy);
             }
             let completion = ReconcileCompletion::new();
+            // 生命周期失败可能已经替换或释放部分实例，因此在协调开始时失效令牌，
+            // 而不是仅在完整 desired 或配置文件成功提交后递增。
+            self.config_generation
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
             *slot = Some(completion.clone());
             self.spawn_reconcile(completion.clone(), desired, plan, config, revision);
             completion
@@ -367,6 +402,12 @@ impl RuntimeTree {
     }
 }
 
+fn next_config_identity() -> Result<u128, LoaderError> {
+    let mut bytes = [0; 16];
+    getrandom::fill(&mut bytes).map_err(|_| LoaderError::ConfigIdentityUnavailable)?;
+    Ok(u128::from_ne_bytes(bytes))
+}
+
 /// 供控制面把 revision 冲突转成 `ConfigConflict`。
 pub(crate) fn ensure_tree_revision_control(
     tree: &RuntimeTree,
@@ -451,7 +492,8 @@ mod tests {
     #[tokio::test]
     async fn idle_observer_waits_for_failed_reconcile_but_returns_actual_snapshot() {
         let runtime = Runtime::new().unwrap();
-        let tree = RuntimeTree::new_root(ExtensionCatalog::new(), runtime.root(), None, None);
+        let tree =
+            RuntimeTree::new_root(ExtensionCatalog::new(), runtime.root(), None, None).unwrap();
         let completion = ReconcileCompletion::new();
         *tree.reconcile.lock().unwrap() = Some(completion.clone());
         let mut observer = Box::pin(tree.await_idle());
@@ -475,7 +517,8 @@ mod tests {
     #[tokio::test]
     async fn idle_observer_does_not_hide_lifecycle_coordinator_failure() {
         let runtime = Runtime::new().unwrap();
-        let tree = RuntimeTree::new_root(ExtensionCatalog::new(), runtime.root(), None, None);
+        let tree =
+            RuntimeTree::new_root(ExtensionCatalog::new(), runtime.root(), None, None).unwrap();
         let completion = ReconcileCompletion::new();
         *tree.reconcile.lock().unwrap() = Some(completion.clone());
         completion.finish(Err(LoaderError::Lifecycle {

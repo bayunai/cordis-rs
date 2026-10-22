@@ -82,7 +82,7 @@ impl LoaderPlugin {
         })
     }
 
-    fn initial_state(&self, context: Context) -> Arc<LoaderInner> {
+    fn initial_state(&self, context: Context) -> Result<Arc<LoaderInner>, LoaderError> {
         let (config, extensions_path, revision) = match &self.source {
             ConfigSource::Memory { config } => (config.clone(), None, None),
             ConfigSource::File {
@@ -91,7 +91,7 @@ impl LoaderPlugin {
                 revision,
             } => (config.clone(), Some(path.clone()), Some(revision.clone())),
         };
-        let root = RuntimeTree::new_root(self.catalog.clone(), context, extensions_path, revision);
+        let root = RuntimeTree::new_root(self.catalog.clone(), context, extensions_path, revision)?;
         let (events, _) = broadcast::channel(64);
         let inner = Arc::new(LoaderInner {
             catalog: self.catalog.clone(),
@@ -104,7 +104,7 @@ impl LoaderPlugin {
             initial: Mutex::new(Some(config)),
         });
         *root.loader.lock().expect("loader weak") = Arc::downgrade(&inner);
-        inner
+        Ok(inner)
     }
 }
 
@@ -116,7 +116,9 @@ impl Plugin for LoaderPlugin {
 
     async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
         self.state.lock().expect("loader plugin state").take();
-        let inner = self.initial_state(ctx.clone());
+        let inner = self
+            .initial_state(ctx.clone())
+            .map_err(|error| CoreError::PluginApply(error.to_string()))?;
         ctx.provide(LOADER, Loader::new(inner.clone()))?;
         let mut fiber_states = ctx.subscribe_fiber_states()?;
         let state_inner = inner.clone();
@@ -404,7 +406,7 @@ impl LoaderInner {
                 file_key.clone(),
                 parent_file,
                 revision.clone(),
-            );
+            )?;
             registry.by_file.insert(file_key.clone(), tree.clone());
             registry.by_prefix.insert(prefix, tree.clone());
             tree

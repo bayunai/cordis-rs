@@ -37,6 +37,20 @@ pub struct EntryUpdate {
 
 #[derive(Debug, thiserror::Error)]
 pub enum LoaderControlError {
+    #[error("配置提交任务异常终止，请重新读取配置与运行状态")]
+    ConfigOperationAborted,
+    #[error("配置 revision 格式无效")]
+    InvalidConfigRevision,
+    #[error("配置已发生变化，请重新读取后提交")]
+    ConfigRevisionConflict,
+    #[error("配置路径无效")]
+    InvalidConfigPath,
+    #[error("结构条目不支持配置表单编辑")]
+    ConfigNotEditable,
+    #[error("配置 Schema 无法安全描述: {message}")]
+    SecretSchema { message: String },
+    #[error("配置校验失败；请检查字段类型与插件约束")]
+    ConfigValidation,
     #[error(transparent)]
     Loader(#[from] LoaderError),
     #[error("Loader 已关闭，Loader 不再可用")]
@@ -67,6 +81,43 @@ pub struct Loader {
 }
 
 impl Loader {
+    /// 描述完整路径指定的配置，包括 Include 内部条目；不要求 Fiber Active。
+    pub async fn describe_config(
+        &self,
+        path: impl AsRef<str>,
+    ) -> Result<crate::EntryConfigView, LoaderControlError> {
+        let inner = self.inner()?;
+        let path = path.as_ref();
+        let tree = inner
+            .subtree_owning_path(path)
+            .unwrap_or_else(|| inner.root.clone());
+        let local = config_local_path(&tree, path);
+        crate::config_control::describe(&tree, local).await
+    }
+
+    /// 安全字段编辑；expected_revision 必须来自最近一次配置描述。
+    ///
+    /// 已接受的提交不会因调用方取消等待而中断。普通/热更新沿用 Factory 策略；
+    /// Persist 表示运行时已经生效但文件写回失败，不提供副作用回滚。
+    pub async fn mutate_config(
+        &self,
+        path: impl AsRef<str>,
+        expected_revision: crate::ConfigRevision,
+        operations: Vec<crate::ConfigOperation>,
+    ) -> Result<crate::EntryConfigView, LoaderControlError> {
+        let inner = self.inner()?;
+        let path = path.as_ref();
+        let tree = inner
+            .subtree_owning_path(path)
+            .unwrap_or_else(|| inner.root.clone());
+        crate::config_control::mutate(
+            &tree,
+            config_local_path(&tree, path),
+            expected_revision,
+            operations,
+        )
+        .await
+    }
     pub(crate) fn new(inner: Arc<LoaderInner>) -> Self {
         Self { inner }
     }
@@ -232,6 +283,27 @@ pub struct LoaderSubtree {
 }
 
 impl LoaderSubtree {
+    /// 子树局部路径对应的配置描述；返回值中的路径为全路径。
+    pub async fn describe_config(
+        &self,
+        path: impl AsRef<str>,
+    ) -> Result<crate::EntryConfigView, LoaderControlError> {
+        self.ensure_alive()?;
+        crate::config_control::describe(&self.tree, path.as_ref()).await
+    }
+
+    /// 按子树局部路径提交配置操作，只写所属配置文件；返回描述使用完整路径。
+    /// 并发令牌、取消等待和 Persist 语义与 Loader::mutate_config 相同。
+    pub async fn mutate_config(
+        &self,
+        path: impl AsRef<str>,
+        expected_revision: crate::ConfigRevision,
+        operations: Vec<crate::ConfigOperation>,
+    ) -> Result<crate::EntryConfigView, LoaderControlError> {
+        self.ensure_alive()?;
+        crate::config_control::mutate(&self.tree, path.as_ref(), expected_revision, operations)
+            .await
+    }
     pub fn snapshot(&self) -> Result<LoaderSnapshot, LoaderControlError> {
         self.ensure_alive()?;
         Ok(self.tree.local_snapshot())
@@ -331,6 +403,14 @@ fn reject_cross_tree(inner: &LoaderInner, parent: Option<&str>) -> Result<(), Lo
     Ok(())
 }
 
+fn config_local_path<'a>(tree: &RuntimeTree, full: &'a str) -> &'a str {
+    if tree.prefix.as_str().is_empty() {
+        full
+    } else {
+        &full[tree.prefix.as_str().len() + 1..]
+    }
+}
+
 async fn mutate_tree<F>(
     tree: &Arc<RuntimeTree>,
     mutate: F,
@@ -357,7 +437,7 @@ where
     }
 }
 
-fn source_path_tree(tree: &RuntimeTree) -> Result<PathBuf, LoaderControlError> {
+pub(crate) fn source_path_tree(tree: &RuntimeTree) -> Result<PathBuf, LoaderControlError> {
     tree.extensions_path
         .clone()
         .ok_or(LoaderError::NoConfigSource.into())
@@ -469,7 +549,7 @@ fn remove_nested(
     Ok(result)
 }
 
-fn patch_entry(
+pub(crate) fn patch_entry(
     entries: &mut [EntryOptions],
     path: &str,
     patch: EntryUpdate,

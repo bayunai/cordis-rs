@@ -168,6 +168,54 @@ Loader reconcile 是**局部**的：仅创建、删除、移动、启停或配�
 通过 `inject` 声明，排序不是业务依赖表达方式。成功 reconcile 后会清理目标树不再引用的命名隔离标签。
 全局 `await_idle()` / 快照按根树前序聚合，并在 Include 路径后插入对应子树。
 
+### 面向管理界面的配置控制面
+
+`Loader::describe_config(path).await` 返回 `EntryConfigView`：完整路径、Factory ID、
+管理 Schema、脱敏配置、秘密字段存在状态与 `ConfigRevision`。根控制面接受完整路径并自动
+定位 Include 的所属文件；`LoaderSubtree` 的同名方法接受子树局部路径。Group 仅是树结构，
+不提供配置表单。Schema 来自静态 Catalog，因此禁用、Pending、Failed 条目都能描述；
+读取不会反序列化或构造插件，也不会要求缺失必填字段的禁用条目先启用。
+
+`mutate_config(path, expected_revision, operations).await` 在所属树的操作锁内检查版本、
+应用有序操作、校验完整配置，再复用现有 reconcile 和持久化。`Set` / `Unset` 的路径是
+配置表的字符串键序列，不含 Entry 控制字段；空路径、穿过标量或数组、删除不存在的键
+明确报 `InvalidConfigPath`。Set 可以创建缺失的父表；数组只允许整体替换。
+即使条目禁用，也执行反序列化与 `prepare()`，但不执行延迟构造。预备结果交给原有协调
+复用，目标的 `prepare()` 不会为一次编辑重复执行。普通/热更新仍由 Factory 决定，
+表单 Schema 不推断字段的更新模式。
+
+版本令牌包含随机树实例身份与协调代次，支持 `Display` / `FromStr`，不代表授权。
+应用负责自己的 HTTP DTO、身份验证和权限检查。版本检查失败返回
+`ConfigRevisionConflict`，外部文件改变返回 `ConfigConflict`。所属树的协调一旦启动，
+即使生命周期失败或写回失败，也会让旧令牌失效；同树无关条目的修改也会导致保守冲突。
+重新读取描述后再编辑，不自动重试写操作。配置读取与写入使用同一操作锁，读取不会混合
+本轮提交前的配置与提交后的版本。Include 释放后保留的旧控制句柄不可使用。
+配置编辑一经提交便由独立任务持锁完成；取消调用方的等待不会取消已接受的编辑或跳过
+文件写回。停用 Loader 时，所属树释放会等待已执行的配置编辑结算。
+
+此接口沿用“运行时先应用，再原子写回”的约定，不提供业务副作用事务。生命周期失败不
+写文件，可能保留部分运行变化；`Persist` 表示运行时已经应用但文件写回失败。操作返回
+错误后应重新读取描述和诊断快照，不能将原来的表单认定为仍然有效。
+
+Config 字段通过 `#[schemars(extend("writeOnly" = true))]` 标记秘密。
+描述中删除秘密值，`secrets` 的路径与 `is_set` 仅表示原始配置中是否存在该字段。
+未提交的秘密保留；Set 明确替换；Unset 明确删除并重新校验完整配置。替换父对象或数组
+就是替换整个值，不自动恢复被删除的秘密。数组元素含秘密时，整个数组被隐藏；根配置
+整体标记 writeOnly 时整份配置隐藏，但空路径仍不可操作，建议将标记放到实际字段上。
+
+管理 Schema 保守合并组合分支的秘密标记，展开本地 JSON Pointer 引用，并移除秘密及其
+祖先相关的 `default`、`examples`、`const`、`enum` 载荷。它是安全表单描述，不是可替代
+Factory 校验的完整验证器。远程、动态、循环引用、改变作用域的 `$id`，以及无法安全投影
+的秘密属性模式等返回 `SecretSchema`，不静默忽略。无需另建秘密字段清单或配置存储。
+
+`entries()`、`factories()` 和 `update()` 是受信任的底层接口，可能包含明文配置或原始
+Schema，不能原样发送到浏览器。新接口不会把反序列化、prepare、构造和比较中的原始
+错误文本作为表单校验错误返回；插件仍不得在生命周期错误、panic、日志或 Schema 文字
+说明中拼接秘密。Loader 无法替业务代码清洗任意日志或进程 panic hook 输出。
+
+可运行示例：`cargo run -p cordis-loader --example config_control`。示例使用临时文件，
+演示禁用实例先配置、Token 脱敏与应用层版本字符串往返，不启动 HTTP 服务。
+
 ## Include（可选 crate）
 
 `cordis-plugin-include` 不是 Loader builtin。应用须：

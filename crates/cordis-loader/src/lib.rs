@@ -10,6 +10,8 @@
 mod bootstrap;
 mod catalog;
 mod config;
+mod config_control;
+mod config_secrets;
 mod error;
 mod loader;
 mod meta;
@@ -29,6 +31,7 @@ pub use config::{
     BootstrapConfig, BootstrapConfigSource, CONFIG_VERSION, ConfigDriver, EntryOptions,
     ExtensionsConfig, GROUP_NAME, InjectConfig, IsolateConfig, IsolateValue,
 };
+pub use config_control::{ConfigOperation, ConfigRevision, EntryConfigView, SecretFieldState};
 pub use error::LoaderError;
 pub use loader::{EntryUpdate, LOADER, Loader, LoaderControlError, LoaderEvent, LoaderSubtree};
 pub use meta::{ENTRY_LOCATION, EntryLocation};
