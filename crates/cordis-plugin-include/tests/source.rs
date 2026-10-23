@@ -371,3 +371,106 @@ async fn canonical_identity_and_atomic_writes_have_private_permissions() {
     assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 2);
     runtime.shutdown().await.unwrap();
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn readonly_file_is_readable_but_management_writes_are_rejected_without_changes() {
+    use std::os::unix::fs::PermissionsExt;
+    let runtime = Runtime::new().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let original = document(vec![entry("one", 1)]);
+    save(&path, &original);
+    let original_bytes = fs::read(&path).unwrap();
+    let source = FileSource::open(IncludeConfig::new(&path), &runtime.root())
+        .await
+        .unwrap();
+    let before = source.read().await.unwrap();
+    let target = document(vec![entry("one", 2)]);
+
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o444)).unwrap();
+    let validation = source.validate_write(&target).await;
+    let writing = source.write(&target, &before.revision).await;
+    let readonly_read = source.read().await;
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+
+    assert_eq!(validation.unwrap_err().kind, SourceErrorKind::ReadOnly);
+    assert_eq!(writing.unwrap_err().kind, SourceErrorKind::ReadOnly);
+    let readonly_read = readonly_read.unwrap();
+    assert_eq!(readonly_read.config, original);
+    assert_eq!(readonly_read.revision, before.revision);
+    assert_eq!(fs::read(&path).unwrap(), original_bytes);
+    assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    // 不缓存永久只读标记，同一来源恢复权限后可立即编辑。
+    source.validate_write(&target).await.unwrap();
+    assert_eq!(fs::read(&path).unwrap(), original_bytes);
+    assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    source.write(&target, &before.revision).await.unwrap();
+    assert_eq!(source.read().await.unwrap().config, target);
+    runtime.shutdown().await.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn parent_directory_preflight_observes_actual_process_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+    let runtime = Runtime::new().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    let config = document(vec![entry("one", 1)]);
+    save(&path, &config);
+    let source = FileSource::open(IncludeConfig::new(&path), &runtime.root())
+        .await
+        .unwrap();
+    let bytes = fs::read(&path).unwrap();
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o555)).unwrap();
+    let actual_probe = dir.path().join("actual-access-check");
+    let access = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&actual_probe);
+    let validation = source.validate_write(&config).await;
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755)).unwrap();
+    match access {
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            assert_eq!(validation.unwrap_err().kind, SourceErrorKind::ReadOnly);
+        }
+        Ok(file) => {
+            drop(file);
+            fs::remove_file(actual_probe).unwrap();
+            eprintln!("当前进程可绕过目录模式位；本环境仅验证实际可写探测，不宣称已覆盖目录拒绝。");
+            validation.unwrap();
+        }
+        Err(error) => panic!("无法验证目录写权限：{error}"),
+    }
+    assert_eq!(fs::read(&path).unwrap(), bytes);
+    assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    source.validate_write(&config).await.unwrap();
+    assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    runtime.shutdown().await.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn write_rechecks_readonly_after_successful_validation() {
+    use std::os::unix::fs::PermissionsExt;
+    let runtime = Runtime::new().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    save(&path, &document(vec![entry("one", 1)]));
+    let source = FileSource::open(IncludeConfig::new(&path), &runtime.root())
+        .await
+        .unwrap();
+    let before = source.read().await.unwrap();
+    let target = document(vec![entry("one", 2)]);
+    source.validate_write(&target).await.unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o444)).unwrap();
+    let result = source.write(&target, &before.revision).await;
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+    assert_eq!(result.unwrap_err().kind, SourceErrorKind::ReadOnly);
+    let after = source.read().await.unwrap();
+    assert_eq!(after.config, before.config);
+    assert_eq!(after.revision, before.revision);
+    assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    runtime.shutdown().await.unwrap();
+}

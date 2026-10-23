@@ -86,7 +86,7 @@ impl LoaderControlError {
 
 #[derive(Clone)]
 pub struct Loader {
-    inner: Arc<LoaderInner>,
+    pub(crate) inner: Arc<LoaderInner>,
 }
 
 impl Loader {
@@ -498,11 +498,14 @@ pub(crate) async fn commit_tree_locked(
             *tree.revision.lock().expect("revision") = Some(revision);
             Ok(snapshot)
         }
-        Err(error) => Err(LoaderControlError::Persist {
-            snapshot: Box::new(snapshot),
-            source_id: source.identity(),
-            message: error.to_string(),
-        }),
+        Err(error) => {
+            tree.mark_unsettled();
+            Err(LoaderControlError::Persist {
+                snapshot: Box::new(snapshot),
+                source_id: source.identity(),
+                message: error.to_string(),
+            })
+        }
     }
 }
 

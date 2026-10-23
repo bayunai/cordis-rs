@@ -77,6 +77,17 @@ fn io_error(path: &Path, error: &std::io::Error) -> SourceError {
         ),
     )
 }
+
+fn write_error(path: &Path, error: &std::io::Error) -> SourceError {
+    let mut result = io_error(path, error);
+    if matches!(
+        error.kind(),
+        std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::ReadOnlyFilesystem
+    ) {
+        result.kind = SourceErrorKind::ReadOnly;
+    }
+    result
+}
 impl FileSource {
     pub async fn from_config(
         config: IncludeConfig,
@@ -175,6 +186,9 @@ impl FileSource {
 
 #[async_trait::async_trait]
 impl EntryTreeSource for FileSource {
+    fn enable_logs(&self) -> bool {
+        log_enabled(&self.logs.lock().expect("include logs"))
+    }
     fn identity(&self) -> String {
         self.filename
             .to_str()
@@ -237,7 +251,11 @@ impl EntryTreeSource for FileSource {
     async fn validate_write(&self, config: &ExtensionsConfig) -> Result<(), SourceError> {
         let work = self.work();
         let config = config.clone();
-        file_task(move || work.bytes_for_write(&config).map(|_| ())).await
+        file_task(move || {
+            work.check_writable()?;
+            work.bytes_for_write(&config).map(|_| ())
+        })
+        .await
     }
     async fn write(
         &self,
@@ -248,6 +266,7 @@ impl EntryTreeSource for FileSource {
         let config = config.clone();
         let expected = expected.clone();
         let revision = file_task(move || {
+            work.check_writable()?;
             let bytes = work.bytes_for_write(&config)?;
             work.check_revision(&expected)?;
             atomic_write(&work.filename, &bytes, true)?;
@@ -260,6 +279,25 @@ impl EntryTreeSource for FileSource {
 }
 
 impl FileWork {
+    /// 预判只证明当前条件，实际写回仍须重复检查，不能据此省略原子写入错误。
+    fn check_writable(&self) -> Result<(), SourceError> {
+        let metadata =
+            fs::metadata(&self.filename).map_err(|error| write_error(&self.filename, &error))?;
+        if metadata.permissions().readonly() {
+            return Err(SourceError::new(
+                SourceErrorKind::ReadOnly,
+                format!("Include 配置文件为只读：{}", self.filename.display()),
+            ));
+        }
+        // 不截断、不创建、不写入目标；检查当前进程的有效文件写权限。
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .open(&self.filename)
+            .map_err(|error| write_error(&self.filename, &error))?;
+        drop(file);
+        probe_directory(&self.filename)
+    }
+
     fn read(&self) -> Result<SourceDocument, SourceError> {
         let bytes = match fs::read(&self.filename) {
             Ok(bytes) => bytes,
@@ -316,6 +354,39 @@ impl FileWork {
     }
 }
 
+/// 原子替换需要在同目录创建与删除临时文件。探测不触碰目标正文或目录权限。
+fn probe_directory(path: &Path) -> Result<(), SourceError> {
+    static NEXT_PROBE: AtomicU64 = AtomicU64::new(0);
+    let parent = path.parent().ok_or_else(|| {
+        SourceError::new(SourceErrorKind::InvalidData, "Include 文件路径没有父目录")
+    })?;
+    let name = path.file_name().ok_or_else(|| {
+        SourceError::new(SourceErrorKind::InvalidData, "Include 文件路径没有文件名")
+    })?;
+    let probe = parent.join(format!(
+        ".{}.{}.{}.probe",
+        name.to_string_lossy(),
+        std::process::id(),
+        NEXT_PROBE.fetch_add(1, Ordering::Relaxed)
+    ));
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options
+        .open(&probe)
+        .map_err(|error| write_error(&probe, &error))?;
+    drop(file);
+    remove_probe(&probe)
+}
+
+fn remove_probe(probe: &Path) -> Result<(), SourceError> {
+    fs::remove_file(probe).map_err(|error| write_error(probe, &error))
+}
+
 /// initial 使用 hard_link 的原子“仅不存在才创建”语义，不覆盖竞争者刚建立的文件。
 /// 普通写回使用同目录 rename。临时文件在打开时即设置 0600，正文没有宽权限窗口。
 fn atomic_write(path: &Path, bytes: &[u8], replace: bool) -> Result<(), SourceError> {
@@ -332,39 +403,84 @@ fn atomic_write(path: &Path, bytes: &[u8], replace: bool) -> Result<(), SourceEr
         std::process::id(),
         NEXT.fetch_add(1, Ordering::Relaxed)
     ));
-    let result = (|| {
-        let mut options = fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = options
-            .open(&temporary)
-            .map_err(|error| io_error(&temporary, &error))?;
+    atomic_write_to(path, &temporary, bytes, replace)
+}
+
+fn atomic_write_to(
+    path: &Path,
+    temporary: &Path,
+    bytes: &[u8],
+    replace: bool,
+) -> Result<(), SourceError> {
+    with_owned_temporary(path, temporary, replace, |file| {
         file.write_all(bytes)
-            .map_err(|error| io_error(&temporary, &error))?;
+            .map_err(|error| write_error(temporary, &error))?;
         file.sync_all()
-            .map_err(|error| io_error(&temporary, &error))?;
-        if replace {
-            fs::rename(&temporary, path).map_err(|error| io_error(path, &error))?;
-        } else {
-            fs::hard_link(&temporary, path).map_err(|error| io_error(path, &error))?;
-            fs::remove_file(&temporary).map_err(|error| io_error(&temporary, &error))?;
-        }
-        Ok(())
-    })();
-    if result.is_err() && temporary.exists() {
-        fs::remove_file(&temporary).map_err(|error| io_error(&temporary, &error))?;
+            .map_err(|error| write_error(temporary, &error))
+    })
+}
+
+/// 创建、写入和发布共享同一所有权边界；写入函数失败也不能跳过已拥有文件的清理。
+fn with_owned_temporary(
+    path: &Path,
+    temporary: &Path,
+    replace: bool,
+    write: impl FnOnce(&mut fs::File) -> Result<(), SourceError>,
+) -> Result<(), SourceError> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
     }
-    result
+    // 只有成功创建后才拥有该临时文件。重名或其他打开失败不能触发清理。
+    let mut file = options
+        .open(temporary)
+        .map_err(|error| write_error(temporary, &error))?;
+    let result = write(&mut file);
+    // 发布前关闭文件；失败时也先释放句柄，再处理本次拥有的路径。
+    drop(file);
+    if let Err(error) = result {
+        return Err(cleanup_owned_temporary(temporary, error));
+    }
+    let publication = if replace {
+        fs::rename(temporary, path)
+    } else {
+        fs::hard_link(temporary, path)
+    };
+    if let Err(error) = publication {
+        return Err(cleanup_owned_temporary(
+            temporary,
+            write_error(path, &error),
+        ));
+    }
+    if !replace {
+        // initial 已创建；仅清理自己的临时链接一次，失败明确报告，不重试或回滚目标。
+        fs::remove_file(temporary).map_err(|error| write_error(temporary, &error))?;
+    }
+    Ok(())
+}
+
+/// 仅在本次 create_new 已成功且尚未发布时调用；原始操作错误始终是主错误。
+fn cleanup_owned_temporary(temporary: &Path, mut original: SourceError) -> SourceError {
+    if let Err(error) = fs::remove_file(temporary) {
+        let cleanup = write_error(temporary, &error);
+        original.message = format!(
+            "{}；临时文件清理失败：{}",
+            original.message, cleanup.message
+        );
+    }
+    original
 }
 
 #[cfg(test)]
 mod tests {
-    use super::file_task;
-    use cordis_loader::SourceErrorKind;
+    use super::{
+        atomic_write_to, cleanup_owned_temporary, file_task, remove_probe, with_owned_temporary,
+        write_error,
+    };
+    use cordis_loader::{SourceError, SourceErrorKind};
 
     #[tokio::test(flavor = "current_thread")]
     async fn blocking_file_transaction_leaves_the_scheduler_available() {
@@ -396,5 +512,149 @@ mod tests {
         assert_eq!(error.kind, SourceErrorKind::Unavailable);
         assert_eq!(error.message, "Include 文件事务任务异常终止");
         assert!(!format!("{error:?}").contains("private configuration payload"));
+    }
+
+    #[test]
+    fn write_permission_errors_are_explicit_and_probe_cleanup_is_not_ignored() {
+        let path = std::path::Path::new("configuration-path");
+        for kind in [
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::ReadOnlyFilesystem,
+        ] {
+            assert_eq!(
+                write_error(path, &std::io::Error::from(kind)).kind,
+                SourceErrorKind::ReadOnly
+            );
+        }
+        assert_eq!(
+            write_error(path, &std::io::Error::from(std::io::ErrorKind::NotFound)).kind,
+            SourceErrorKind::Io
+        );
+        let dir = tempfile::tempdir().unwrap();
+        // 已丢失的探测文件不能被当成“清理成功”。
+        let error = remove_probe(&dir.path().join("missing.probe")).unwrap_err();
+        assert_eq!(error.kind, SourceErrorKind::Io);
+    }
+
+    #[test]
+    fn failed_create_new_preserves_the_unowned_file_and_target() {
+        // 来自审计独立复现；显式临时路径使测试不依赖进程计数器或并发顺序。
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("config.toml");
+        let temporary = dir.path().join("existing.tmp");
+        std::fs::write(&target, b"original configuration").unwrap();
+        std::fs::write(&temporary, b"not owned by this write").unwrap();
+        let error = atomic_write_to(&target, &temporary, b"candidate", true).unwrap_err();
+        assert_eq!(error.kind, SourceErrorKind::Io);
+        assert!(error.message.contains("AlreadyExists"));
+        assert_eq!(
+            std::fs::read(&temporary).unwrap(),
+            b"not owned by this write"
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"original configuration");
+    }
+
+    #[test]
+    fn failed_open_does_not_claim_cleanup_ownership() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("config.toml");
+        let temporary = dir.path().join("absent-parent/temporary");
+        std::fs::write(&target, b"original").unwrap();
+        let error = atomic_write_to(&target, &temporary, b"candidate", true).unwrap_err();
+        assert_eq!(error.kind, SourceErrorKind::Io);
+        assert!(error.message.contains("NotFound"));
+        assert!(!error.message.contains("清理失败"));
+        assert_eq!(std::fs::read(&target).unwrap(), b"original");
+    }
+
+    #[test]
+    fn write_and_sync_failures_clean_only_the_owned_temporary() {
+        use std::io::Write;
+        for stage in ["写入", "同步"] {
+            let dir = tempfile::tempdir().unwrap();
+            let target = dir.path().join("config.toml");
+            let temporary = dir.path().join("owned.tmp");
+            std::fs::write(&target, b"original").unwrap();
+            let message = format!("{stage}阶段失败");
+            let error = with_owned_temporary(&target, &temporary, true, |file| {
+                // 同步失败前，正文已写入临时文件，但不得发布到目标。
+                if stage == "同步" {
+                    file.write_all(b"candidate").unwrap();
+                }
+                Err(SourceError::new(SourceErrorKind::ReadOnly, message.clone()))
+            })
+            .unwrap_err();
+            assert_eq!(error.kind, SourceErrorKind::ReadOnly);
+            assert_eq!(error.message, message);
+            assert!(!temporary.exists());
+            assert_eq!(std::fs::read(&target).unwrap(), b"original");
+        }
+    }
+
+    #[test]
+    fn rename_failure_cleans_the_owned_temporary_without_replacing_the_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target-directory");
+        let temporary = dir.path().join("owned.tmp");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("sentinel"), b"keep").unwrap();
+        let error = atomic_write_to(&target, &temporary, b"candidate", true).unwrap_err();
+        assert_eq!(error.kind, SourceErrorKind::Io);
+        assert!(!temporary.exists());
+        assert_eq!(std::fs::read(target.join("sentinel")).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn cleanup_failure_keeps_the_original_kind_and_both_causes() {
+        let dir = tempfile::tempdir().unwrap();
+        let temporary = dir.path().join("owned.tmp");
+        // 模拟创建后被外部替换成目录，remove_file 必须失败且不能覆盖原始操作错误。
+        std::fs::create_dir(&temporary).unwrap();
+        let original = SourceError::new(SourceErrorKind::ReadOnly, "原始同步失败");
+        let error = cleanup_owned_temporary(&temporary, original);
+        assert_eq!(error.kind, SourceErrorKind::ReadOnly);
+        assert!(
+            error
+                .message
+                .starts_with("原始同步失败；临时文件清理失败：")
+        );
+        assert!(error.message.contains("owned.tmp"));
+        assert!(temporary.is_dir());
+    }
+
+    #[test]
+    fn atomic_publication_releases_the_temporary_for_replace_and_initial() {
+        let dir = tempfile::tempdir().unwrap();
+        for replace in [false, true] {
+            let target = dir.path().join(format!("config-{replace}"));
+            let temporary = dir.path().join(format!("owned-{replace}.tmp"));
+            if replace {
+                std::fs::write(&target, b"original").unwrap();
+            }
+            atomic_write_to(&target, &temporary, b"candidate", replace).unwrap();
+            assert_eq!(std::fs::read(&target).unwrap(), b"candidate");
+            assert!(!temporary.exists());
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                assert_eq!(
+                    std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+                    0o600
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn initial_collision_does_not_replace_the_existing_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("existing-config");
+        let temporary = dir.path().join("owned.tmp");
+        std::fs::write(&target, b"original").unwrap();
+        let error = atomic_write_to(&target, &temporary, b"candidate", false).unwrap_err();
+        assert_eq!(error.kind, SourceErrorKind::Io);
+        assert!(error.message.contains("AlreadyExists"));
+        assert!(!temporary.exists());
+        assert_eq!(std::fs::read(&target).unwrap(), b"original");
     }
 }

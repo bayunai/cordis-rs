@@ -50,10 +50,6 @@ impl ExtensionFactory for Factory {
         if input.limit == 0 {
             return Err(LoaderError::invalid_config("private-validation"));
         }
-        if let Some(path) = self.0.persist_fault.lock().unwrap().take() {
-            std::fs::remove_file(&path).unwrap();
-            std::fs::create_dir(path).unwrap();
-        }
         let counts = self.0.clone();
         Ok(PreparedExtension::volatile(
             (input.address, input.token),
@@ -83,6 +79,11 @@ impl Plugin for Instance {
     }
     async fn apply(&self, _: &Context) -> Result<(), CoreError> {
         self.counts.applies.fetch_add(1, Ordering::SeqCst);
+        // 权限/写回故障发生在预判之后，才能验证已生效状态上的 Persist 语义。
+        if let Some(path) = self.counts.persist_fault.lock().unwrap().take() {
+            std::fs::remove_file(&path).unwrap();
+            std::fs::create_dir(path).unwrap();
+        }
         if self.address == "blocked" {
             self.counts.started.notify_one();
             self.counts.release.notified().await;
@@ -508,7 +509,11 @@ async fn persistence_failure_reports_applied_state_and_invalidates_old_revision(
     *h.counts.persist_fault.lock().unwrap() = Some(h.dir.path().join("extensions.toml"));
     assert!(matches!(
         h.loader
-            .mutate_config("include:one", form.revision, vec![set("limit", 9)])
+            .mutate_config(
+                "include:one",
+                form.revision,
+                vec![set("address", "updated"), set("limit", 9)]
+            )
             .await,
         Err(LoaderControlError::Persist { .. })
     ));

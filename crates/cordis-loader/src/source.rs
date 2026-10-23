@@ -56,6 +56,8 @@ pub struct SourceDocument {
 #[async_trait::async_trait]
 pub trait EntryTreeSource: Send + Sync + 'static {
     fn identity(&self) -> String;
+    /// 纯内存的所属树生命周期信息日志策略；错误诊断不受该开关影响。
+    fn enable_logs(&self) -> bool;
     /// 建立来源元数据；定义原地更新成功后也会调用，以提交提供方的共享上下文策略。
     fn context(&self, owner: &Context) -> Result<Context, SourceError>;
     async fn read(&self) -> Result<SourceDocument, SourceError>;

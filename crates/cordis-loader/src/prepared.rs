@@ -24,6 +24,18 @@ pub(crate) struct TreeState {
     opener: Mutex<TreeOpener>,
 }
 
+impl TreeState {
+    fn needs_reconcile(&self) -> bool {
+        self.dirty.load(std::sync::atomic::Ordering::Acquire)
+            || self
+                .mounted
+                .lock()
+                .expect("tree mounted")
+                .as_ref()
+                .is_none_or(|(_, subtree)| subtree.tree.needs_reconcile())
+    }
+}
+
 struct TreePlugin {
     key: PluginKey,
     state: Arc<TreeState>,
@@ -141,6 +153,7 @@ impl<B: FnOnce() -> Result<Arc<dyn Plugin>, LoaderError> + Send> PreparedConfig 
 
 pub(crate) trait ConfigBinding: Any + Send + Sync {
     fn as_any(&self) -> &dyn Any;
+    fn needs_reconcile(&self) -> bool;
 }
 
 struct Binding<S, L> {
@@ -150,6 +163,9 @@ struct Binding<S, L> {
 impl<S: Send + Sync + 'static, L: Send + Sync + 'static> ConfigBinding for Binding<S, L> {
     fn as_any(&self) -> &dyn Any {
         self
+    }
+    fn needs_reconcile(&self) -> bool {
+        false
     }
 }
 
@@ -186,6 +202,9 @@ impl<S: Send + Sync + 'static, C: Send + Sync + 'static> ConfigBinding for TreeB
     fn as_any(&self) -> &dyn Any {
         self
     }
+    fn needs_reconcile(&self) -> bool {
+        self.state.needs_reconcile()
+    }
 }
 impl<S, C, F, Fut> PreparedConfig for TreePrepared<S, C, F>
 where
@@ -214,10 +233,7 @@ where
             && binding.settings == settings
         {
             if *binding.config.lock().expect("tree config") == config
-                && !binding
-                    .state
-                    .dirty
-                    .load(std::sync::atomic::Ordering::Acquire)
+                && !binding.state.needs_reconcile()
             {
                 return Ok(PreparedOutcome::Hot {
                     binding: current.clone(),

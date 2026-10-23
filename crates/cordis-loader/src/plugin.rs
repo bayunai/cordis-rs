@@ -83,25 +83,11 @@ impl Plugin for LoaderPlugin {
             .initial_state(ctx.clone())
             .map_err(|error| CoreError::PluginApply(error.to_string()))?;
         ctx.provide(LOADER, Loader::new(inner.clone()))?;
-        let mut fiber_states = ctx.subscribe_fiber_states()?;
-        let state_inner = inner.clone();
-        let state_task = tokio::spawn(async move {
-            loop {
-                match fiber_states.recv().await {
-                    Ok(change) => state_inner.observe_fiber_state(change.fiber_id),
-                    // 事件流只用于失效通知；滞后时重新投影完整快照即可。
-                    Err(broadcast::error::RecvError::Lagged(_)) => {
-                        state_inner.prune_disposed_bindings();
-                        state_inner.publish_snapshot_changed();
-                        state_inner.state_progress.notify_waiters();
-                    }
-                    Err(broadcast::error::RecvError::Closed) => break,
-                }
-                if !state_inner.alive.load(Ordering::Acquire) {
-                    break;
-                }
-            }
-        });
+        let fiber_states = ctx.subscribe_fiber_states()?;
+        let state_task = tokio::spawn(crate::fiber_events::observe_fiber_events(
+            inner.clone(),
+            fiber_states,
+        ));
         ctx.effect_named("loader-fiber-events")?
             .on_dispose(move || state_task.abort());
         ctx.effect_named("loader-state")?.on_dispose({
@@ -188,8 +174,12 @@ impl LoaderInner {
     }
 
     /// 只观察本 Loader 条目树中的 Fiber；无关 Runtime 工作不会影响 Loader 稳定边界。
-    fn observe_fiber_state(&self, fiber_id: u64) {
-        if !self.manages_fiber(fiber_id) {
+    pub(crate) fn observe_fiber_state(&self, change: cordis_core::FiberStateChange) {
+        let mut tracked = false;
+        for tree in std::iter::once(self.root.clone()).chain(self.runtime_trees()) {
+            tracked |= tree.observe_lifecycle(&change);
+        }
+        if !tracked && !self.manages_fiber(change.fiber_id) {
             return;
         }
         self.prune_disposed_bindings();
@@ -197,7 +187,11 @@ impl LoaderInner {
         self.state_progress.notify_waiters();
     }
 
-    fn prune_disposed_bindings(&self) {
+    pub(crate) fn notify_state_progress(&self) {
+        self.state_progress.notify_waiters();
+    }
+
+    pub(crate) fn prune_disposed_bindings(&self) {
         for tree in std::iter::once(self.root.clone()).chain(self.runtime_trees()) {
             for entry in tree.entries.lock().expect("entries").values_mut() {
                 if entry.fiber.as_ref().is_some_and(Fiber::is_disposed) {
@@ -207,7 +201,7 @@ impl LoaderInner {
         }
     }
 
-    fn runtime_trees(&self) -> Vec<Arc<RuntimeTree>> {
+    pub(crate) fn runtime_trees(&self) -> Vec<Arc<RuntimeTree>> {
         self.subtrees
             .lock()
             .expect("subtree registry")
@@ -315,14 +309,9 @@ impl LoaderInner {
             .config(crate::meta::ENTRY_LOCATION)
             .map_err(|_| LoaderError::EntryLocationMissing)?;
         let source_id = source.identity();
-        let document = source.read().await?;
-        preflight(&self.catalog, &document.config)?;
-
-        let prefix = EntryId::from(location.path.as_str());
-        // 读取/预检在锁外；检查与保留在同一注册表临界区，不能被并发 attach 穿插。
-        let tree = {
-            let mut registry = self.subtrees.lock().expect("subtree registry");
-            let owner_tree = if location.tree_prefix.is_empty() {
+        let owner_tree = {
+            let registry = self.subtrees.lock().expect("subtree registry");
+            let tree = if location.tree_prefix.is_empty() {
                 self.root.clone()
             } else {
                 registry
@@ -333,6 +322,30 @@ impl LoaderInner {
                         instance: location.tree_prefix.clone(),
                     })?
             };
+            tree.ensure_open()?;
+            tree
+        };
+        let document = source.read().await?;
+        preflight(&self.catalog, &document.config)?;
+
+        let prefix = EntryId::from(location.path.as_str());
+        // 读取/预检在锁外；检查与保留在同一注册表临界区，不能被并发 attach 穿插。
+        let tree = {
+            let mut registry = self.subtrees.lock().expect("subtree registry");
+            if owner.is_disposed()
+                || !self.alive.load(Ordering::Acquire)
+                || (!location.tree_prefix.is_empty()
+                    && !registry
+                        .by_prefix
+                        .get(&owner_tree.prefix)
+                        .is_some_and(|current| Arc::ptr_eq(current, &owner_tree)))
+            {
+                return Err(crate::SourceError::new(
+                    crate::SourceErrorKind::Unavailable,
+                    "来源树所属实例已关闭或被替换",
+                )
+                .into());
+            }
             owner_tree.ensure_open()?;
 
             // 先检查祖先链，确保循环比一般重复来源得到更准确的诊断。
@@ -361,6 +374,7 @@ impl LoaderInner {
                 prefix.clone(),
                 source,
                 parent_source,
+                Arc::downgrade(&owner_tree),
                 document.revision,
             )?;
             registry.by_source.insert(source_id, tree.clone());
@@ -371,8 +385,9 @@ impl LoaderInner {
         match tree.initialize(document.config).await {
             Ok(_) => Ok(tree),
             Err(error) => {
-                let _ = tree.dispose_all().await;
-                self.unregister_subtree(&tree);
+                if let Err(cleanup) = self.detach_subtree(&tree).await {
+                    tree.lifecycle_logs.error(&cleanup);
+                }
                 Err(error)
             }
         }
@@ -397,40 +412,13 @@ impl LoaderInner {
         }
     }
 
-    pub(crate) async fn detach_subtree(&self, tree: &Arc<RuntimeTree>) -> Result<(), LoaderError> {
-        // 先卸嵌套子树（前缀以本树 prefix 开头的更长前缀）
-        let nested: Vec<_> = {
-            let registry = self.subtrees.lock().expect("subtree registry");
-            let base = tree.prefix.as_str();
-            registry
-                .by_prefix
-                .iter()
-                .filter(|(prefix, _)| {
-                    let p = prefix.as_str();
-                    !p.is_empty()
-                        && p != base
-                        && (base.is_empty() || p.starts_with(&(base.to_string() + ":")))
-                })
-                .map(|(_, t)| t.clone())
-                .collect()
-        };
-        // 深者优先
-        let mut nested = nested;
-        nested.sort_by(|a, b| {
-            b.prefix
-                .as_str()
-                .matches(':')
-                .count()
-                .cmp(&a.prefix.as_str().matches(':').count())
-        });
-        for child in nested {
-            child.dispose_all().await?;
-            self.unregister_subtree(&child);
-        }
-        tree.dispose_all().await?;
-        self.unregister_subtree(tree);
-        self.publish_snapshot_changed();
-        Ok(())
+    pub(crate) fn detach_subtree(
+        self: &Arc<Self>,
+        tree: &Arc<RuntimeTree>,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<(), LoaderError>> + Send + 'static>,
+    > {
+        crate::release::detach(self.clone(), tree.clone())
     }
 }
 

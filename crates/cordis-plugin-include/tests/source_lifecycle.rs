@@ -405,6 +405,81 @@ async fn carrier_description_does_not_expose_secrets_embedded_in_initial_or_patc
 }
 
 #[tokio::test]
+async fn unchanged_parent_file_reload_repairs_an_uncommitted_nested_source_binding() {
+    let h = Harness::new().await;
+    let nested_path = h.dir.path().join("repair.toml");
+    fs::write(
+        &nested_path,
+        toml::to_string(&ExtensionsConfig {
+            version: 3,
+            extensions: vec![entry("child", 3)],
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    let nested = IncludeConfig::new("repair.toml");
+    let tree = h.loader.subtree("include").unwrap();
+    tree.create(
+        EntryOptions::new("nested", "cordis:include")
+            .with_config(toml::Value::try_from(&nested).unwrap()),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let source_file = h.file();
+    let fiber = h
+        .loader
+        .await_idle()
+        .await
+        .unwrap()
+        .entry("include:nested")
+        .unwrap()
+        .fiber_id;
+    let mut broken = nested;
+    broken.patches = vec![EntryPatch {
+        id: Some("child".into()),
+        config: Some(toml::toml! {value=4 fail=true}.into()),
+        ..Default::default()
+    }];
+    assert!(
+        tree.update(
+            "nested",
+            EntryUpdate {
+                config: Some(toml::Value::try_from(broken).unwrap()),
+                ..Default::default()
+            },
+            None,
+            None
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(h.file(), source_file);
+    assert_eq!(
+        h.loader
+            .await_idle()
+            .await
+            .unwrap()
+            .entry("include:nested:child")
+            .unwrap()
+            .state,
+        Some(FiberState::Failed)
+    );
+    tree.reload().await.unwrap();
+    let repaired = h.loader.await_idle().await.unwrap();
+    assert_eq!(repaired.entry("include:nested").unwrap().fiber_id, fiber);
+    assert_eq!(
+        repaired.entry("include:nested:child").unwrap().state,
+        Some(FiberState::Active)
+    );
+    let prepares = h.counts.builds.load(Ordering::SeqCst);
+    tree.reload().await.unwrap();
+    assert_eq!(h.counts.builds.load(Ordering::SeqCst), prepares);
+    h.runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn one_source_definition_failure_does_not_skip_an_independent_source_update() {
     let h = Harness::new().await;
     for (id, value) in [("left", 3), ("right", 4)] {

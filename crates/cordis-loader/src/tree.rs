@@ -63,6 +63,7 @@ impl ReconcileCompletion {
 
 /// 一棵内存条目树，可选来源对象提供读取、版本检查及持久化。
 pub(crate) struct RuntimeTree {
+    pub(crate) lifecycle_logs: crate::lifecycle_logs::LifecycleLogs,
     pub(crate) config_identity: u128,
     pub(crate) config_generation: std::sync::atomic::AtomicU64,
     pub(crate) catalog: ExtensionCatalog,
@@ -73,7 +74,10 @@ pub(crate) struct RuntimeTree {
     pub(crate) source: Mutex<Option<Arc<dyn EntryTreeSource>>>,
     pub(crate) source_id: Option<String>,
     pub(crate) parent_source: Option<String>,
+    pub(crate) parent_tree: Weak<RuntimeTree>,
+    pub(crate) release: Mutex<Option<Arc<crate::release::ReleaseCompletion>>>,
     pub(crate) closing: std::sync::atomic::AtomicBool,
+    unsettled: std::sync::atomic::AtomicBool,
     pub(crate) desired: Mutex<ExtensionsConfig>,
     pub(crate) revision: Mutex<Option<SourceRevision>>,
     pub(crate) entries: Mutex<BTreeMap<EntryId, RuntimeEntry>>,
@@ -97,6 +101,11 @@ impl RuntimeTree {
         owner: Context,
     ) -> Result<Arc<Self>, LoaderError> {
         Ok(Arc::new(Self {
+            lifecycle_logs: crate::lifecycle_logs::LifecycleLogs::new(
+                owner
+                    .logger_named("loader")
+                    .map_err(|source| LoaderError::Runtime { source })?,
+            ),
             config_identity: next_config_identity()?,
             config_generation: std::sync::atomic::AtomicU64::new(0),
             catalog,
@@ -106,7 +115,10 @@ impl RuntimeTree {
             source: Mutex::new(None),
             source_id: None,
             parent_source: None,
+            parent_tree: Weak::new(),
+            release: Mutex::new(None),
             closing: std::sync::atomic::AtomicBool::new(false),
+            unsettled: std::sync::atomic::AtomicBool::new(true),
             desired: Mutex::new(ExtensionsConfig {
                 version: crate::config::CONFIG_VERSION,
                 extensions: Vec::new(),
@@ -128,11 +140,17 @@ impl RuntimeTree {
         prefix: EntryId,
         source: Arc<dyn EntryTreeSource>,
         parent_source: Option<String>,
+        parent_tree: Weak<RuntimeTree>,
         revision: SourceRevision,
     ) -> Result<Arc<Self>, LoaderError> {
         let source_id = source.identity();
         let owner = source.context(&owner)?;
         Ok(Arc::new(Self {
+            lifecycle_logs: crate::lifecycle_logs::LifecycleLogs::new(
+                owner
+                    .logger_named("loader")
+                    .map_err(|source| LoaderError::Runtime { source })?,
+            ),
             config_identity: next_config_identity()?,
             config_generation: std::sync::atomic::AtomicU64::new(0),
             catalog,
@@ -142,7 +160,10 @@ impl RuntimeTree {
             source: Mutex::new(Some(source)),
             source_id: Some(source_id),
             parent_source,
+            parent_tree,
+            release: Mutex::new(None),
             closing: std::sync::atomic::AtomicBool::new(false),
+            unsettled: std::sync::atomic::AtomicBool::new(true),
             desired: Mutex::new(ExtensionsConfig {
                 version: crate::config::CONFIG_VERSION,
                 extensions: Vec::new(),
@@ -260,6 +281,8 @@ impl RuntimeTree {
                 // 而不是仅在完整 desired 或配置文件成功提交后递增。
                 tree.config_generation
                     .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                tree.unsettled
+                    .store(true, std::sync::atomic::Ordering::Release);
                 *slot = Some(completion.clone());
                 tree.spawn_reconcile(completion.clone(), desired, plan, config, revision);
                 completion
@@ -319,6 +342,8 @@ impl RuntimeTree {
                     *tree.revision.lock().expect("revision") = Some(revision);
                 }
                 tree.prune_named_isolation_labels();
+                tree.unsettled
+                    .store(false, std::sync::atomic::Ordering::Release);
             }
             let mut slot = tree.reconcile.lock().expect("reconcile slot");
             if slot
@@ -403,12 +428,16 @@ impl RuntimeTree {
     }
 
     /// 后序释放全部条目并清空运行时槽位（用于 detach）。
-    pub(crate) async fn dispose_all(self: &Arc<Self>) -> Result<(), LoaderError> {
+    pub(crate) async fn dispose_entries(self: &Arc<Self>) -> Result<(), LoaderError> {
         self.closing
             .store(true, std::sync::atomic::Ordering::Release);
         let _operation = self.operations.lock().await;
         // 等待进行中的 reconcile
-        let _ = self.await_idle().await;
+        let mut first_error = None;
+        if let Err(error) = self.await_idle().await {
+            self.lifecycle_logs.error(&error);
+            first_error = Some(error);
+        }
         let paths: Vec<_> = {
             let entries = self.entries.lock().expect("entries");
             let mut paths: Vec<_> = entries.keys().cloned().collect();
@@ -423,7 +452,10 @@ impl RuntimeTree {
             paths
         };
         for path in paths {
-            self.dispose_and_remove(&path).await?;
+            if let Err(error) = self.dispose_and_remove(&path).await {
+                self.lifecycle_logs.error(&error);
+                first_error.get_or_insert(error);
+            }
         }
         *self.order.lock().expect("entry order") = Vec::new();
         *self.desired.lock().expect("desired") = ExtensionsConfig {
@@ -431,7 +463,10 @@ impl RuntimeTree {
             extensions: Vec::new(),
         };
         self.named_labels.lock().expect("named labels").clear();
-        Ok(())
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     pub(crate) async fn reload(self: &Arc<Self>) -> Result<LoaderSnapshot, LoaderError> {
@@ -447,12 +482,55 @@ impl RuntimeTree {
                 .clone()
                 .ok_or(LoaderError::NoConfigSource)?;
             let document = source.read().await?;
+            if tree.can_skip_reload(&document)? {
+                return Ok(tree.local_snapshot());
+            }
             tree.apply(document.config, Some(document.revision)).await
         })
         .await
         .map_err(|_| LoaderError::ReconcileAborted {
             reason: "来源重载任务异常结束".into(),
         })?
+    }
+
+    fn can_skip_reload(&self, document: &crate::SourceDocument) -> Result<bool, LoaderError> {
+        if self.needs_reconcile()
+            || self.revision.lock().expect("revision").as_ref() != Some(&document.revision)
+            || *self.desired.lock().expect("desired") != document.config
+        {
+            return Ok(false);
+        }
+        let prefix = (!self.prefix.as_str().is_empty()).then_some(self.prefix.as_str());
+        // 只建立结构差分，不调用 Factory。Pending 本身不导致重新构造。
+        let (desired, roots) = index_desired_tree(&self.catalog, &document.config, prefix)?;
+        let entries = self.entries.lock().expect("entries");
+        Ok(plan_reconcile(&entries, &desired, &roots)?.is_empty())
+    }
+
+    pub(crate) fn needs_reconcile(&self) -> bool {
+        self.unsettled.load(std::sync::atomic::Ordering::Acquire)
+            || self.entries.lock().expect("entries").values().any(|entry| {
+                entry.context.is_disposed()
+                    || (entry.enabled && entry.fiber.is_none())
+                    || entry
+                        .binding
+                        .as_ref()
+                        .is_some_and(|binding| binding.needs_reconcile())
+                    || entry.fiber.as_ref().is_some_and(|fiber| {
+                        matches!(
+                            fiber.state(),
+                            cordis_core::FiberState::Loading
+                                | cordis_core::FiberState::Unloading
+                                | cordis_core::FiberState::Failed
+                                | cordis_core::FiberState::Disposed
+                        )
+                    })
+            })
+    }
+
+    pub(crate) fn mark_unsettled(&self) {
+        self.unsettled
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 
     pub(crate) fn ensure_open(&self) -> Result<(), LoaderError> {

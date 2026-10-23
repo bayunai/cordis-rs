@@ -49,6 +49,18 @@ pub(crate) struct ReconcilePlan {
     hot: BTreeMap<EntryId, HotCommit>,
 }
 
+impl ReconcilePlan {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.remove.is_empty()
+            && self.dispose_fiber.is_empty()
+            && self.replace.is_empty()
+            && self.mount.is_empty()
+            && self.build.is_empty()
+            && self.hot.is_empty()
+            && self.tree_updates.is_empty()
+    }
+}
+
 struct TreeCommit {
     state: Arc<crate::prepared::TreeState>,
     fiber_id: u64,
@@ -193,6 +205,14 @@ impl RuntimeTree {
                 *update.tree.source.lock().expect("source") = Some(update.source);
                 (update.commit)();
                 update.state.dirty.store(false, Ordering::Release);
+                self.log_reload(
+                    &path,
+                    &desired
+                        .get(&path)
+                        .expect("source update entry")
+                        .options
+                        .name,
+                );
                 Ok(())
             }
             .await;
@@ -226,6 +246,11 @@ impl RuntimeTree {
                     message: format_panic_message("hot config commit", payload),
                 }
             })?;
+            let factory = current.expect("validated hot entry").factory.clone();
+            drop(entries);
+            if let Some(factory) = factory {
+                self.log_reload(&path, &factory);
+            }
         }
 
         // 6) 纯排序 / 最终前序
@@ -242,6 +267,7 @@ impl RuntimeTree {
             entry.fiber.take()
         };
         if let Some(mut fiber) = fiber.take() {
+            let id = fiber.id();
             fiber
                 .dispose_wait()
                 .await
@@ -249,6 +275,7 @@ impl RuntimeTree {
                     instance: path.to_string(),
                     source,
                 })?;
+            self.record_lifecycle_state(id, FiberState::Disposed);
         }
         self.order
             .lock()
@@ -269,6 +296,7 @@ impl RuntimeTree {
             entry.fiber.take()
         };
         if let Some(mut fiber) = fiber.take() {
+            let id = fiber.id();
             fiber
                 .dispose_wait()
                 .await
@@ -276,6 +304,7 @@ impl RuntimeTree {
                     instance: path.to_string(),
                     source,
                 })?;
+            self.record_lifecycle_state(id, FiberState::Disposed);
         }
         Ok(())
     }
@@ -335,6 +364,7 @@ impl RuntimeTree {
                 ),
             });
         }
+        self.log_reload(path, &node.options.name);
         Ok(())
     }
 
@@ -442,6 +472,9 @@ impl RuntimeTree {
             (None, None, false, None)
         };
 
+        let log_state = (!node.options.group)
+            .then(|| fiber.as_ref().map(|fiber| (fiber.id(), fiber.state())))
+            .flatten();
         let mut entries = self.entries.lock().expect("entries");
         entries.insert(
             path.clone(),
@@ -459,6 +492,9 @@ impl RuntimeTree {
             },
         );
         drop(entries);
+        if let Some((id, state)) = log_state {
+            self.track_lifecycle(id, path, &node.options.name, state);
+        }
         if mount_failed {
             return Err(LoaderError::Lifecycle {
                 instance: path.to_string(),
@@ -597,6 +633,7 @@ pub(crate) fn plan_reconcile(
                 matches!(fiber.state(), FiberState::Failed | FiberState::Disposed)
             });
             if unavailable
+                || current.context.is_disposed()
                 || current.options.inject != node.options.inject
                 || current.options.isolate != node.options.isolate
             {
@@ -632,7 +669,8 @@ pub(crate) fn plan_reconcile(
                 .as_ref()
                 .is_some_and(|fiber| fiber.is_disposed());
 
-            if inject_changed
+            if current.context.is_disposed()
+                || inject_changed
                 || isolate_changed
                 || current.enabled != want_enabled
                 || (want_enabled && (current.fiber.is_none() || disposed))
