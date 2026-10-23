@@ -220,12 +220,7 @@ impl Harness {
             .unwrap();
         }
         fs::write(
-            directory.path().join("bootstrap.toml"),
-            "version = 3\n[config]\ndriver = \"file\"\npath = \"extensions.toml\"\n",
-        )
-        .unwrap();
-        fs::write(
-            directory.path().join("extensions.toml"),
+            directory.path().join("cordis.toml"),
             toml::to_string(&target(entries)).unwrap(),
         )
         .unwrap();
@@ -233,7 +228,7 @@ impl Harness {
         let fiber = mount_file(
             &runtime,
             catalog(state),
-            directory.path().join("bootstrap.toml"),
+            directory.path().join("cordis.toml"),
         )
         .await;
         assert_eq!(fiber.state(), FiberState::Active);
@@ -246,7 +241,7 @@ impl Harness {
         }
     }
     fn file(&self) -> std::path::PathBuf {
-        self.directory.path().join("extensions.toml")
+        self.directory.path().join("cordis.toml")
     }
     fn write(&self, entries: Vec<EntryOptions>) {
         fs::write(self.file(), toml::to_string(&target(entries)).unwrap()).unwrap();
@@ -381,13 +376,14 @@ async fn invalid_candidates_and_panics_do_not_mutate_runtime_or_file() {
 }
 
 #[tokio::test]
-async fn lifecycle_failure_defers_hot_commit_and_same_target_retries() {
+async fn lifecycle_failure_commits_desired_defers_hot_and_same_target_retries() {
     let state = Arc::new(State::default());
     let h = Harness::new(&state, vec![entry("a", "db", 1), entry("b", "db", 1)]).await;
     let first = state.refs.lock().unwrap()[0].clone();
     h.write(vec![entry("a", "db", 2), entry("b", "apply-error", 2)]);
     for _ in 0..2 {
         assert!(h.loader.subtree("include").unwrap().reload().await.is_err());
+        // 热值未提交；声明已按 desired 提交。
         assert_eq!(first.get().revision, 0);
         assert_eq!(
             h.loader
@@ -397,7 +393,7 @@ async fn lifecycle_failure_defers_hot_commit_and_same_target_retries() {
                 .unwrap()
                 .extensions[0]
                 .config,
-            entry("a", "db", 1).config
+            entry("a", "db", 2).config
         );
     }
     h.write(vec![entry("a", "db", 2), entry("b", "fixed", 2)]);
@@ -891,11 +887,9 @@ async fn partial_hot_commit_is_visible_and_retry_does_not_duplicate_revision() {
 async fn mount_file(
     runtime: &Runtime,
     catalog: ExtensionCatalog,
-    bootstrap: impl AsRef<std::path::Path>,
+    cordis: impl AsRef<std::path::Path>,
 ) -> Fiber {
-    let entry = cordis_plugin_include::bootstrap_entry("include", bootstrap)
-        .await
-        .unwrap();
+    let entry = cordis_plugin_include::include_root_entry("include", cordis).unwrap();
     let fiber = runtime
         .root()
         .plugin(Arc::new(LoaderPlugin::new(catalog)))

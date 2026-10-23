@@ -115,7 +115,7 @@ pub enum LoaderError {
 
 impl LoaderError {
     /// 可隔离的业务挂载/清理失败；协调器或运行环境失效不能当作条目失败处理。
-    pub(crate) fn is_entry_lifecycle_failure(&self) -> bool {
+    pub fn is_entry_lifecycle_failure(&self) -> bool {
         matches!(
             self,
             Self::Lifecycle {

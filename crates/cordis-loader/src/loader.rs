@@ -82,6 +82,11 @@ impl LoaderControlError {
             Self::Source { source }
         }
     }
+
+    /// 个别 Entry 挂载/清理失败；组成变更通常已生效，调用方可继续。
+    pub fn is_entry_lifecycle_failure(&self) -> bool {
+        matches!(self, Self::Loader(error) if error.is_entry_lifecycle_failure())
+    }
 }
 
 #[derive(Clone)]
@@ -90,43 +95,46 @@ pub struct Loader {
 }
 
 impl Loader {
-    /// 描述完整路径指定的配置，包括 Include 内部条目；不要求 Fiber Active。
-    pub async fn describe_config(
+    /// 受信任读取完整路径上的原始配置与 Catalog Schema；可含明文秘密。
+    ///
+    /// 不要求 Fiber Active。不得把返回值原样发给浏览器；表单投影由 settings 插件完成。
+    pub async fn snapshot_entry_config(
         &self,
         path: impl AsRef<str>,
-    ) -> Result<crate::EntryConfigView, LoaderControlError> {
+    ) -> Result<crate::EntryConfigSnapshot, LoaderControlError> {
         let inner = self.inner()?;
         let path = path.as_ref();
         let tree = inner
             .subtree_owning_path(path)
             .unwrap_or_else(|| inner.root.clone());
         let local = config_local_path(&tree, path);
-        crate::config_control::describe(&tree, local).await
+        crate::config_control::snapshot(&tree, local).await
     }
 
-    /// 安全字段编辑；expected_revision 必须来自最近一次配置描述。
+    /// 整表替换 Entry 配置；expected 必须来自最近一次快照或表单描述。
     ///
     /// 已接受的提交不会因调用方取消等待而中断。普通/热更新沿用 Factory 策略；
     /// Persist 表示运行时已经生效但文件写回失败，不提供副作用回滚。
-    pub async fn mutate_config(
+    pub async fn commit_entry_config(
         &self,
         path: impl AsRef<str>,
         expected_revision: crate::ConfigRevision,
-        operations: Vec<crate::ConfigOperation>,
-    ) -> Result<crate::EntryConfigView, LoaderControlError> {
+        config: toml::Value,
+    ) -> Result<crate::EntryConfigSnapshot, LoaderControlError> {
         let inner = self.inner()?;
         let path = path.as_ref();
         let tree = inner
             .subtree_owning_path(path)
             .unwrap_or_else(|| inner.root.clone());
-        crate::config_control::mutate(
+        crate::config_control::commit(
             &tree,
             config_local_path(&tree, path),
             expected_revision,
-            operations,
+            config,
         )
         .await
     }
+
     pub(crate) fn new(inner: Arc<LoaderInner>) -> Self {
         Self { inner }
     }
@@ -142,6 +150,28 @@ impl Loader {
 
     pub fn factories(&self) -> Result<Vec<FactoryDescriptor>, LoaderControlError> {
         Ok(self.inner()?.catalog.factories()?)
+    }
+
+    /// 受信任：对 Factory 执行 `prepare` 校验，不修改条目树。
+    ///
+    /// 表单路径在写入 user / reconcile 前调用，使禁用条目也会校验。
+    pub fn prepare_entry_config(
+        &self,
+        factory: &str,
+        config: &toml::Value,
+    ) -> Result<(), LoaderControlError> {
+        self.inner()?
+            .catalog
+            .prepare(factory, config)
+            .map(|_| ())
+            .map_err(|error| match error {
+                LoaderError::InvalidConfig { .. }
+                | LoaderError::FactoryPanic { .. }
+                | LoaderError::PluginBuild { .. }
+                | LoaderError::PluginPanic { .. }
+                | LoaderError::UnknownFactory { .. } => LoaderControlError::ConfigValidation,
+                other => LoaderControlError::Loader(other),
+            })
     }
 
     pub fn injections(&self) -> Result<Vec<InjectionDescriptorInfo>, LoaderControlError> {
@@ -308,27 +338,7 @@ impl LoaderSubtree {
         self.ensure_alive()?;
         Ok(self.tree.desired.lock().expect("desired").clone())
     }
-    /// 子树局部路径对应的配置描述；返回值中的路径为全路径。
-    pub async fn describe_config(
-        &self,
-        path: impl AsRef<str>,
-    ) -> Result<crate::EntryConfigView, LoaderControlError> {
-        self.ensure_alive()?;
-        crate::config_control::describe(&self.tree, path.as_ref()).await
-    }
 
-    /// 按子树局部路径提交配置操作，只写所属配置文件；返回描述使用完整路径。
-    /// 并发令牌、取消等待和 Persist 语义与 Loader::mutate_config 相同。
-    pub async fn mutate_config(
-        &self,
-        path: impl AsRef<str>,
-        expected_revision: crate::ConfigRevision,
-        operations: Vec<crate::ConfigOperation>,
-    ) -> Result<crate::EntryConfigView, LoaderControlError> {
-        self.ensure_alive()?;
-        crate::config_control::mutate(&self.tree, path.as_ref(), expected_revision, operations)
-            .await
-    }
     pub fn snapshot(&self) -> Result<LoaderSnapshot, LoaderControlError> {
         self.ensure_alive()?;
         Ok(self.tree.local_snapshot())

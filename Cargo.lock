@@ -267,12 +267,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "cordis-plugin-config-editor"
+version = "0.2.0"
+dependencies = [
+ "async-trait",
+ "cordis-core",
+ "cordis-loader",
+ "cordis-plugin-include",
+ "cordis-testkit",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "toml",
+]
+
+[[package]]
 name = "cordis-plugin-include"
 version = "0.2.0"
 dependencies = [
  "async-trait",
  "cordis-core",
  "cordis-loader",
+ "cordis-plugin-config-editor",
+ "cordis-plugin-settings",
  "cordis-testkit",
  "schemars",
  "serde",
@@ -292,6 +311,20 @@ dependencies = [
  "cordis-core",
  "time",
  "tokio",
+]
+
+[[package]]
+name = "cordis-plugin-settings"
+version = "0.2.0"
+dependencies = [
+ "async-trait",
+ "cordis-core",
+ "cordis-loader",
+ "cordis-plugin-config-editor",
+ "cordis-testkit",
+ "serde_json",
+ "tokio",
+ "toml",
 ]
 
 [[package]]

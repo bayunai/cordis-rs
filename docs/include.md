@@ -1,7 +1,7 @@
 # Include 文件配置树
 
 `cordis-plugin-include` 是可选的文件来源插件，不是 Loader 内建文件驱动。
-它负责 bootstrap 读取、路径与格式解析、initial、patches、来源版本检查和原子写回。
+它负责路径与格式解析、initial、patches、来源版本检查和原子写回。
 `cordis-loader` 只处理内存条目树、Factory 预检、生命周期协调及热配置提交，通过
 `EntryTreeSource` 委托实际来源操作；`cordis-core` 不感知文件配置。
 
@@ -9,7 +9,7 @@
 
 ```rust
 use cordis_loader::{ExtensionCatalog, LOADER, LoaderPlugin};
-use cordis_plugin_include::{IncludeFactory, bootstrap_entry};
+use cordis_plugin_include::{IncludeFactory, include_root_entry};
 
 let mut catalog = ExtensionCatalog::new();
 catalog.register(IncludeFactory)?;
@@ -17,25 +17,20 @@ catalog.register(IncludeFactory)?;
 let plugin = LoaderPlugin::new(catalog);
 let _loader_fiber = host.root().plugin(std::sync::Arc::new(plugin)).await?;
 let loader = host.root().get(LOADER)?;
-loader.create(bootstrap_entry("include", "bootstrap.toml").await?, None, None).await?;
+loader.create(include_root_entry("include", "cordis.toml")?, None, None).await?;
 ```
 
-启动文件仍是极小 v3 文档，由 Include 读取，不交给 Loader 解析：
+根文档是 v3 `version` / `extensions` 清单（约定名 `cordis.toml`），由 Include 直接读取，
+不经独立 bootstrap 配方、也不交给 Loader 解析。产品路径常为空根，业务 Entry 见
+[config-surface.md](config-surface.md)。
 
-```toml
-version = 3
-[config]
-driver = "file"
-path = "extensions.toml"
-```
-
-`bootstrap_entry` 的 ID 必须由 Host 显式传入。示例统一使用 `include`，因此文件中的 `worker`
+`include_root_entry` 的 ID 必须由 Host 显式传入。示例统一使用 `include`，因此文件中的 `worker`
 完整路径为 `include:worker`；嵌套文件 `reports` 中的 `importer` 为 `include:reports:importer`。
 这是实际路径变化，不提供无前缀别名。文件内部保存的局部 ID 不增加前缀。
 `include` 是应用启动层选择的稳定 ID，不是 Loader 保留名称；应用传入其他 ID 时，
 完整路径使用该 ID 作为前缀，Loader 不特殊识别或省略根 Include。
 
-`bootstrap_entry` 将启动文件的相对 path 转为绝对路径。内存根本身没有文件目录上下文，
+`include_root_entry` 将路径解析为绝对路径。内存根本身没有文件目录上下文，
 因此直接构造根 IncludeConfig 时必须使用绝对路径。嵌套 Include 的相对路径则以承载它的
 父配置文件目录解析，不以进程工作目录解析。
 
@@ -109,17 +104,18 @@ let loader = host.root().get(cordis_loader::LOADER)?;
 let file_tree = loader.subtree("include")?;
 let declarations = file_tree.entries()?;
 let snapshot = file_tree.reload().await?;
-let form = loader.describe_config("include:worker").await?;
+let settings = host.root().get(cordis_plugin_settings::SETTINGS)?;
+let form = settings.describe("include:worker").await?;
 ```
 
-根 Loader 的 create/update/remove 只修改内存声明，不会保存 bootstrap 或任何文件。
-文件树 CRUD 使用对应 `LoaderSubtree` 与文件内局部路径；配置描述和安全字段编辑可以使用
-Loader 的完整路径，由控制面定位来源。include Include 自身仍是应用提供的内存启动声明，
-修改它的配置也不代表已修改 bootstrap；需要持久化该启动组合时应由应用明确保存。
+根 Loader 的 create/update/remove 只修改内存声明，不会保存任何文件。
+文件树 CRUD 使用对应 `LoaderSubtree` 与文件内局部路径；配置描述和安全字段编辑经
+settings / config-editor，使用完整路径定位来源。根 Include 自身仍是应用提供的内存
+启动声明；需要持久化该启动组合时应由应用明确保存。
 
 Include 写回的是**当前有效树**。它不反向恢复原始基础层、不自动清空 patches，也不另存
-用户覆盖文件。已有覆盖可能因此固化进原文件。独立保存用户 patch 属于后续 ConfigEditor，
-不能把两种写回路径混在一起。
+用户覆盖文件。已有覆盖可能因此固化进原文件。独立保存用户 patch 与整表提交同属
+config-editor 路径，不能与受信任的明文 `update` 混用。
 
 持久化前先检查来源版本与写回往返：将目标声明序列化，再读取并应用同一组 patches，
 必须得到相同且合法的目标声明。若插入项重复或固定覆盖使目标不能保持，则明确拒绝，
@@ -178,9 +174,11 @@ Include 将路径规范化、读取与解析、版本检查、写回验证及原
 
 - `LoaderPlugin::new(catalog)` 返回空 Loader 插件，不再接收初始声明，也不返回 `Result`。
   挂载后显式调用 `loader.create(entry, None, None).await`；启动与运行期只有这一创建入口。
-- 删除 `LoaderPlugin::bootstrap`；启动文件条目由 `bootstrap_entry("include", …).await?` 生成后交给 `create()`。
-- 文件 bootstrap/read 辅助函数改从 `cordis_plugin_include` 导入，不保留 Loader 重导出。
-- `FileSource::open` / `from_config`、`load_bootstrap`、`bootstrap_entry`、`load_extensions` 统一改为异步，调用方须使用 `.await`，不提供同步兼容入口。
+- 删除 `LoaderPlugin::bootstrap` 与 Include 的 `bootstrap.toml` / `bootstrap_entry` / `load_bootstrap`；
+  根文件条目由同步 `include_root_entry("include", "cordis.toml")?` 生成后交给 `create()`。
+- 文件 read 辅助函数改从 `cordis_plugin_include` 导入，不保留 Loader 重导出。
+- `FileSource::open` / `from_config`、`load_extensions` 为异步，调用方须使用 `.await`；
+  `include_root_entry` 为同步，不提供旧 bootstrap API。
 - 自定义 `EntryTreeSource` 使用 `async_trait` 实现异步读写方法；`PreparedExtension::tree` 的来源构造闭包改为接收拥有的 `Context` 并返回异步结果。
 - 自定义来源必须实现纯内存的 `enable_logs()`，明确是否输出所属条目的生命周期信息日志。
 - 删除 `attach_file_subtree`；自定义来源使用通用 `attach_subtree`，不把文件路径交给 Loader。

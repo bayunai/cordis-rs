@@ -11,7 +11,7 @@ catalog.register(cordis_plugin_include::IncludeFactory)?;
 let plugin = LoaderPlugin::new(catalog);
 let _loader_fiber = host.root().plugin(Arc::new(plugin)).await?;
 let loader = host.root().get(LOADER)?;
-loader.create(cordis_plugin_include::bootstrap_entry("include", "bootstrap.toml").await?, None, None).await?;
+loader.create(cordis_plugin_include::include_root_entry("include", "cordis.toml")?, None, None).await?;
 ```
 
 保留 `_loader_fiber` 直到应用关闭；释放它会撤销 `LOADER` 并后序释放整棵条目树。
@@ -22,18 +22,12 @@ Loader 挂载后即为空树 Active；启动条目与运行期条目统一使用
 
 ## 配置树
 
-Include 读取 `bootstrap.toml`，将相对文件路径解析为绝对路径。启动文件与扩展清单都使用 v3：
+Host 用 `include_root_entry` 直挂根 v3 文档（约定名 `cordis.toml`）。产品路径常为空根，
+业务 Entry 由 config-editor 的 deploy ∘ user ∘ home 经 Include `patches` 同步；测试与示例也可把
+条目直接写进该文件。文档结构：
 
 ```toml
-# bootstrap.toml
-version = 3
-[config]
-driver = "file"
-path = "extensions.toml"
-```
-
-```toml
-# extensions.toml
+# cordis.toml
 version = 3
 
 [[extensions]]
@@ -183,32 +177,34 @@ Loader reconcile 是**局部**的：仅创建、删除、移动、启停或配�
 
 ### 面向管理界面的配置控制面
 
-`Loader::describe_config(path).await` 返回 `EntryConfigView`：完整路径、Factory ID、
-管理 Schema、脱敏配置、秘密字段存在状态与 `ConfigRevision`。根控制面接受完整路径并自动
-定位所属来源树；`LoaderSubtree` 的同名方法接受子树局部路径。文件写回由 Include 提供。
-返回配置是原始声明的脱敏值，不展开类型默认值或配置继承。Group 仅是树结构，
-不提供配置表单。Schema 来自静态 Catalog，因此禁用、Pending、Failed 条目都能描述；
-读取不会反序列化或构造插件，也不会要求缺失必填字段的禁用条目先启用。
+Host 在 Loader（及 Include 根）之后显式挂载
+[`ConfigEditorPlugin`](../crates/cordis-plugin-config-editor) 与
+[`SettingsPlugin`](../crates/cordis-plugin-settings)。分层见 [配置控制面拆分](config-surface.md)。
+Loader **不**提供 `describe_config` / `mutate_config`；表单只走 `SETTINGS` → config-editor
+**user** 层。运维整表写回走 `CONFIG_EDITOR.commit_source`（其下为 `commit_entry_config`）。
 
-`mutate_config(path, expected_revision, operations).await` 在所属树的操作锁内检查版本、
-应用有序操作、校验完整配置，再复用现有 reconcile 和持久化。`Set` / `Unset` 的路径是
-配置表的字符串键序列，不含 Entry 控制字段；空路径、穿过标量或数组、删除不存在的键
-明确报 `InvalidConfigPath`。Set 可以创建缺失的父表；数组只允许整体替换。
-即使条目禁用，也执行反序列化与 `prepare()`，但不执行延迟构造。预备结果交给原有协调
-复用，目标的 `prepare()` 不会为一次编辑重复执行。普通/热更新仍由 Factory 决定，
-表单 Schema 不推断字段的更新模式。
+`settings.describe(path).await` 返回 `EntryConfigView`：完整路径、Factory ID、管理 Schema、
+脱敏 `base` / `user` / `value`（effective）、秘密字段存在状态与 `ConfigRevision`。
+`base` 为有序 deploy patch 组成结果；`user` 为本机覆盖；`value` = deploy ∘ user ∘ home。
+Group 仅是树结构，不提供配置表单。Schema 来自静态 Catalog，因此禁用、Pending、Failed 条目
+都能描述；读取不会反序列化或构造插件，也不会要求缺失必填字段的禁用条目先启用。
+
+`settings.mutate(path, expected_revision, operations).await` 在 **user** 上拼装有序字段操作，
+委托 config-editor 写入本机 user patch 并 reconcile；**不** bake 空根或各插件 deploy。
+若 home 盖住导致 effective ≠ 目标则拒绝。`Set` / `Unset` 的路径是配置表的字符串键序列，不含
+Entry 控制字段；空路径、穿过标量或数组、删除不存在的键明确报 `InvalidConfigPath`。
+即使条目禁用，也执行反序列化与 `prepare()`，但不执行延迟构造。嵌套 Include 子树首版不可经此路径编辑。
 
 版本令牌包含随机树实例身份与协调代次，支持 `Display` / `FromStr`，不代表授权。
 应用负责自己的 HTTP DTO、身份验证和权限检查。版本检查失败返回
-`ConfigRevisionConflict`，外部来源改变返回明确的来源冲突。所属树的协调一旦启动，
-即使生命周期失败或写回失败，也会让旧令牌失效；同树无关条目的修改也会导致保守冲突。
-重新读取描述后再编辑，不自动重试写操作。配置读取与写入使用同一操作锁，读取不会混合
-本轮提交前的配置与提交后的版本。Include 释放后保留的旧控制句柄不可使用。
-配置编辑一经提交便由独立任务持锁完成；取消调用方的等待不会取消已接受的编辑或跳过
-文件写回。停用 Loader 时，所属树释放会等待已执行的配置编辑结算。
+`ConfigRevisionConflict`。所属树的协调一旦启动，即使生命周期失败，也会让旧令牌失效；
+同树无关条目的修改也会导致保守冲突。重新读取描述后再编辑，不自动重试写操作。
+配置编辑一经提交便由独立任务完成；取消调用方的等待不会取消已接受的编辑或跳过
+user 文档写回。Host 须注入有序 `deploy_patch_paths`、`user_patch_path`、`home_patch_path` 与
+`config_dir`。
 
-此接口沿用“运行时先应用，再原子写回”的约定，不提供业务副作用事务。生命周期失败不
-写文件，可能保留部分运行变化；`Persist` 表示运行时已经应用但文件写回失败。操作返回
+表单路径约定为「先原子写 user，再 reconcile」；校验或应用失败回滚 user 文档。
+`commit_source` 仍沿用「运行时先应用，再写回来源」并可能产生 `Persist`。操作返回
 错误后应重新读取描述和诊断快照，不能将原来的表单认定为仍然有效。
 
 Config 字段通过 `#[schemars(extend("writeOnly" = true))]` 标记秘密。
@@ -222,10 +218,11 @@ Config 字段通过 `#[schemars(extend("writeOnly" = true))]` 标记秘密。
 Factory 校验的完整验证器。远程、动态、循环引用、改变作用域的 `$id`，以及无法安全投影
 的秘密属性模式等返回 `SecretSchema`，不静默忽略。无需另建秘密字段清单或配置存储。
 
-`entries()`、`factories()` 和 `update()` 是受信任的底层接口，可能包含明文配置或原始
-Schema，不能原样发送到浏览器。新接口不会把反序列化、prepare、构造和比较中的原始
-错误文本作为表单校验错误返回；插件仍不得在生命周期错误、panic、日志或 Schema 文字
-说明中拼接秘密。Loader 无法替业务代码清洗任意日志或进程 panic hook 输出。
+`entries()`、`factories()`、`update()` 以及 config-editor 的 `read` / Loader
+`snapshot_entry_config` 是受信任接口，可能包含明文配置或原始 Schema，不能原样发送到浏览器。
+表单路径不会把反序列化、prepare、构造和比较中的原始错误文本作为校验错误返回；插件仍不得在
+生命周期错误、panic、日志或 Schema 文字说明中拼接秘密。Loader 无法替业务代码清洗任意日志或
+进程 panic hook 输出。
 
 可运行示例：`cargo run -p cordis-plugin-include --example config_control`。示例使用临时文件，
 演示禁用实例先配置、Token 脱敏与应用层版本字符串往返，不启动 HTTP 服务。

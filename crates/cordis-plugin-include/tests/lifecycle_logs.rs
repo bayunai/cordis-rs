@@ -214,7 +214,7 @@ async fn readonly_preflight_rejects_edit_without_changing_runtime_revision_or_fi
     let path = dir.path().join("entries.toml");
     save(&path, vec![leaf("worker", 1, false, false)]);
     let (runtime, _fiber, loader) = mount(vec![include("include", &path, Some(true))]).await;
-    let before = loader.describe_config("include:worker").await.unwrap();
+    let before = loader.snapshot_entry_config("include:worker").await.unwrap();
     let id = loader
         .await_idle()
         .await
@@ -243,9 +243,9 @@ async fn readonly_preflight_rejects_edit_without_changing_runtime_revision_or_fi
         matches!(result, Err(cordis_loader::LoaderControlError::Source { source })
         if source.kind == cordis_loader::SourceErrorKind::ReadOnly)
     );
-    let after = loader.describe_config("include:worker").await.unwrap();
+    let after = loader.snapshot_entry_config("include:worker").await.unwrap();
     assert_eq!(before.revision, after.revision);
-    assert_eq!(before.value, after.value);
+    assert_eq!(before.config, after.config);
     assert_eq!(
         id,
         loader

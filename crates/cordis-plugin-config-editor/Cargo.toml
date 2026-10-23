@@ -1,0 +1,27 @@
+[package]
+name = "cordis-plugin-config-editor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+readme = "README.md"
+description = "Persist entry user overlays and apply them through Loader reconcile."
+
+[dependencies]
+async-trait.workspace = true
+cordis-core.workspace = true
+cordis-loader.workspace = true
+cordis-plugin-include.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["fs", "io-util", "macros", "rt", "sync"] }
+toml.workspace = true
+
+[dev-dependencies]
+cordis-testkit.workspace = true
+tempfile = "3"
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

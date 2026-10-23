@@ -1,8 +1,8 @@
 use cordis_core::Runtime;
 use cordis_loader::{EntryOptions, EntryTreeSource, ExtensionsConfig, SourceErrorKind};
 use cordis_plugin_include::{
-    EntryPatch, FileSource, INCLUDE_LOCATION, IncludeConfig, apply_patches, bootstrap_entry,
-    load_bootstrap, load_extensions,
+    EntryPatch, FileSource, INCLUDE_LOCATION, IncludeConfig, apply_patches, include_root_entry,
+    load_extensions,
 };
 use std::{fs, path::Path};
 
@@ -304,33 +304,20 @@ async fn invalid_values_and_secrets_never_become_parser_errors() {
     runtime.shutdown().await.unwrap();
 }
 
-#[tokio::test]
-async fn bootstrap_is_owned_by_include_and_does_not_hide_invalid_input() {
+#[test]
+fn include_root_entry_resolves_path_and_rejects_unknown_extension() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("bootstrap.toml");
-    fs::write(
-        &path,
-        "version=3\n[config]\ndriver='file'\npath='extensions.yaml'\n",
-    )
-    .unwrap();
-    let (_, resolved) = load_bootstrap(&path).await.unwrap();
-    assert_eq!(
-        resolved,
-        dir.path().canonicalize().unwrap().join("extensions.yaml")
-    );
-    let entry = bootstrap_entry("include", &path).await.unwrap();
+    let path = dir.path().join("cordis.toml");
+    fs::write(&path, "version = 3\n\nextensions = []\n").unwrap();
+    let entry = include_root_entry("include", &path).unwrap();
     assert_eq!(entry.id, "include");
     assert_eq!(entry.name, "cordis:include");
     let config: IncludeConfig = entry.config.try_into().unwrap();
-    assert_eq!(config.path, resolved);
-    fs::write(
-        &path,
-        "version=3\n[config]\ndriver='remote'\npath='secret-payload'\n",
-    )
-    .unwrap();
+    assert_eq!(config.path, path.canonicalize().unwrap());
+    let bad = dir.path().join("secret-payload.bin");
+    fs::write(&bad, b"x").unwrap();
     assert!(
-        !load_bootstrap(&path)
-            .await
+        !include_root_entry("include", &bad)
             .err()
             .unwrap()
             .to_string()

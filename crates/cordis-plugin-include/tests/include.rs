@@ -85,17 +85,11 @@ fn write_tree(
     root: &ExtensionsConfig,
     include: &ExtensionsConfig,
 ) -> PathBuf {
-    let bootstrap = dir.join("bootstrap.toml");
-    let extensions = dir.join("extensions.toml");
+    let cordis = dir.join("cordis.toml");
     let nested = dir.join("nested.toml");
-    fs::write(
-        &bootstrap,
-        "version = 3\n[config]\ndriver = \"file\"\npath = \"extensions.toml\"\n",
-    )
-    .unwrap();
-    fs::write(&extensions, toml::to_string_pretty(root).unwrap()).unwrap();
+    fs::write(&cordis, toml::to_string_pretty(root).unwrap()).unwrap();
     fs::write(&nested, toml::to_string_pretty(include).unwrap()).unwrap();
-    bootstrap
+    cordis
 }
 
 fn include_entry(path: &str) -> EntryOptions {
@@ -106,9 +100,9 @@ fn include_entry(path: &str) -> EntryOptions {
         .with_isolate([("value".into(), IsolateValue::Flag(true))].into())
 }
 
-async fn mount(bootstrap: &std::path::Path) -> (Runtime, cordis_core::Fiber, Loader) {
+async fn mount(cordis: &std::path::Path) -> (Runtime, cordis_core::Fiber, Loader) {
     let runtime = Runtime::new().unwrap();
-    let fiber = mount_file(&runtime, catalog(), bootstrap).await;
+    let fiber = mount_file(&runtime, catalog(), cordis).await;
     let loader = (*runtime.root().get(LOADER).unwrap()).clone();
     (runtime, fiber, loader)
 }
@@ -117,7 +111,7 @@ async fn mount(bootstrap: &std::path::Path) -> (Runtime, cordis_core::Fiber, Loa
 async fn root_include_id_is_application_owned_and_has_no_path_aliases() {
     for root_id in ["include", "workspace-config"] {
         let dir = tempfile::tempdir().unwrap();
-        let bootstrap = write_tree(
+        let cordis = write_tree(
             dir.path(),
             &ExtensionsConfig {
                 version: 3,
@@ -134,9 +128,7 @@ async fn root_include_id_is_application_owned_and_has_no_path_aliases() {
         let loader = runtime.root().get(LOADER).unwrap();
         loader
             .create(
-                cordis_plugin_include::bootstrap_entry(root_id, &bootstrap)
-                    .await
-                    .unwrap(),
+                cordis_plugin_include::include_root_entry(root_id, &cordis).unwrap(),
                 None,
                 None,
             )
@@ -149,13 +141,13 @@ async fn root_include_id_is_application_owned_and_has_no_path_aliases() {
             Some(FiberState::Active)
         );
         assert!(loader.entry_context(&full_path).is_ok());
-        assert!(loader.describe_config(&full_path).await.is_ok());
+        assert!(loader.snapshot_entry_config(&full_path).await.is_ok());
         assert!(loader.subtree(root_id).is_ok());
         for alias in ["worker", "main:worker", "include:worker"] {
             if alias != full_path {
                 assert!(snapshot.entry(alias).is_none());
                 assert!(loader.entry_context(alias).is_err());
-                assert!(loader.describe_config(alias).await.is_err());
+                assert!(loader.snapshot_entry_config(alias).await.is_err());
             }
         }
         runtime.shutdown().await.unwrap();
@@ -176,8 +168,8 @@ async fn include_mounts_children_with_prefixed_paths() {
             include_entry("nested.toml"),
         ],
     };
-    let bootstrap = write_tree(dir.path(), &root, &include);
-    let (runtime, _fiber, loader) = mount(&bootstrap).await;
+    let cordis = write_tree(dir.path(), &root, &include);
+    let (runtime, _fiber, loader) = mount(&cordis).await;
     let snapshot = loader.await_idle().await.unwrap();
     assert_eq!(
         snapshot.entry("include:reports:child").unwrap().state,
@@ -222,8 +214,8 @@ async fn include_detach_on_disable_clears_children() {
         version: 3,
         extensions: vec![include_entry("nested.toml")],
     };
-    let bootstrap = write_tree(dir.path(), &root, &include);
-    let (runtime, _fiber, loader) = mount(&bootstrap).await;
+    let cordis = write_tree(dir.path(), &root, &include);
+    let (runtime, _fiber, loader) = mount(&cordis).await;
     loader.await_idle().await.unwrap();
     assert!(loader.entry_context("include:reports:child").is_ok());
 
@@ -262,9 +254,9 @@ async fn subtree_create_writes_only_include_file() {
         version: 3,
         extensions: vec![include_entry("nested.toml")],
     };
-    let bootstrap = write_tree(dir.path(), &root, &include);
-    let root_text_before = fs::read_to_string(dir.path().join("extensions.toml")).unwrap();
-    let (runtime, _fiber, loader) = mount(&bootstrap).await;
+    let cordis = write_tree(dir.path(), &root, &include);
+    let root_text_before = fs::read_to_string(dir.path().join("cordis.toml")).unwrap();
+    let (runtime, _fiber, loader) = mount(&cordis).await;
     loader.await_idle().await.unwrap();
 
     let subtree = loader.subtree("include:reports").unwrap();
@@ -278,7 +270,7 @@ async fn subtree_create_writes_only_include_file() {
         Some(FiberState::Active)
     );
     assert_eq!(
-        fs::read_to_string(dir.path().join("extensions.toml")).unwrap(),
+        fs::read_to_string(dir.path().join("cordis.toml")).unwrap(),
         root_text_before
     );
     let nested: ExtensionsConfig =
@@ -298,8 +290,8 @@ async fn subtree_conflict_requires_reload() {
         version: 3,
         extensions: vec![include_entry("nested.toml")],
     };
-    let bootstrap = write_tree(dir.path(), &root, &include);
-    let (runtime, _fiber, loader) = mount(&bootstrap).await;
+    let cordis = write_tree(dir.path(), &root, &include);
+    let (runtime, _fiber, loader) = mount(&cordis).await;
     loader.await_idle().await.unwrap();
     let subtree = loader.subtree("include:reports").unwrap();
 
@@ -339,7 +331,7 @@ async fn invalid_include_fails_apply_without_residue() {
         version: 3,
         extensions: vec![include_entry("nested.toml")],
     };
-    let bootstrap = write_tree(
+    let cordis = write_tree(
         dir.path(),
         &root,
         &ExtensionsConfig {
@@ -353,7 +345,7 @@ async fn invalid_include_fails_apply_without_residue() {
     )
     .unwrap();
     let runtime = Runtime::new().unwrap();
-    let fiber = mount_file(&runtime, catalog(), &bootstrap).await;
+    let fiber = mount_file(&runtime, catalog(), &cordis).await;
     assert_eq!(fiber.state(), FiberState::Active);
     let loader = runtime.root().get(LOADER).unwrap();
     let snapshot = loader.await_idle().await.unwrap();
@@ -404,7 +396,7 @@ async fn failed_child_keeps_include_control_plane_and_independent_sibling() {
             EntryOptions::new("stable", "demo.value"),
         ],
     };
-    let bootstrap = write_tree(
+    let cordis = write_tree(
         dir.path(),
         &ExtensionsConfig {
             version: 3,
@@ -415,7 +407,7 @@ async fn failed_child_keeps_include_control_plane_and_independent_sibling() {
     let mut catalog = catalog();
     catalog.register(BrokenFactory).unwrap();
     let runtime = Runtime::new().unwrap();
-    let mut fiber = mount_file(&runtime, catalog, bootstrap).await;
+    let mut fiber = mount_file(&runtime, catalog, &cordis).await;
     let loader = runtime.root().get(LOADER).unwrap();
     let snapshot = loader.await_idle().await.unwrap();
     assert_eq!(fiber.state(), FiberState::Active);
@@ -459,8 +451,8 @@ async fn cross_tree_move_is_rejected() {
             include_entry("nested.toml"),
         ],
     };
-    let bootstrap = write_tree(dir.path(), &root, &include);
-    let (runtime, _fiber, loader) = mount(&bootstrap).await;
+    let cordis = write_tree(dir.path(), &root, &include);
+    let (runtime, _fiber, loader) = mount(&cordis).await;
     loader.await_idle().await.unwrap();
     let err = loader
         .subtree("include")
@@ -498,9 +490,9 @@ async fn duplicate_include_file_fails() {
                 .with_isolate(isolate.into()),
         ],
     };
-    let bootstrap = write_tree(dir.path(), &root, &include);
+    let cordis = write_tree(dir.path(), &root, &include);
     let runtime = Runtime::new().unwrap();
-    let fiber = mount_file(&runtime, catalog(), &bootstrap).await;
+    let fiber = mount_file(&runtime, catalog(), &cordis).await;
     assert_eq!(fiber.state(), FiberState::Active);
     let loader = runtime.root().get(LOADER).unwrap();
     let snapshot = loader.await_idle().await.unwrap();
@@ -530,7 +522,7 @@ async fn duplicate_include_file_fails() {
 async fn include_cycle_fails_only_cyclic_entry_without_registering_another_tree() {
     let dir = tempfile::tempdir().unwrap();
     let mut back_config = toml::Table::new();
-    back_config.insert("path".into(), toml::Value::String("extensions.toml".into()));
+    back_config.insert("path".into(), toml::Value::String("cordis.toml".into()));
     let nested = ExtensionsConfig {
         version: 3,
         extensions: vec![
@@ -543,9 +535,9 @@ async fn include_cycle_fails_only_cyclic_entry_without_registering_another_tree(
         version: 3,
         extensions: vec![include_entry("nested.toml")],
     };
-    let bootstrap = write_tree(dir.path(), &root, &nested);
+    let cordis = write_tree(dir.path(), &root, &nested);
     let runtime = Runtime::new().unwrap();
-    let fiber = mount_file(&runtime, catalog(), &bootstrap).await;
+    let fiber = mount_file(&runtime, catalog(), &cordis).await;
     assert_eq!(fiber.state(), FiberState::Active);
     let loader = runtime.root().get(LOADER).unwrap();
     let snapshot = loader.await_idle().await.unwrap();
@@ -581,8 +573,8 @@ async fn concurrent_attach_reserves_one_subtree_source() {
             EntryOptions::new("b", "demo.noop"),
         ],
     };
-    let bootstrap = write_tree(dir.path(), &root, &include);
-    let (runtime, _fiber, loader) = mount(&bootstrap).await;
+    let cordis = write_tree(dir.path(), &root, &include);
+    let (runtime, _fiber, loader) = mount(&cordis).await;
     let left_context = loader.entry_context("include:a").unwrap();
     let right_context = loader.entry_context("include:b").unwrap();
     let barrier = Arc::new(Barrier::new(2));
@@ -671,8 +663,8 @@ async fn nested_include_prefixes_paths() {
         version: 3,
         extensions: vec![include_entry("nested.toml")],
     };
-    let bootstrap = write_tree(dir.path(), &root, &mid);
-    let (runtime, _fiber, loader) = mount(&bootstrap).await;
+    let cordis = write_tree(dir.path(), &root, &mid);
+    let (runtime, _fiber, loader) = mount(&cordis).await;
     let snapshot = loader.await_idle().await.unwrap();
     assert_eq!(
         snapshot.entry("include:reports:mid:leaf").unwrap().state,
@@ -702,11 +694,9 @@ async fn nested_include_prefixes_paths() {
 async fn mount_file(
     runtime: &Runtime,
     catalog: ExtensionCatalog,
-    bootstrap: impl AsRef<std::path::Path>,
+    cordis: impl AsRef<std::path::Path>,
 ) -> cordis_core::Fiber {
-    let entry = cordis_plugin_include::bootstrap_entry("include", bootstrap)
-        .await
-        .unwrap();
+    let entry = cordis_plugin_include::include_root_entry("include", cordis).unwrap();
     let fiber = runtime
         .root()
         .plugin(Arc::new(LoaderPlugin::new(catalog)))

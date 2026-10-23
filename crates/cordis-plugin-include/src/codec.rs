@@ -1,6 +1,19 @@
 //! 每个扩展名只有一个编解码器；解析失败不会尝试其他格式。
 use cordis_loader::{ExtensionsConfig, SourceError, SourceErrorKind};
-use std::path::Path;
+use std::{fs, path::Path};
+
+/// 读取 Include path 源文件并解析为声明树，**不**应用 IncludeConfig.patches。
+///
+/// 供 config-editor 读取 base 层；产品 user 覆盖不得写回该文件。
+pub fn read_extensions_file(path: &Path) -> Result<ExtensionsConfig, SourceError> {
+    let bytes = fs::read(path).map_err(|error| {
+        SourceError::new(
+            SourceErrorKind::Io,
+            format!("无法读取配置文件 {}: {error}", path.display()),
+        )
+    })?;
+    Format::for_path(path)?.parse(&bytes)
+}
 
 #[derive(Clone, Copy)]
 pub(crate) enum Format {

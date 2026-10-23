@@ -25,6 +25,8 @@
 | [`cordis-plugin-timer`](crates/cordis-plugin-timer) | Host 显式挂载的 Effect 作用域计时器能力（timeout / interval / throttle / debounce）。 |
 | [`cordis-plugin-logger-console`](crates/cordis-plugin-logger-console) | Host 显式挂载的控制台日志 exporter；不经 ServiceKey / isolate。 |
 | [`cordis-plugin-include`](crates/cordis-plugin-include) | 可选文件配置树（`cordis:include`）：TOML／JSON／YAML、initial、patches、文件版本检查与原子写回；须 Catalog 显式注册。 |
+| [`cordis-plugin-config-editor`](crates/cordis-plugin-config-editor) | Host 显式挂载的配置编辑器：本机 user patch、base∘user 组成与 reconcile；可选整表 `commit_source`。 |
+| [`cordis-plugin-settings`](crates/cordis-plugin-settings) | Host 显式挂载的配置设置服务：分层 Schema 表单投影（base/user/value）与秘密安全编辑；mutate 只写 user。 |
 | [`cordis-testkit`](crates/cordis-testkit) | 测试辅助；不应用于生产宿主。 |
 
 ## 快速开始
@@ -87,7 +89,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 Loader Factory 统一使用 `prepare()` 返回预备结果，通过 `catalog.register()` 登记。
 普通插件使用 `PreparedExtension::ordinary()`，热配置使用 `volatile()`，Include 等来源树载体
-使用 `tree()`；普通插件无需定义空热配置。文件编解码和 bootstrap 由 Include 负责。
+使用 `tree()`；普通插件无需定义空热配置。文件编解码由 Include 负责。
 
 - [`volatile_config`](crates/cordis-plugin-include/examples/volatile_config.rs)：类型化热配置、Effect 托管订阅与普通配置替换。运行 `cargo run -p cordis-plugin-include --example volatile_config`。
 - [`config_control`](crates/cordis-plugin-include/examples/config_control.rs)：禁用实例配置表单、秘密字段脱敏、版本检查与来源统一写回。运行 `cargo run -p cordis-plugin-include --example config_control`。
@@ -99,6 +101,7 @@ Loader Factory 统一使用 `prepare()` 返回预备结果，通过 `catalog.reg
 - [`host_bootstrap`](crates/cordis-host/examples/host_bootstrap/main.rs)：可复制的 Host 模板，包含入口、静态 Catalog、插件目录与 TOML 扩展清单。
 - [架构与边界](docs/architecture.md)
 - [Host 编排](docs/host.md)
+- [配置控制面拆分](docs/config-surface.md)
 - [Include 文件配置树与迁移](docs/include.md)
 - [扩展编写指南](docs/extension-authoring.md)
 
@@ -111,7 +114,7 @@ cargo run -p cordis-host --example host_bootstrap
 ```
 
 应用入口先通过 `LoaderPlugin::new(catalog)` 显式挂载空 Loader，再调用
-`loader.create(bootstrap_entry("include", "bootstrap.toml").await?, None, None).await?` 登记根文件。
+`loader.create(include_root_entry("include", "cordis.toml")?, None, None).await?` 登记根文件。
 启动与运行期共用 `create()`；Loader 根树只保存在内存，文件编辑
 使用 `loader.subtree("include")` 的局部路径，服务读取使用 `loader.entry_context("include:父:子")`。
 应用与受信任插件通过 `ctx.get(LOADER)` 取得管理服务。Factory 与可配置 inject 均为静态、

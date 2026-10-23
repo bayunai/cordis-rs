@@ -166,13 +166,8 @@ impl Harness {
             extensions: vec![entry],
         };
         fs::write(
-            directory.path().join("extensions.toml"),
+            directory.path().join("cordis.toml"),
             toml::to_string(&config).unwrap(),
-        )
-        .unwrap();
-        fs::write(
-            directory.path().join("bootstrap.toml"),
-            "version = 3\n[config]\ndriver = 'file'\npath = 'extensions.toml'\n",
         )
         .unwrap();
         let counts = Arc::new(Counts::default());
@@ -182,7 +177,7 @@ impl Harness {
             .register(cordis_plugin_include::IncludeFactory)
             .unwrap();
         let runtime = Runtime::new().unwrap();
-        let fiber = mount_file(&runtime, catalog, directory.path().join("bootstrap.toml")).await;
+        let fiber = mount_file(&runtime, catalog, directory.path().join("cordis.toml")).await;
         let loader = (*runtime.root().get(LOADER).unwrap()).clone();
         Self {
             runtime,
@@ -332,7 +327,7 @@ async fn capability_and_binding_types_replace_but_hot_values_do_not_construct() 
 async fn prepare_construct_and_key_failures_are_zero_runtime_change() {
     let h = Harness::new(Mode::Hot, false).await;
     let before = h.view();
-    let file = h.directory.path().join("extensions.toml");
+    let file = h.directory.path().join("cordis.toml");
     let text = fs::read_to_string(&file).unwrap();
     for mode in [
         Mode::PreparePanic,
@@ -403,7 +398,7 @@ async fn disabled_entry_does_not_prepare_or_construct() {
 async fn comparison_panic_is_rejected_before_any_runtime_or_file_change() {
     let h = Harness::new(Mode::CompareSafe, false).await;
     let before = h.view();
-    let path = h.directory.path().join("extensions.toml");
+    let path = h.directory.path().join("cordis.toml");
     let file = fs::read_to_string(&path).unwrap();
     assert!(matches!(
         h.update(Mode::ComparePanic, 2).await,
@@ -420,11 +415,9 @@ async fn comparison_panic_is_rejected_before_any_runtime_or_file_change() {
 async fn mount_file(
     runtime: &Runtime,
     catalog: ExtensionCatalog,
-    bootstrap: impl AsRef<std::path::Path>,
+    cordis: impl AsRef<std::path::Path>,
 ) -> Fiber {
-    let entry = cordis_plugin_include::bootstrap_entry("include", bootstrap)
-        .await
-        .unwrap();
+    let entry = cordis_plugin_include::include_root_entry("include", cordis).unwrap();
     let fiber = runtime
         .root()
         .plugin(Arc::new(LoaderPlugin::new(catalog)))

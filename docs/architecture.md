@@ -8,7 +8,8 @@
 | **Loader** | 静态 Catalog、内存条目树、预检、reconcile、热提交与通用来源接口 | `crates/cordis-loader` |
 | **应用 Host** | 创建 Runtime、显式挂载 LoaderPlugin、运行应用事件循环并受控关闭 | `crates/cordis-host`；应用再接入网络/持久化 |
 | **生命周期能力** | Timer / Console Logger 等须由 Host 显式挂载；不属于 Loader builtin | `cordis-plugin-timer`、`cordis-plugin-logger-console` |
-| **文件配置树** | 可选 Include：bootstrap、路径、TOML／JSON／YAML、patches、文件检查与写回；须 Catalog 显式注册 | `crates/cordis-plugin-include` |
+| **文件配置树** | 可选 Include：根路径、TOML／JSON／YAML、patches、文件检查与写回；须 Catalog 显式注册 | `crates/cordis-plugin-include` |
+| **配置控制面** | Host 显式挂载：settings（表单投影）→ config-editor（校验与写回） | `cordis-plugin-settings`、`cordis-plugin-config-editor`；见 [config-surface.md](config-surface.md) |
 | **扩展** | 实现 `Plugin`，`provide` / `inject` / `on`，不触碰宿主内部类型 | 插件 crate |
 
 `cordis-core` **不包含** HTTP、数据库、Redis、JSON 配置、Manifest、WASM、网关或计时器语义。
@@ -19,35 +20,22 @@
 
 结构化日志由 Core 内置的 Runtime 全局 `LoggerService` 提供（`ctx.logger()?`），**不经** `ServiceKey` / `isolate`，且**不过滤**等级——全部记录进入环形缓冲并分发给 exporter。等级阈值由各 exporter 自行解释（可参考记录上的 `default_level`，来自 `LOGGER_CONFIG.level`）。控制台输出由独立的 `cordis-plugin-logger-console` 挂载；无 Console 时 Logger 仍缓冲。
 
-## Bootstrap 配置边界
+## 根配置挂载
 
-宿主必须从本地、可人工恢复的**极小启动配置文件**启动；默认约定为
-`bootstrap.toml`。它是 Runtime 之外唯一不可由扩展自身替代的配置来源，目的是避免
-“配置扩展需要先读取自身配置”的启动循环。
-
-启动文件只能包含已实现的启动锚点，不得承载应用、路由、策略或任意插件业务配置，
-也不得保存凭证明文。
-
-当前 `cordis-plugin-include` 提供的启动锚点只有文件来源：
-
-```toml
-version = 3
-
-[config]
-driver = "file"
-path = "extensions.toml"
-```
+宿主在代码中显式构造根 Include，指向本地可人工恢复的根文档（约定 `cordis.toml`）。
+不再经独立 bootstrap 配方文件间接指向扩展清单。产品路径常挂空根，业务 Entry 由
+config-editor 的 deploy ∘ user ∘ home 组成；见 [config-surface.md](config-surface.md)。
 
 ```text
 应用入口构造 LoaderPlugin::new(catalog)
   → root.plugin(LoaderPlugin)
-  → await Include.bootstrap_entry("include", bootstrap.toml) 构造显式根 Include 声明
+  → Include.include_root_entry("include", cordis.toml) 构造显式根 Include 声明
   → await loader.create(entry, None, None)
   → include Include 读取文件、提供来源上下文与文件版本
   → Loader 预检文件条目并收敛为 include:* 子树
 ```
 
-- 启动文件的相对 `path` 相对于 `bootstrap.toml` 所在目录解析；嵌套 Include 相对于所属文件目录。
+- 根 Include 的 `path` 须为绝对路径（`include_root_entry` 负责解析）；嵌套 Include 相对于所属文件目录。
   文件重载使用 `loader.subtree("include")?.reload()`，没有自动监听。
 - Loader 的内存根 CRUD 不写任何文件；Include 来源树的 CRUD 与配置编辑只写所属文件。
   `EntryLocation` 只描述条目位置；文件目录与继承日志策略由 Include 的 `INCLUDE_LOCATION` 提供。
@@ -124,13 +112,17 @@ Factory 是静态 Loader 的必要构造边界：Catalog 根据条目 `name` 找
 
 ### 配置控制面
 
-Loader 从 Catalog Schema 和已加载的 Entry 声明生成安全配置描述，不依赖 Active Fiber。
-`describe_config()` / `mutate_config()` 统一提供脱敏、树实例级版本检查与字段编辑；
-后续仍进入原有 prepare、reconcile、热提交与文件写回，不建立独立 Settings 存储。
-普通配置和热配置都可管理，禁用或失败实例也可修复。来源树通过 `EntryTreeSource` 写回，
-文件来源由 Include 实现；内存根编辑不假装已保存到磁盘。Schema 的 `writeOnly` 是秘密投影
-标记，不参与普通/热配置划分。HTTP、鉴权、表单组件与 DTO 属于应用 Host，Core 不感知。
-持久化失败和局部生命周期失败继续遵循现有不回滚语义。详见 [Host 文档](host.md#面向管理界面的配置控制面)。
+由两个 Host 插件承接（Loader 无表单兼容 API）：
+
+- **settings**：安全 Schema、脱敏 value、秘密存在状态与字段操作拼装。
+- **config-editor**：deploy ∘ user ∘ home 组成；表单 `edit` / `set_enabled` 只写 user，
+  再经根 Include `patches` reconcile。运维整表才走 `commit_source` → `commit_entry_config`。
+
+不建立独立 Settings 存储。普通/热配置都可管理，禁用或失败实例也可修复。Schema 的
+`writeOnly` 是秘密投影标记，不参与普通/热配置划分。HTTP、鉴权、表单组件与 DTO 属于应用 Host。
+持久化失败和局部生命周期失败继续遵循现有不回滚语义。
+
+分层见 [配置控制面拆分](config-surface.md)；行为细则见 [Host 文档](host.md#面向管理界面的配置控制面)。
 
 ### Provider 就绪状态
 

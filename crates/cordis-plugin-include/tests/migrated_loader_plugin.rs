@@ -96,14 +96,12 @@ fn config(entries: Vec<EntryOptions>) -> ExtensionsConfig {
 
 async fn mount_file(
     mut catalog: ExtensionCatalog,
-    bootstrap: impl AsRef<std::path::Path>,
+    cordis: impl AsRef<std::path::Path>,
 ) -> (Runtime, Fiber, Loader) {
     catalog
         .register(cordis_plugin_include::IncludeFactory)
         .unwrap();
-    let entry = cordis_plugin_include::bootstrap_entry("include", bootstrap)
-        .await
-        .unwrap();
+    let entry = cordis_plugin_include::include_root_entry("include", cordis).unwrap();
     let runtime = Runtime::new().unwrap();
     let root = runtime.root();
     let fiber = root
@@ -297,16 +295,10 @@ async fn mount_with_file(
     std::path::PathBuf,
 ) {
     let directory = tempfile::tempdir().unwrap();
-    let bootstrap = directory.path().join("bootstrap.toml");
-    let extensions = directory.path().join("extensions.toml");
-    fs::write(
-        &bootstrap,
-        "version = 3\n[config]\ndriver = \"file\"\npath = \"extensions.toml\"\n",
-    )
-    .unwrap();
-    fs::write(&extensions, toml::to_string(&config(entries)).unwrap()).unwrap();
-    let (runtime, fiber, loader) = mount_file(catalog, &bootstrap).await;
-    (runtime, fiber, loader, directory, extensions)
+    let cordis = directory.path().join("cordis.toml");
+    fs::write(&cordis, toml::to_string(&config(entries)).unwrap()).unwrap();
+    let (runtime, fiber, loader) = mount_file(catalog, &cordis).await;
+    (runtime, fiber, loader, directory, cordis)
 }
 
 #[tokio::test]
@@ -320,15 +312,9 @@ async fn disabling_provider_returns_consumer_to_pending_then_recovers() {
     )
     .unwrap();
     let directory = tempfile::tempdir().unwrap();
-    let bootstrap = directory.path().join("bootstrap.toml");
-    let extensions = directory.path().join("extensions.toml");
-    fs::write(
-        &bootstrap,
-        "version = 3\n[config]\ndriver = \"file\"\npath = \"extensions.toml\"\n",
-    )
-    .unwrap();
-    fs::write(&extensions, toml::to_string(&config(vec![group])).unwrap()).unwrap();
-    let (runtime, _loader_fiber, loader) = mount_file(dep_catalog(), &bootstrap).await;
+    let cordis = directory.path().join("cordis.toml");
+    fs::write(&cordis, toml::to_string(&config(vec![group])).unwrap()).unwrap();
+    let (runtime, _loader_fiber, loader) = mount_file(dep_catalog(), &cordis).await;
     assert_eq!(
         loader
             .await_idle()
@@ -390,21 +376,15 @@ async fn disabling_provider_returns_consumer_to_pending_then_recovers() {
 #[tokio::test]
 async fn persistent_create_move_and_conflict_use_paths() {
     let directory = tempfile::tempdir().unwrap();
-    let bootstrap = directory.path().join("bootstrap.toml");
-    let extensions = directory.path().join("extensions.toml");
-    fs::write(
-        &bootstrap,
-        "version = 3\n[config]\ndriver = \"file\"\npath = \"extensions.toml\"\n",
-    )
-    .unwrap();
-    fs::write(&extensions, "version = 3\nextensions = []\n").unwrap();
+    let cordis = directory.path().join("cordis.toml");
+    fs::write(&cordis, "version = 3\nextensions = []\n").unwrap();
     let (runtime, _loader_fiber, loader) = mount_file(
         catalog(vec![Factory {
             id: "demo.value",
             needs_dep: false,
             record: None,
         }]),
-        &bootstrap,
+        &cordis,
     )
     .await;
     loader
@@ -483,11 +463,11 @@ async fn persistent_create_move_and_conflict_use_paths() {
             .is_some()
     );
     assert!(
-        fs::read_to_string(&extensions)
+        fs::read_to_string(&cordis)
             .unwrap()
             .contains("id = \"two\"")
     );
-    fs::write(&extensions, "version = 3\nextensions = []\n# outside\n").unwrap();
+    fs::write(&cordis, "version = 3\nextensions = []\n# outside\n").unwrap();
     assert!(matches!(
         loader
             .subtree("include")
@@ -511,14 +491,8 @@ async fn deleting_group_disposes_children_in_postorder() {
     )
     .unwrap();
     let directory = tempfile::tempdir().unwrap();
-    let bootstrap = directory.path().join("bootstrap.toml");
-    let extensions = directory.path().join("extensions.toml");
-    fs::write(
-        &bootstrap,
-        "version = 3\n[config]\ndriver = \"file\"\npath = \"extensions.toml\"\n",
-    )
-    .unwrap();
-    fs::write(&extensions, toml::to_string(&config(vec![group])).unwrap()).unwrap();
+    let cordis = directory.path().join("cordis.toml");
+    fs::write(&cordis, toml::to_string(&config(vec![group])).unwrap()).unwrap();
     let (runtime, _loader_fiber, loader) = mount_file(
         catalog(vec![
             Factory {
@@ -532,7 +506,7 @@ async fn deleting_group_disposes_children_in_postorder() {
                 record: Some(record.clone()),
             },
         ]),
-        &bootstrap,
+        &cordis,
     )
     .await;
     loader
@@ -682,7 +656,7 @@ async fn pure_reorder_keeps_all_fiber_ids() {
 
 #[tokio::test]
 async fn factory_changed_on_reload_is_zero_runtime_change() {
-    let (runtime, _loader_fiber, loader, _dir, extensions) = mount_with_file(
+    let (runtime, _loader_fiber, loader, _dir, cordis) = mount_with_file(
         catalog(vec![
             Factory {
                 id: "demo.value",
@@ -702,7 +676,7 @@ async fn factory_changed_on_reload_is_zero_runtime_change() {
     let item_id = fiber_id(&before, "item");
 
     fs::write(
-        &extensions,
+        &cordis,
         toml::to_string(&config(vec![EntryOptions::new("item", "demo.dep")])).unwrap(),
     )
     .unwrap();
@@ -815,7 +789,7 @@ async fn plugin_key_changed_during_group_rebuild_is_zero_runtime_change() {
         )]
         .into(),
     ));
-    let (runtime, _loader_fiber, loader, _dir, extensions) =
+    let (runtime, _loader_fiber, loader, _dir, cordis) =
         mount_with_file(catalog, vec![initial]).await;
     let before = loader.await_idle().await.unwrap();
     let keyed_id = fiber_id(&before, "app:keyed");
@@ -835,7 +809,7 @@ async fn plugin_key_changed_during_group_rebuild_is_zero_runtime_change() {
         )]
         .into(),
     ));
-    fs::write(&extensions, toml::to_string(&config(vec![target])).unwrap()).unwrap();
+    fs::write(&cordis, toml::to_string(&config(vec![target])).unwrap()).unwrap();
 
     let error = loader
         .subtree("include")
@@ -868,14 +842,14 @@ async fn plugin_key_changed_during_group_rebuild_is_zero_runtime_change() {
 }
 
 #[tokio::test]
-async fn lifecycle_failure_keeps_unrelated_active_and_skips_desired_commit() {
+async fn lifecycle_failure_keeps_unrelated_active_and_commits_desired_without_file_write() {
     let mut catalog = catalog(vec![Factory {
         id: "demo.value",
         needs_dep: false,
         record: None,
     }]);
     catalog.register(FailFactory).unwrap();
-    let (runtime, _loader_fiber, loader, _dir, extensions) = mount_with_file(
+    let (runtime, _loader_fiber, loader, _dir, cordis) = mount_with_file(
         catalog,
         vec![
             EntryOptions::new("stable", "demo.value"),
@@ -886,7 +860,7 @@ async fn lifecycle_failure_keeps_unrelated_active_and_skips_desired_commit() {
     .await;
     let before = loader.await_idle().await.unwrap();
     let stable_id = fiber_id(&before, "stable");
-    let before_file = fs::read_to_string(&extensions).unwrap();
+    let before_file = fs::read_to_string(&cordis).unwrap();
     let mut events = loader.subscribe().unwrap();
 
     let error = loader
@@ -925,6 +899,7 @@ async fn lifecycle_failure_keeps_unrelated_active_and_skips_desired_commit() {
         after.entry("include:flaky").unwrap().state,
         Some(FiberState::Failed)
     );
+    // 生命周期失败仍提交 desired（运行树已按目标尝试）；来源文件不写回。
     assert_eq!(
         loader
             .subtree("include")
@@ -933,9 +908,9 @@ async fn lifecycle_failure_keeps_unrelated_active_and_skips_desired_commit() {
             .unwrap()
             .extensions[1]
             .config,
-        toml::Value::try_from(FailConfig { fail: false }).unwrap()
+        toml::Value::try_from(FailConfig { fail: true }).unwrap()
     );
-    assert_eq!(fs::read_to_string(&extensions).unwrap(), before_file);
+    assert_eq!(fs::read_to_string(&cordis).unwrap(), before_file);
     runtime.shutdown().await.unwrap();
 }
 
@@ -1141,22 +1116,26 @@ async fn failed_reload_mounts_later_entries_and_retries_without_committing_decla
             assert_eq!(fiber_id(&snapshot, "provider"), id);
         }
         provider_id = Some(fiber_id(&snapshot, "provider"));
-        assert!(
+        // 生命周期失败仍提交 desired；外部文件内容未改写。
+        assert_eq!(
             loader
                 .subtree("include")
                 .unwrap()
                 .entries()
                 .unwrap()
                 .extensions
-                .is_empty()
+                .len(),
+            3
         );
         assert_eq!(fs::read_to_string(&file).unwrap(), text);
     }
-    // 失败 reload 未提交 revision：管理写操作仍应要求先处理外部文件变更。
-    assert!(matches!(
-        loader.subtree("include").unwrap().remove("provider").await,
-        Err(LoaderControlError::ConfigConflict { .. })
-    ));
+    // 外部文件与已提交声明一致时可管理写；此处删掉 broken 以便收敛。
+    loader
+        .subtree("include")
+        .unwrap()
+        .remove("broken")
+        .await
+        .unwrap();
     runtime.shutdown().await.unwrap();
 }
 
@@ -1166,12 +1145,12 @@ async fn failed_external_reload_is_visible_and_retried_until_fixed() {
     catalog.register(FailFactory).unwrap();
     let initial = EntryOptions::new("flaky", "demo.fail")
         .with_config(toml::Value::try_from(FailConfig { fail: false }).unwrap());
-    let (runtime, _loader_fiber, loader, _dir, extensions) =
+    let (runtime, _loader_fiber, loader, _dir, cordis) =
         mount_with_file(catalog, vec![initial.clone()]).await;
 
     let failed = EntryOptions::new("flaky", "demo.fail")
         .with_config(toml::Value::try_from(FailConfig { fail: true }).unwrap());
-    fs::write(&extensions, toml::to_string(&config(vec![failed])).unwrap()).unwrap();
+    fs::write(&cordis, toml::to_string(&config(vec![failed])).unwrap()).unwrap();
     assert!(matches!(
         loader.subtree("include").unwrap().reload().await,
         Err(LoaderControlError::Loader(LoaderError::Lifecycle { .. }))
@@ -1194,7 +1173,7 @@ async fn failed_external_reload_is_visible_and_retried_until_fixed() {
             .unwrap()
             .extensions[0]
             .config,
-        initial.config
+        toml::Value::try_from(FailConfig { fail: true }).unwrap()
     );
 
     assert!(matches!(
@@ -1210,20 +1189,10 @@ async fn failed_external_reload_is_visible_and_retried_until_fixed() {
             .unwrap()
             .state,
         Some(FiberState::Failed)
-    );
-    assert_eq!(
-        loader
-            .subtree("include")
-            .unwrap()
-            .entries()
-            .unwrap()
-            .extensions[0]
-            .config,
-        initial.config
     );
 
     fs::write(
-        &extensions,
+        &cordis,
         toml::to_string(&config(vec![initial])).unwrap(),
     )
     .unwrap();
@@ -1298,17 +1267,23 @@ async fn failed_create_is_visible_and_can_be_removed_before_a_later_success() {
         snapshot.entry("include:flaky").unwrap().state,
         Some(FiberState::Failed)
     );
-    assert!(
+    assert_eq!(
         loader
             .subtree("include")
             .unwrap()
             .entries()
             .unwrap()
             .extensions
-            .is_empty()
+            .len(),
+        1
     );
 
-    loader.subtree("include").unwrap().reload().await.unwrap();
+    loader
+        .subtree("include")
+        .unwrap()
+        .remove("flaky")
+        .await
+        .unwrap();
     assert!(
         loader
             .await_idle()
@@ -1544,13 +1519,13 @@ async fn named_isolate_labels_are_pruned_after_reload() {
     let group_b = EntryOptions::group("b", vec![EntryOptions::new("consumer", "demo.consumer")])
         .unwrap()
         .with_isolate(isolate_dep(false));
-    let (runtime, _loader_fiber, loader, _dir, extensions) =
+    let (runtime, _loader_fiber, loader, _dir, cordis) =
         mount_with_file(catalog, vec![group_a, group_b]).await;
     loader.await_idle().await.unwrap();
 
     // 去掉命名 isolate：成功 reconcile 后应清理 named_labels；再挂回同名标签仍可共享。
     fs::write(
-        &extensions,
+        &cordis,
         toml::to_string(&config(vec![
             EntryOptions::group("a", vec![EntryOptions::new("provider", "demo.dep")])
                 .unwrap()
@@ -1570,7 +1545,7 @@ async fn named_isolate_labels_are_pruned_after_reload() {
     );
 
     fs::write(
-        &extensions,
+        &cordis,
         toml::to_string(&config(vec![
             EntryOptions::group("a", vec![EntryOptions::new("provider", "demo.dep")])
                 .unwrap()
@@ -1597,7 +1572,7 @@ async fn named_isolate_labels_are_pruned_after_reload() {
 
 #[tokio::test]
 async fn update_enable_disable_notifies_subscribers_with_increasing_revision() {
-    let (runtime, _fiber, loader, _directory, _extensions) = mount_with_file(
+    let (runtime, _fiber, loader, _directory, _cordis) = mount_with_file(
         catalog(vec![Factory {
             id: "demo.value",
             needs_dep: false,

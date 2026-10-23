@@ -148,7 +148,7 @@ impl RuntimeTree {
             }
         }
 
-        // 独立条目均已尝试；失败不提交热值、desired 或文件 revision。
+        // 独立条目均已尝试；生命周期失败仍向上返回，由 RuntimeTree 决定是否提交 desired。
         if let Some(error) = lifecycle_error {
             return Err(error);
         }

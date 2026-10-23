@@ -248,16 +248,14 @@ async fn memory_root_mutation_does_not_persist_and_source_tree_uses_its_backend(
     tree.create(entry("other", 2), None, None).await.unwrap();
     assert_eq!(source.writes.load(Ordering::SeqCst), 1);
     assert_eq!(source.data.lock().unwrap().extensions.len(), 2);
-    let form = loader.describe_config("tree:leaf").await.unwrap();
+    let form = loader.snapshot_entry_config("tree:leaf").await.unwrap();
+    let mut config = form.config;
+    config
+        .as_table_mut()
+        .unwrap()
+        .insert("value".into(), 3.into());
     loader
-        .mutate_config(
-            "tree:leaf",
-            form.revision,
-            vec![cordis_loader::ConfigOperation::Set {
-                path: vec!["value".into()],
-                value: 3.into(),
-            }],
-        )
+        .commit_entry_config("tree:leaf", form.revision, config)
         .await
         .unwrap();
     assert_eq!(source.writes.load(Ordering::SeqCst), 2);
@@ -274,7 +272,7 @@ async fn unchanged_reload_reads_source_but_does_not_prepare_revise_or_publish() 
     loader.await_idle().await.unwrap();
     tokio::task::yield_now().await;
     let tree = loader.subtree("tree").unwrap();
-    let before = loader.describe_config("tree:leaf").await.unwrap();
+    let before = loader.snapshot_entry_config("tree:leaf").await.unwrap();
     let fiber = tree
         .snapshot()
         .unwrap()
@@ -289,7 +287,11 @@ async fn unchanged_reload_reads_source_but_does_not_prepare_revise_or_publish() 
         let snapshot = tree.reload().await.unwrap();
         assert_eq!(snapshot.entry("tree:leaf").unwrap().fiber_id, fiber);
         assert_eq!(
-            loader.describe_config("tree:leaf").await.unwrap().revision,
+            loader
+                .snapshot_entry_config("tree:leaf")
+                .await
+                .unwrap()
+                .revision,
             before.revision
         );
     }
@@ -334,7 +336,7 @@ async fn stable_pending_entry_does_not_force_unchanged_reload() {
     source.pending.store(true, Ordering::SeqCst);
     let (runtime, _fiber, loader, source) = mount_source(source).await;
     let tree = loader.subtree("tree").unwrap();
-    let before = loader.describe_config("tree:leaf").await.unwrap();
+    let before = loader.snapshot_entry_config("tree:leaf").await.unwrap();
     let snapshot = tree.snapshot().unwrap();
     assert_eq!(
         snapshot.entry("tree:leaf").unwrap().state,
@@ -344,7 +346,11 @@ async fn stable_pending_entry_does_not_force_unchanged_reload() {
     tree.reload().await.unwrap();
     assert_eq!(source.prepares.load(Ordering::SeqCst), prepares);
     assert_eq!(
-        loader.describe_config("tree:leaf").await.unwrap().revision,
+        loader
+            .snapshot_entry_config("tree:leaf")
+            .await
+            .unwrap()
+            .revision,
         before.revision
     );
     assert_eq!(

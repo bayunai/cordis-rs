@@ -1,11 +1,16 @@
 //! 受信任 Host 将配置描述交给管理 UI；传输与认证不属于 Loader。
+//! 表单写入本机 user patch，不 bake 进空根或 deploy patch。
 use async_trait::async_trait;
 use cordis_core::{Context, CoreError, Plugin, PluginKey, Runtime};
 use cordis_loader::{
-    ConfigOperation, EntryOptions, ExtensionCatalog, ExtensionFactory, ExtensionsConfig, LOADER,
-    LoaderError, LoaderPlugin, PreparedExtension,
+    EntryOptions, ExtensionCatalog, ExtensionFactory, LOADER, LoaderError, LoaderPlugin,
+    PreparedExtension,
 };
-use cordis_plugin_include::{IncludeFactory, bootstrap_entry};
+use cordis_plugin_config_editor::{
+    ConfigEditorConfig, ConfigEditorPlugin, PATCH_FILE_VERSION, PatchFileDocument,
+};
+use cordis_plugin_include::{EntryPatch, IncludeFactory, include_root_entry};
+use cordis_plugin_settings::{ConfigOperation, SETTINGS, SettingsPlugin};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use std::{fs, sync::Arc};
@@ -32,7 +37,6 @@ impl ExtensionFactory for Factory {
                 "endpoint 必须使用 HTTP 或 HTTPS",
             ));
         }
-        // 实际插件在闭包内捕获配置；绝不把 Token 写进日志或错误。
         let _ = config.token;
         Ok(PreparedExtension::ordinary(|| Ok(Arc::new(ExamplePlugin))))
     }
@@ -50,41 +54,55 @@ impl Plugin for ExamplePlugin {
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;
-    // 禁用且未配置的实例仍然可描述；表单可在启用前补齐必填字段。
     let mut entry = EntryOptions::new("ocr", "example.config");
     entry.disabled = true;
     fs::write(
-        directory.path().join("extensions.toml"),
-        toml::to_string(&ExtensionsConfig {
-            version: 3,
-            extensions: vec![entry],
-        })?,
+        directory.path().join("cordis.toml"),
+        "version = 3\n\nextensions = []\n",
     )?;
-    fs::write(
-        directory.path().join("bootstrap.toml"),
-        "version = 3\n[config]\ndriver = 'file'\npath = 'extensions.toml'\n",
-    )?;
+    let deploy = PatchFileDocument {
+        version: PATCH_FILE_VERSION,
+        patches: vec![EntryPatch {
+            insert: Some(vec![entry]),
+            ..Default::default()
+        }],
+    };
+    let deploy_path = directory.path().join("deploy.patches.toml");
+    fs::write(&deploy_path, toml::to_string_pretty(&deploy)?)?;
+    fs::write(directory.path().join("home.patches.toml"), "version = 1\n")?;
+    let deploy_before = fs::read(&deploy_path)?;
     let mut catalog = ExtensionCatalog::new();
     catalog.register(Factory)?;
     catalog.register(IncludeFactory)?;
     let runtime = Runtime::new()?;
-    let _fiber = runtime
+    let _loader = runtime
         .root()
         .plugin(Arc::new(LoaderPlugin::new(catalog)))
         .await?;
     let loader = runtime.root().get(LOADER)?;
     loader
         .create(
-            bootstrap_entry("include", directory.path().join("bootstrap.toml")).await?,
+            include_root_entry("include", directory.path().join("cordis.toml"))?,
             None,
             None,
         )
         .await?;
-    let before = loader.describe_config("include:ocr").await?;
-    // 应用可以用字符串 DTO 往返版本令牌；它不是访问凭据。
+    let _editor = runtime
+        .root()
+        .plugin(Arc::new(ConfigEditorPlugin::new(ConfigEditorConfig::new(
+            vec![deploy_path.clone()],
+            directory.path().join("user.patches.toml"),
+            directory.path().join("home.patches.toml"),
+            directory.path(),
+        ))))
+        .await?;
+    let _settings = runtime.root().plugin(Arc::new(SettingsPlugin)).await?;
+    let settings = runtime.root().get(SETTINGS)?;
+    let before = settings.describe("include:ocr").await?;
+    assert!(before.user.is_none());
     let expected = before.revision.to_string().parse()?;
-    let after = loader
-        .mutate_config(
+    let after = settings
+        .mutate(
             "include:ocr",
             expected,
             vec![
@@ -99,6 +117,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ],
         )
         .await?;
+    assert!(after.user.is_some());
     assert!(after.value.get("token").is_none());
     assert!(
         after
@@ -106,7 +125,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .iter()
             .any(|field| field.path == ["token"] && field.is_set)
     );
-    println!("已保存配置；Token 已脱敏，实例仍保持禁用。");
+    assert_eq!(
+        fs::read(&deploy_path)?,
+        deploy_before,
+        "表单不得 bake 进 deploy patch"
+    );
+    assert!(
+        directory.path().join("user.patches.toml").is_file(),
+        "应写入本机 user patch"
+    );
+    println!("已保存到 user patch；Token 已脱敏，deploy 未改，实例仍保持禁用。");
     runtime.shutdown().await?;
     Ok(())
 }

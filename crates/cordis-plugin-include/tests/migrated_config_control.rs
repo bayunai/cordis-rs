@@ -3,9 +3,15 @@ use cordis_core::{
     Context, CoreError, Fiber, FiberState, Plugin, PluginKey, Runtime, ServiceId, ServiceKey,
 };
 use cordis_loader::{
-    ConfigOperation, ConfigRef, EntryOptions, EntryUpdate, ExtensionCatalog, ExtensionFactory,
-    ExtensionsConfig, LOADER, Loader, LoaderControlError, LoaderError, LoaderPlugin,
-    PreparedExtension,
+    ConfigRef, EntryOptions, ExtensionCatalog, ExtensionFactory, ExtensionsConfig,
+    LOADER, Loader, LoaderControlError, LoaderError, LoaderPlugin, PreparedExtension,
+};
+use cordis_plugin_config_editor::{
+    CONFIG_EDITOR, ConfigEditorConfig, ConfigEditorPlugin, PATCH_FILE_VERSION, PatchFileDocument,
+};
+use cordis_plugin_include::EntryPatch;
+use cordis_plugin_settings::{
+    ConfigOperation, SETTINGS, SettingsPlugin, SettingsService,
 };
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -99,7 +105,8 @@ impl Plugin for Instance {
 struct Harness {
     runtime: Runtime,
     loader: Loader,
-    _fiber: Fiber,
+    settings: SettingsService,
+    _fibers: Vec<Fiber>,
     dir: tempfile::TempDir,
     counts: Arc<Counts>,
 }
@@ -109,20 +116,24 @@ impl Harness {
         let mut entry = EntryOptions::new("one", "editable")
             .with_config(toml::toml! { address = address limit = 1 token = "secret-value" }.into());
         entry.disabled = disabled;
-        let config = ExtensionsConfig {
-            version: 3,
-            extensions: vec![entry],
+        std::fs::write(
+            dir.path().join("cordis.toml"),
+            "version = 3\n\nextensions = []\n",
+        )
+        .unwrap();
+        let deploy = PatchFileDocument {
+            version: PATCH_FILE_VERSION,
+            patches: vec![EntryPatch {
+                insert: Some(vec![entry]),
+                ..Default::default()
+            }],
         };
         std::fs::write(
-            dir.path().join("extensions.toml"),
-            toml::to_string(&config).unwrap(),
+            dir.path().join("deploy.patches.toml"),
+            toml::to_string_pretty(&deploy).unwrap(),
         )
         .unwrap();
-        std::fs::write(
-            dir.path().join("bootstrap.toml"),
-            "version = 3\n[config]\ndriver = 'file'\npath = 'extensions.toml'\n",
-        )
-        .unwrap();
+        std::fs::write(dir.path().join("home.patches.toml"), "version = 1\n").unwrap();
         let counts = Arc::new(Counts::default());
         let mut catalog = ExtensionCatalog::new();
         catalog.register(Factory(counts.clone())).unwrap();
@@ -130,18 +141,36 @@ impl Harness {
             .register(cordis_plugin_include::IncludeFactory)
             .unwrap();
         let runtime = Runtime::new().unwrap();
-        let fiber = mount_file(&runtime, catalog, dir.path().join("bootstrap.toml")).await;
+        let (fibers, settings) = mount_file(
+            &runtime,
+            catalog,
+            dir.path().join("cordis.toml"),
+            dir.path().join("deploy.patches.toml"),
+            dir.path().join("user.patches.toml"),
+            dir.path().join("home.patches.toml"),
+            dir.path(),
+        )
+        .await;
         let loader = (*runtime.root().get(LOADER).unwrap()).clone();
         Self {
             runtime,
             loader,
-            _fiber: fiber,
+            settings,
+            _fibers: fibers,
             dir,
             counts,
         }
     }
     fn file(&self) -> String {
-        std::fs::read_to_string(self.dir.path().join("extensions.toml")).unwrap()
+        std::fs::read_to_string(self.dir.path().join("deploy.patches.toml")).unwrap()
+    }
+    fn user_file(&self) -> String {
+        let path = self.dir.path().join("user.patches.toml");
+        if path.is_file() {
+            std::fs::read_to_string(path).unwrap()
+        } else {
+            String::new()
+        }
     }
 }
 fn set(key: &str, value: impl Into<toml::Value>) -> ConfigOperation {
@@ -155,29 +184,28 @@ fn set(key: &str, value: impl Into<toml::Value>) -> ConfigOperation {
 async fn disabled_edit_validates_once_without_constructing_and_preserves_secrets() {
     let h = Harness::new("ok", true).await;
     assert_eq!(h.counts.prepares.load(Ordering::SeqCst), 0);
-    let before = h.loader.describe_config("include:one").await.unwrap();
+    let before = h.settings.describe("include:one").await.unwrap();
+    assert!(before.user.is_none());
     assert!(before.value.get("token").is_none());
     assert_eq!(before.secrets[0].path, ["token"]);
     assert!(before.secrets[0].is_set);
     assert!(!format!("{before:?}").contains("secret-value"));
-    let after = h
-        .loader
-        .mutate_config("include:one", before.revision, vec![set("limit", 2)])
+    let base_before = h.file();
+    let after = h.settings.mutate("include:one", before.revision, vec![set("limit", 2)])
         .await
         .unwrap();
     assert_ne!(before.revision, after.revision);
+    assert!(after.user.is_some());
     assert_eq!(h.counts.prepares.load(Ordering::SeqCst), 1);
     assert_eq!(h.counts.builds.load(Ordering::SeqCst), 0);
-    assert!(h.file().contains("secret-value"));
+    assert_eq!(h.file(), base_before, "表单不得 bake 进 Include path");
+    assert!(h.user_file().contains("secret-value"));
     assert!(matches!(
-        h.loader
-            .mutate_config("include:one", before.revision, vec![set("limit", 3)])
+        h.settings.mutate("include:one", before.revision, vec![set("limit", 3)])
             .await,
         Err(LoaderControlError::ConfigRevisionConflict)
     ));
-    let after = h
-        .loader
-        .mutate_config(
+    let after = h.settings.mutate(
             "include:one",
             after.revision,
             vec![ConfigOperation::Unset {
@@ -187,7 +215,8 @@ async fn disabled_edit_validates_once_without_constructing_and_preserves_secrets
         .await
         .unwrap();
     assert!(!after.secrets[0].is_set);
-    assert!(!h.file().contains("secret-value"));
+    assert!(h.file().contains("secret-value"), "base 源文件仍保留秘密");
+    assert!(!h.user_file().contains("secret-value"));
     h.runtime.shutdown().await.unwrap();
 }
 
@@ -202,11 +231,9 @@ async fn active_hot_and_static_changes_use_existing_reconcile_and_one_prepare() 
         .entry("include:one")
         .unwrap()
         .fiber_id;
-    let form = h.loader.describe_config("include:one").await.unwrap();
+    let form = h.settings.describe("include:one").await.unwrap();
     let prepares = h.counts.prepares.load(Ordering::SeqCst);
-    let form = h
-        .loader
-        .mutate_config("include:one", form.revision, vec![set("limit", 2)])
+    let form = h.settings.mutate("include:one", form.revision, vec![set("limit", 2)])
         .await
         .unwrap();
     assert_eq!(h.counts.prepares.load(Ordering::SeqCst), prepares + 1);
@@ -222,8 +249,7 @@ async fn active_hot_and_static_changes_use_existing_reconcile_and_one_prepare() 
             .fiber_id,
         before
     );
-    h.loader
-        .mutate_config(
+    h.settings.mutate(
             "include:one",
             form.revision,
             vec![set("address", "changed")],
@@ -238,34 +264,31 @@ async fn active_hot_and_static_changes_use_existing_reconcile_and_one_prepare() 
 #[tokio::test]
 async fn invalid_input_does_not_change_file_or_revision_and_does_not_echo_values() {
     let h = Harness::new("ok", false).await;
-    let before = h.loader.describe_config("include:one").await.unwrap();
+    let before = h.settings.describe("include:one").await.unwrap();
     let file = h.file();
+    let user = h.user_file();
     for operation in [
         set("limit", "sensitive-invalid"),
         set("limit", 0),
         set("address", "panic"),
     ] {
-        let error = h
-            .loader
-            .mutate_config("include:one", before.revision, vec![operation])
+        let error = h.settings.mutate("include:one", before.revision, vec![operation])
             .await
             .unwrap_err();
         assert!(matches!(error, LoaderControlError::ConfigValidation));
         assert!(!error.to_string().contains("private"));
         assert!(!error.to_string().contains("sensitive"));
         assert_eq!(h.file(), file);
+        assert_eq!(h.user_file(), user);
         assert_eq!(
-            h.loader
-                .describe_config("include:one")
+            h.settings.describe("include:one")
                 .await
                 .unwrap()
                 .revision,
             before.revision
         );
     }
-    let error = h
-        .loader
-        .mutate_config(
+    let error = h.settings.mutate(
             "include:one",
             before.revision,
             vec![ConfigOperation::Set {
@@ -283,10 +306,8 @@ async fn invalid_input_does_not_change_file_or_revision_and_does_not_echo_values
 async fn failed_and_pending_instances_can_be_fixed_and_failure_invalidates_revision() {
     for address in ["fail", "pending"] {
         let h = Harness::new(address, false).await;
-        let before = h.loader.describe_config("include:one").await.unwrap();
-        let after = h
-            .loader
-            .mutate_config("include:one", before.revision, vec![set("address", "ok")])
+        let before = h.settings.describe("include:one").await.unwrap();
+        let after = h.settings.mutate("include:one", before.revision, vec![set("address", "ok")])
             .await
             .unwrap();
         assert_eq!(
@@ -300,17 +321,26 @@ async fn failed_and_pending_instances_can_be_fixed_and_failure_invalidates_revis
             Some(FiberState::Active)
         );
         let file = h.file();
-        assert!(
-            h.loader
-                .mutate_config("include:one", after.revision, vec![set("address", "fail")])
-                .await
-                .is_err()
-        );
+        // 生命周期失败不回滚 desired；与 deploy 相同时可清除 user；编辑器保持可用。
+        let failed = h
+            .settings
+            .mutate("include:one", after.revision, vec![set("address", "fail")])
+            .await
+            .unwrap();
         assert_eq!(h.file(), file);
-        let retry = h.loader.describe_config("include:one").await.unwrap();
-        assert_ne!(retry.revision, after.revision);
-        h.loader
-            .mutate_config("include:one", retry.revision, vec![set("address", "ok")])
+        assert_eq!(
+            h.loader
+                .await_idle()
+                .await
+                .unwrap()
+                .entry("include:one")
+                .unwrap()
+                .state,
+            Some(FiberState::Failed)
+        );
+        assert_ne!(failed.revision, after.revision);
+        h.settings
+            .mutate("include:one", failed.revision, vec![set("address", "ok")])
             .await
             .unwrap();
         h.runtime.shutdown().await.unwrap();
@@ -318,70 +348,66 @@ async fn failed_and_pending_instances_can_be_fixed_and_failure_invalidates_revis
 }
 
 #[tokio::test]
-async fn external_file_conflict_and_concurrent_edits_are_explicit() {
+async fn concurrent_edits_conflict_and_external_base_edit_is_explicit() {
     let h = Harness::new("ok", false).await;
-    let form = h.loader.describe_config("include:one").await.unwrap();
+    let form = h.settings.describe("include:one").await.unwrap();
     let (a, b) = tokio::join!(
-        h.loader
-            .mutate_config("include:one", form.revision, vec![set("limit", 2)]),
-        h.loader
-            .mutate_config("include:one", form.revision, vec![set("limit", 3)])
+        h.settings.mutate("include:one", form.revision, vec![set("limit", 2)]),
+        h.settings.mutate("include:one", form.revision, vec![set("limit", 3)])
     );
     assert_ne!(a.is_ok(), b.is_ok());
     assert!(matches!(
         a.err().or(b.err()).unwrap(),
         LoaderControlError::ConfigRevisionConflict
     ));
-    let form = h.loader.describe_config("include:one").await.unwrap();
+    let form = h.settings.describe("include:one").await.unwrap();
     std::fs::write(
-        h.dir.path().join("extensions.toml"),
-        format!("{}\n# outside edit\n", h.file()),
+        h.dir.path().join("cordis.toml"),
+        format!(
+            "{}\n# outside edit\n",
+            std::fs::read_to_string(h.dir.path().join("cordis.toml")).unwrap()
+        ),
     )
     .unwrap();
+    // 同步 user→Include.patches 时 FileSource 仍检查来源版本。
     assert!(matches!(
-        h.loader
-            .mutate_config("include:one", form.revision, vec![set("limit", 4)])
+        h.settings
+            .mutate("include:one", form.revision, vec![set("limit", 4)])
             .await,
         Err(LoaderControlError::ConfigConflict { .. })
     ));
+    assert!(!h.file().contains("limit = 4"));
     h.runtime.shutdown().await.unwrap();
 }
 
 #[tokio::test]
 async fn ordinary_update_invalidates_config_form_and_shutdown_rejects_reads() {
     let h = Harness::new("ok", true).await;
-    let form = h.loader.describe_config("include:one").await.unwrap();
-    h.loader
-        .subtree("include")
+    let form = h.settings.describe("include:one").await.unwrap();
+    h.runtime
+        .root()
+        .get(CONFIG_EDITOR)
         .unwrap()
-        .update(
-            "one",
-            EntryUpdate {
-                disabled: Some(false),
-                ..Default::default()
-            },
-            None,
-            None,
-        )
+        .set_enabled("include:one", true)
         .await
         .unwrap();
     assert!(matches!(
-        h.loader
-            .mutate_config("include:one", form.revision, vec![set("limit", 4)])
+        h.settings
+            .mutate("include:one", form.revision, vec![set("limit", 4)])
             .await,
         Err(LoaderControlError::ConfigRevisionConflict)
     ));
     h.runtime.shutdown().await.unwrap();
     assert!(matches!(
-        h.loader.describe_config("include:one").await,
+        h.settings.describe("include:one").await,
         Err(LoaderControlError::LoaderUnavailable)
     ));
 }
 
 #[tokio::test]
-async fn include_edits_write_only_the_owning_file_and_recreated_trees_reject_old_tokens() {
-    let h = Harness::new("ok", false).await;
-    let child_path = h.dir.path().join("child.toml");
+async fn nested_include_is_readable_but_not_editable_via_root_user_layer() {
+    let dir = tempfile::tempdir().unwrap();
+    let child_path = dir.path().join("child.toml");
     let child = EntryOptions::new("child", "editable")
         .with_config(toml::toml! { address = "child" limit = 1 }.into());
     std::fs::write(
@@ -394,49 +420,70 @@ async fn include_edits_write_only_the_owning_file_and_recreated_trees_reject_old
     )
     .unwrap();
     let child_name = child_path.to_str().unwrap();
-    h.loader
-        .subtree("include")
-        .unwrap()
-        .create(
-            EntryOptions::new("include", "cordis:include")
-                .with_config(toml::toml! { path = child_name }.into()),
-            None,
-            None,
-        )
-        .await
+    let nested = EntryOptions::new("nested", "cordis:include")
+        .with_config(toml::toml! { path = child_name }.into());
+    let mut one = EntryOptions::new("one", "editable")
+        .with_config(toml::toml! { address = "ok" limit = 1 token = "secret-value" }.into());
+    one.disabled = false;
+    std::fs::write(dir.path().join("cordis.toml"), "version = 3\n\nextensions = []\n").unwrap();
+    let deploy = PatchFileDocument {
+        version: PATCH_FILE_VERSION,
+        patches: vec![EntryPatch {
+            insert: Some(vec![one, nested]),
+            ..Default::default()
+        }],
+    };
+    std::fs::write(
+        dir.path().join("deploy.patches.toml"),
+        toml::to_string_pretty(&deploy).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("home.patches.toml"), "version = 1\n").unwrap();
+    let counts = Arc::new(Counts::default());
+    let mut catalog = ExtensionCatalog::new();
+    catalog.register(Factory(counts.clone())).unwrap();
+    catalog
+        .register(cordis_plugin_include::IncludeFactory)
         .unwrap();
-    let root_before = h.file();
-    let root_fiber = h
-        .loader
+    let runtime = Runtime::new().unwrap();
+    let (_fibers, settings) = mount_file(
+        &runtime,
+        catalog,
+        dir.path().join("cordis.toml"),
+        dir.path().join("deploy.patches.toml"),
+        dir.path().join("user.patches.toml"),
+        dir.path().join("home.patches.toml"),
+        dir.path(),
+    )
+    .await;
+    let loader = (*runtime.root().get(LOADER).unwrap()).clone();
+    let child_before = std::fs::read_to_string(&child_path).unwrap();
+    let root_fiber = loader
         .await_idle()
         .await
         .unwrap()
         .entry("include:one")
         .unwrap()
         .fiber_id;
-    let tree = h.loader.subtree("include:include").unwrap();
-    let form = h
-        .loader
-        .describe_config("include:include:group:child")
+    let tree = loader.subtree("include:nested").unwrap();
+    let form = settings
+        .describe("include:nested:group:child")
         .await
         .unwrap();
-    assert_eq!(form.path.as_str(), "include:include:group:child");
+    assert_eq!(form.path.as_str(), "include:nested:group:child");
+    assert!(matches!(
+        settings
+            .mutate(
+                "include:nested:group:child",
+                form.revision,
+                vec![set("limit", 8)],
+            )
+            .await,
+        Err(LoaderControlError::ConfigNotEditable)
+    ));
+    assert_eq!(std::fs::read_to_string(&child_path).unwrap(), child_before);
     assert_eq!(
-        tree.describe_config("group:child").await.unwrap().revision,
-        form.revision
-    );
-    let form = tree
-        .mutate_config("group:child", form.revision, vec![set("limit", 8)])
-        .await
-        .unwrap();
-    assert_eq!(h.file(), root_before);
-    assert!(
-        std::fs::read_to_string(&child_path)
-            .unwrap()
-            .contains("limit = 8")
-    );
-    assert_eq!(
-        h.loader
+        loader
             .await_idle()
             .await
             .unwrap()
@@ -446,82 +493,52 @@ async fn include_edits_write_only_the_owning_file_and_recreated_trees_reject_old
         root_fiber
     );
     assert!(matches!(
-        tree.describe_config("group").await,
+        settings.describe("include:nested:group").await,
         Err(LoaderControlError::ConfigNotEditable)
     ));
-    h.loader
-        .subtree("include")
+    runtime
+        .root()
+        .get(CONFIG_EDITOR)
         .unwrap()
-        .update(
-            "include",
-            EntryUpdate {
-                disabled: Some(true),
-                ..Default::default()
-            },
-            None,
-            None,
-        )
+        .set_enabled("include:nested", false)
         .await
         .unwrap();
+    assert!(tree.entries().is_err());
     assert!(matches!(
-        tree.describe_config("group:child").await,
-        Err(LoaderControlError::LoaderUnavailable)
+        settings.describe("include:nested:group:child").await,
+        Err(LoaderControlError::EntryNotFound { .. })
     ));
-    h.loader
-        .subtree("include")
-        .unwrap()
-        .update(
-            "include",
-            EntryUpdate {
-                disabled: Some(false),
-                ..Default::default()
-            },
-            None,
-            None,
-        )
-        .await
-        .unwrap();
-    assert!(matches!(
-        h.loader
-            .mutate_config(
-                "include:include:group:child",
-                form.revision,
-                vec![set("limit", 9)]
-            )
-            .await,
-        Err(LoaderControlError::ConfigRevisionConflict)
-    ));
-    h.runtime.shutdown().await.unwrap();
+    runtime.shutdown().await.unwrap();
 }
 
 #[tokio::test]
-async fn persistence_failure_reports_applied_state_and_invalidates_old_revision() {
+async fn form_mutate_writes_user_and_leaves_base_file_unchanged() {
     let h = Harness::new("ok", false).await;
-    let form = h.loader.describe_config("include:one").await.unwrap();
-    *h.counts.persist_fault.lock().unwrap() = Some(h.dir.path().join("extensions.toml"));
-    assert!(matches!(
-        h.loader
-            .mutate_config(
-                "include:one",
-                form.revision,
-                vec![set("address", "updated"), set("limit", 9)]
-            )
-            .await,
-        Err(LoaderControlError::Persist { .. })
-    ));
-    let current = h.loader.describe_config("include:one").await.unwrap();
+    let form = h.settings.describe("include:one").await.unwrap();
+    let base_before = h.file();
+    let current = h
+        .settings
+        .mutate(
+            "include:one",
+            form.revision,
+            vec![set("address", "updated"), set("limit", 9)],
+        )
+        .await
+        .unwrap();
     assert_eq!(current.value["limit"].as_integer(), Some(9));
+    assert_eq!(current.value["address"].as_str(), Some("updated"));
+    assert!(current.user.is_some());
     assert_ne!(current.revision, form.revision);
+    assert_eq!(h.file(), base_before);
+    assert!(h.user_file().contains("updated"));
     h.runtime.shutdown().await.unwrap();
 }
 
 #[tokio::test]
 async fn ordered_operations_and_secret_replacement_do_not_restore_deleted_fields() {
     let h = Harness::new("ok", true).await;
-    let form = h.loader.describe_config("include:one").await.unwrap();
-    let form = h
-        .loader
-        .mutate_config(
+    let form = h.settings.describe("include:one").await.unwrap();
+    let form = h.settings.mutate(
             "include:one",
             form.revision,
             vec![set("limit", 2), set("limit", 3), set("token", "new-secret")],
@@ -531,11 +548,12 @@ async fn ordered_operations_and_secret_replacement_do_not_restore_deleted_fields
     assert_eq!(form.value["limit"].as_integer(), Some(3));
     assert!(form.value.get("token").is_none());
     assert!(!format!("{form:?}").contains("new-secret"));
-    assert!(h.file().contains("new-secret"));
+    assert!(!h.file().contains("new-secret"));
+    assert!(h.user_file().contains("new-secret"));
     let before = h.file();
+    let user_before = h.user_file();
     assert!(matches!(
-        h.loader
-            .mutate_config(
+        h.settings.mutate(
                 "include:one",
                 form.revision,
                 vec![ConfigOperation::Unset {
@@ -546,17 +564,18 @@ async fn ordered_operations_and_secret_replacement_do_not_restore_deleted_fields
         Err(LoaderControlError::ConfigValidation)
     ));
     assert_eq!(h.file(), before);
+    assert_eq!(h.user_file(), user_before);
     h.runtime.shutdown().await.unwrap();
 }
 
 #[tokio::test]
 async fn describe_waits_for_in_flight_config_commit_and_returns_matching_revision() {
     let h = Harness::new("ok", false).await;
-    let before = h.loader.describe_config("include:one").await.unwrap();
-    let loader = h.loader.clone();
+    let before = h.settings.describe("include:one").await.unwrap();
+    let settings = h.settings.clone();
     let update = tokio::spawn(async move {
-        loader
-            .mutate_config(
+        settings
+            .mutate(
                 "include:one",
                 before.revision,
                 vec![set("address", "blocked")],
@@ -564,8 +583,8 @@ async fn describe_waits_for_in_flight_config_commit_and_returns_matching_revisio
             .await
     });
     h.counts.started.notified().await;
-    let loader = h.loader.clone();
-    let read = tokio::spawn(async move { loader.describe_config("include:one").await });
+    let settings = h.settings.clone();
+    let read = tokio::spawn(async move { settings.describe("include:one").await });
     tokio::task::yield_now().await;
     assert!(!read.is_finished());
     h.counts.release.notify_one();
@@ -578,37 +597,61 @@ async fn describe_waits_for_in_flight_config_commit_and_returns_matching_revisio
 
 #[tokio::test]
 async fn instance_edits_preserve_other_instance_config_and_fiber() {
-    let h = Harness::new("ok", false).await;
-    h.loader
-        .subtree("include")
-        .unwrap()
-        .create(
-            EntryOptions::new("two", "editable")
-                .with_config(toml::toml! { address="second" limit=7 }.into()),
-            None,
-            None,
-        )
-        .await
+    let dir = tempfile::tempdir().unwrap();
+    let one = EntryOptions::new("one", "editable")
+        .with_config(toml::toml! { address = "ok" limit = 1 token = "secret-value" }.into());
+    let two = EntryOptions::new("two", "editable")
+        .with_config(toml::toml! { address = "second" limit = 7 }.into());
+    std::fs::write(dir.path().join("cordis.toml"), "version = 3\n\nextensions = []\n").unwrap();
+    let deploy = PatchFileDocument {
+        version: PATCH_FILE_VERSION,
+        patches: vec![EntryPatch {
+            insert: Some(vec![one, two]),
+            ..Default::default()
+        }],
+    };
+    std::fs::write(
+        dir.path().join("deploy.patches.toml"),
+        toml::to_string_pretty(&deploy).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("home.patches.toml"), "version = 1\n").unwrap();
+    let counts = Arc::new(Counts::default());
+    let mut catalog = ExtensionCatalog::new();
+    catalog.register(Factory(counts)).unwrap();
+    catalog
+        .register(cordis_plugin_include::IncludeFactory)
         .unwrap();
-    let other = h
-        .loader
+    let runtime = Runtime::new().unwrap();
+    let (_fibers, settings) = mount_file(
+        &runtime,
+        catalog,
+        dir.path().join("cordis.toml"),
+        dir.path().join("deploy.patches.toml"),
+        dir.path().join("user.patches.toml"),
+        dir.path().join("home.patches.toml"),
+        dir.path(),
+    )
+    .await;
+    let loader = (*runtime.root().get(LOADER).unwrap()).clone();
+    let other = loader
         .await_idle()
         .await
         .unwrap()
         .entry("include:two")
         .unwrap()
         .fiber_id;
-    let form = h.loader.describe_config("include:one").await.unwrap();
-    h.loader
-        .mutate_config("include:one", form.revision, vec![set("limit", 4)])
+    let form = settings.describe("include:one").await.unwrap();
+    settings
+        .mutate("include:one", form.revision, vec![set("limit", 4)])
         .await
         .unwrap();
     assert_eq!(
-        h.loader.describe_config("include:two").await.unwrap().value["limit"].as_integer(),
+        settings.describe("include:two").await.unwrap().value["limit"].as_integer(),
         Some(7)
     );
     assert_eq!(
-        h.loader
+        loader
             .await_idle()
             .await
             .unwrap()
@@ -617,15 +660,13 @@ async fn instance_edits_preserve_other_instance_config_and_fiber() {
             .fiber_id,
         other
     );
-    h.runtime.shutdown().await.unwrap();
+    runtime.shutdown().await.unwrap();
 }
 
 #[tokio::test]
 async fn revision_roundtrips_as_an_opaque_transport_token() {
     let h = Harness::new("ok", true).await;
-    let revision = h
-        .loader
-        .describe_config("include:one")
+    let revision = h.settings.describe("include:one")
         .await
         .unwrap()
         .revision;
@@ -652,11 +693,11 @@ async fn revision_roundtrips_as_an_opaque_transport_token() {
 #[tokio::test]
 async fn cancelling_the_waiter_does_not_skip_persistence_after_reconcile() {
     let h = Harness::new("ok", false).await;
-    let before = h.loader.describe_config("include:one").await.unwrap();
-    let loader = h.loader.clone();
+    let before = h.settings.describe("include:one").await.unwrap();
+    let settings = h.settings.clone();
     let waiter = tokio::spawn(async move {
-        loader
-            .mutate_config(
+        settings
+            .mutate(
                 "include:one",
                 before.revision,
                 vec![set("address", "blocked")],
@@ -667,21 +708,24 @@ async fn cancelling_the_waiter_does_not_skip_persistence_after_reconcile() {
     waiter.abort();
     assert!(waiter.await.unwrap_err().is_cancelled());
     h.counts.release.notify_one();
-    let after = h.loader.describe_config("include:one").await.unwrap();
+    let after = h.settings.describe("include:one").await.unwrap();
     assert_eq!(after.value["address"].as_str(), Some("blocked"));
-    assert!(h.file().contains("blocked"));
+    assert!(!h.file().contains("blocked"));
+    assert!(h.user_file().contains("blocked"));
     h.runtime.shutdown().await.unwrap();
 }
 
 async fn mount_file(
     runtime: &Runtime,
     catalog: ExtensionCatalog,
-    bootstrap: impl AsRef<std::path::Path>,
-) -> Fiber {
-    let entry = cordis_plugin_include::bootstrap_entry("include", bootstrap)
-        .await
-        .unwrap();
-    let fiber = runtime
+    cordis: impl AsRef<std::path::Path>,
+    deploy_patch: impl AsRef<std::path::Path>,
+    user_patch: impl AsRef<std::path::Path>,
+    home_patch: impl AsRef<std::path::Path>,
+    config_dir: impl AsRef<std::path::Path>,
+) -> (Vec<Fiber>, SettingsService) {
+    let entry = cordis_plugin_include::include_root_entry("include", cordis).unwrap();
+    let loader_fiber = runtime
         .root()
         .plugin(Arc::new(LoaderPlugin::new(catalog)))
         .await
@@ -693,5 +737,24 @@ async fn mount_file(
         .create(entry, None, None)
         .await
         .unwrap();
-    fiber
+    let editor_fiber = runtime
+        .root()
+        .plugin(Arc::new(ConfigEditorPlugin::new(ConfigEditorConfig::new(
+            vec![deploy_patch.as_ref().to_path_buf()],
+            user_patch.as_ref(),
+            home_patch.as_ref(),
+            config_dir.as_ref(),
+        ))))
+        .await
+        .unwrap();
+    let settings_fiber = runtime
+        .root()
+        .plugin(Arc::new(SettingsPlugin))
+        .await
+        .unwrap();
+    let settings = (*runtime.root().get(SETTINGS).unwrap()).clone();
+    (
+        vec![loader_fiber, editor_fiber, settings_fiber],
+        settings,
+    )
 }

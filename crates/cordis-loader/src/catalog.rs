@@ -251,6 +251,22 @@ impl ExtensionCatalog {
     pub(crate) fn get(&self, id: &str) -> Option<&Arc<dyn ErasedExtensionFactory>> {
         self.factories.get(id).map(|record| &record.factory)
     }
+    /// 对已登记 Factory 执行 `prepare`；用于表单提交在写回前的校验，不修改树。
+    pub fn prepare(
+        &self,
+        factory: &str,
+        config: &toml::Value,
+    ) -> Result<PreparedExtension, LoaderError> {
+        let factory = self.get(factory).ok_or_else(|| LoaderError::UnknownFactory {
+            instance: String::new(),
+            factory: factory.into(),
+        })?;
+        catch_unwind(AssertUnwindSafe(|| factory.prepare(config))).map_err(|payload| {
+            LoaderError::FactoryPanic {
+                message: format_panic_message("extension factory prepare", payload),
+            }
+        })?
+    }
     pub fn contains(&self, id: &str) -> bool {
         self.factories.contains_key(id)
     }

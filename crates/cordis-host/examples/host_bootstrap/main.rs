@@ -2,8 +2,8 @@
 //!
 //! ```bash
 //! cargo run -p cordis-host --example host_bootstrap
-//! # 或指定自己的启动锚点：
-//! cargo run -p cordis-host --example host_bootstrap -- /path/to/bootstrap.toml
+//! # 或指定自己的根配置：
+//! cargo run -p cordis-host --example host_bootstrap -- /path/to/cordis.toml
 //! ```
 
 mod host;
@@ -11,7 +11,7 @@ mod plugins;
 
 use cordis_host::CordisHost;
 use cordis_loader::LoaderPlugin;
-use cordis_plugin_include::bootstrap_entry;
+use cordis_plugin_include::include_root_entry;
 use cordis_plugin_logger_console::{ConsoleLoggerConfig, ConsoleLoggerPlugin};
 use cordis_plugin_timer::TimerPlugin;
 use plugins::greeting::GREETING;
@@ -19,11 +19,11 @@ use std::{path::PathBuf, sync::Arc};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let bootstrap_path = std::env::args_os()
+    let cordis_path = std::env::args_os()
         .nth(1)
         .map(PathBuf::from)
         .unwrap_or_else(|| {
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/host_bootstrap/bootstrap.toml")
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/host_bootstrap/cordis.toml")
         });
 
     let host = CordisHost::new()?;
@@ -36,18 +36,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })))
         .await?;
     let _timer_fiber = host.root().plugin(Arc::new(TimerPlugin)).await?;
-    // Loader 先就绪，启动文件由应用显式创建的 Include 读取。
+    // Loader 先就绪，根配置由应用显式创建的 Include 读取。
     let loader = LoaderPlugin::new(host::build_catalog()?);
     let _loader_fiber = host.root().plugin(Arc::new(loader)).await?;
 
     // 真实应用在此运行 HTTP、窗口事件循环或后台任务。
     let loader = host.root().get(cordis_loader::LOADER)?;
     loader
-        .create(
-            bootstrap_entry("include", bootstrap_path).await?,
-            None,
-            None,
-        )
+        .create(include_root_entry("include", cordis_path)?, None, None)
         .await?;
     let greeting = loader
         .entry_context("include:default-greeting")?

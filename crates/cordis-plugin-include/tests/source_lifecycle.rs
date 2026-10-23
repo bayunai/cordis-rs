@@ -4,7 +4,9 @@ use cordis_loader::{
     ConfigRef, EntryOptions, EntryUpdate, ExtensionCatalog, ExtensionFactory, ExtensionsConfig,
     LOADER, Loader, LoaderError, LoaderPlugin, PreparedExtension,
 };
-use cordis_plugin_include::{EntryPatch, IncludeConfig, IncludeFactory};
+use cordis_plugin_config_editor::{ConfigEditorConfig, ConfigEditorPlugin};
+use cordis_plugin_include::{EntryPatch, IncludeConfig, IncludeFactory, include_root_entry};
+use cordis_plugin_settings::{SETTINGS, SettingsPlugin, SettingsService};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use std::{
@@ -80,7 +82,8 @@ impl Plugin for Instance {
 struct Harness {
     runtime: Runtime,
     loader: Loader,
-    _fiber: Fiber,
+    settings: SettingsService,
+    _fibers: Vec<Fiber>,
     dir: tempfile::TempDir,
     counts: Arc<Counts>,
     config: IncludeConfig,
@@ -91,7 +94,7 @@ fn entry(id: &str, value: u32) -> EntryOptions {
 impl Harness {
     async fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("main.toml");
+        let path = dir.path().join("cordis.toml");
         fs::write(
             &path,
             toml::to_string(&ExtensionsConfig {
@@ -101,31 +104,42 @@ impl Harness {
             .unwrap(),
         )
         .unwrap();
-        let config = IncludeConfig::new(&path);
+        fs::write(dir.path().join("home.patches.toml"), "version = 1\n").unwrap();
         let counts = Arc::new(Counts::default());
         let mut catalog = ExtensionCatalog::new();
         catalog.register(IncludeFactory).unwrap();
         catalog.register(Factory(counts.clone())).unwrap();
         let runtime = Runtime::new().unwrap();
-        let fiber = runtime
+        let loader_fiber = runtime
             .root()
             .plugin(Arc::new(LoaderPlugin::new(catalog)))
             .await
             .unwrap();
         let loader = (*runtime.root().get(LOADER).unwrap()).clone();
-        loader
-            .create(
-                EntryOptions::new("include", "cordis:include")
-                    .with_config(toml::Value::try_from(&config).unwrap()),
-                None,
-                None,
-            )
+        let entry = include_root_entry("include", &path).unwrap();
+        let config: IncludeConfig = entry.config.clone().try_into().unwrap();
+        loader.create(entry, None, None).await.unwrap();
+        let editor_fiber = runtime
+            .root()
+            .plugin(Arc::new(ConfigEditorPlugin::new(ConfigEditorConfig::new(
+                Vec::new(),
+                dir.path().join("user.patches.toml"),
+                dir.path().join("home.patches.toml"),
+                dir.path(),
+            ))))
             .await
             .unwrap();
+        let settings_fiber = runtime
+            .root()
+            .plugin(Arc::new(SettingsPlugin))
+            .await
+            .unwrap();
+        let settings = (*runtime.root().get(SETTINGS).unwrap()).clone();
         Self {
             runtime,
             loader,
-            _fiber: fiber,
+            settings,
+            _fibers: vec![loader_fiber, editor_fiber, settings_fiber],
             dir,
             counts,
             config,
@@ -149,7 +163,7 @@ impl Harness {
             .map(|_| ())
     }
     fn file(&self) -> Vec<u8> {
-        fs::read(self.dir.path().join("main.toml")).unwrap()
+        fs::read(self.dir.path().join("cordis.toml")).unwrap()
     }
 }
 fn patch(value: u32, fail: bool) -> EntryPatch {
@@ -275,7 +289,7 @@ async fn patch_lifecycle_failure_is_waited_and_same_target_can_retry() {
 async fn changing_path_rebuilds_source_and_invalidates_old_handles() {
     let h = Harness::new().await;
     let old = h.loader.subtree("include").unwrap();
-    let form = old.describe_config("one").await.unwrap();
+    let form = h.settings.describe("include:one").await.unwrap();
     let before = h
         .loader
         .await_idle()
@@ -308,11 +322,7 @@ async fn changing_path_rebuilds_source_and_invalidates_old_handles() {
     );
     assert!(old.entries().is_err());
     assert_ne!(
-        h.loader
-            .describe_config("include:one")
-            .await
-            .unwrap()
-            .revision,
+        h.settings.describe("include:one").await.unwrap().revision,
         form.revision
     );
     h.runtime.shutdown().await.unwrap();
@@ -389,7 +399,7 @@ async fn carrier_description_does_not_expose_secrets_embedded_in_initial_or_patc
         ..Default::default()
     }];
     h.update(&config).await.unwrap();
-    let form = h.loader.describe_config("include").await.unwrap();
+    let form = h.settings.describe("include").await.unwrap();
     assert!(form.value.get("initial").is_none());
     assert!(form.value.get("patches").is_none());
     assert!(!format!("{form:?}").contains("embedded-private-token"));
@@ -517,7 +527,7 @@ async fn one_source_definition_failure_does_not_skip_an_independent_source_updat
         }
     }
     fs::write(
-        h.dir.path().join("main.toml"),
+        h.dir.path().join("cordis.toml"),
         toml::to_string(&declaration).unwrap(),
     )
     .unwrap();

@@ -336,7 +336,14 @@ impl RuntimeTree {
                         reason: format!("reconcile worker: {error}"),
                     }),
                 };
-            if result.is_ok() {
+            // 个别 Entry 生命周期失败时运行树已按 desired 尝试挂载；仍须提交声明，
+            // 否则投影/表单读到空树，而 Fiber 已存在（空根 + patches 组成时尤其明显）。
+            let commit_desired = match &result {
+                Ok(_) => true,
+                Err(error) if error.is_entry_lifecycle_failure() => true,
+                Err(_) => false,
+            };
+            if commit_desired {
                 *tree.desired.lock().expect("desired") = config;
                 if let Some(revision) = revision {
                     *tree.revision.lock().expect("revision") = Some(revision);

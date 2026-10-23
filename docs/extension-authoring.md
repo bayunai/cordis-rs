@@ -57,7 +57,8 @@ struct UploadConfig {
 禁用实例的表单编辑也会调用 prepare，因此不要将启用期资源访问放到该阶段。
 不要在错误、panic 或日志中拼接 Token 或其他秘密。
 
-应用使用 `describe_config()` 展示表单，再通过 `mutate_config()` 提交有序字段操作和版本。
+应用挂载 `SettingsPlugin` 后使用 `settings.describe()` 展示表单，再通过
+`settings.mutate()` 提交有序字段操作和版本（写回经 config-editor）。
 未修改的秘密不要从脱敏表单补为空字符串；只有用户明确替换或删除时才提交相应操作。
 管理端无需依赖插件自身的客户端入口，未启用或失败的实例同样能修复配置。
 详细并发、持久化及 Schema 边界见 [Host 配置控制面](host.md#面向管理界面的配置控制面)。
@@ -65,14 +66,15 @@ struct UploadConfig {
 ## 文件来源与树载体
 
 文件读取、路径、编解码、patches 与文件写回属于可选 `cordis-plugin-include`，不是 Factory
-或 Core 的通用职责。Host 显式注册 IncludeFactory，并用 `bootstrap_entry("include", path).await?` 构造
+或 Core 的通用职责。Host 显式注册 IncludeFactory，并用 `include_root_entry("include", path)?` 构造
 根文件条目；文件中的实例完整路径因此带 `include:` 前缀。原始文件内的局部 ID 不需要增加前缀。
 启动和运行期统一先挂载 `LoaderPlugin::new(catalog)`，再通过 `loader.create(entry, None, None).await`
 登记条目；Loader 构造不再接收任何初始条目列表。
 
 业务服务通过 `loader.entry_context("include:插件")` 读取；文件树 CRUD 使用
-`loader.subtree("include")` 的局部路径。`describe_config` / `mutate_config` 可以直接使用完整路径，
-由 Loader 定位来源。Loader 内存根 CRUD 不持久化，不能把文件修改发到根控制面。
+`loader.subtree("include")` 的局部路径。表单 `describe` / `mutate` 使用完整路径，由
+settings → config-editor → Loader 定位来源。Loader 内存根 CRUD 不持久化，不能把文件修改
+发到根控制面。
 
 需要文件目录时读取 Include 提供的 `INCLUDE_LOCATION`，不要假定 `EntryLocation` 包含文件信息。
 该元数据只在 Include 来源的上下文中存在；内存根中的 Include 应使用绝对路径。

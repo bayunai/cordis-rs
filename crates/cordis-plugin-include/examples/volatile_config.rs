@@ -5,7 +5,7 @@ use cordis_loader::{
     ConfigRef, EntryOptions, EntryUpdate, ExtensionCatalog, ExtensionFactory, ExtensionsConfig,
     LOADER, LoaderError, LoaderPlugin, PreparedExtension,
 };
-use cordis_plugin_include::{IncludeFactory, bootstrap_entry};
+use cordis_plugin_include::{IncludeFactory, include_root_entry};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use std::{error::Error, fs, sync::Arc};
@@ -80,21 +80,14 @@ fn config(address: &str, limit: u32) -> Result<toml::Value, toml::de::Error> {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let directory = tempfile::tempdir()?;
-    let bootstrap = directory.path().join("bootstrap.toml");
-    fs::write(
-        &bootstrap,
-        "version = 3\n[config]\ndriver = 'file'\npath = 'extensions.toml'\n",
-    )?;
+    let cordis = directory.path().join("cordis.toml");
     let initial = ExtensionsConfig {
         version: cordis_loader::CONFIG_VERSION,
         extensions: vec![
             EntryOptions::new("gateway", "gateway").with_config(config("db://primary", 100)?),
         ],
     };
-    fs::write(
-        directory.path().join("extensions.toml"),
-        toml::to_string(&initial)?,
-    )?;
+    fs::write(&cordis, toml::to_string(&initial)?)?;
     let mut catalog = ExtensionCatalog::new();
     catalog.register(Factory)?;
     catalog.register(IncludeFactory)?;
@@ -105,7 +98,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .await?;
     let loader = runtime.root().get(LOADER)?;
     loader
-        .create(bootstrap_entry("include", &bootstrap).await?, None, None)
+        .create(include_root_entry("include", &cordis)?, None, None)
         .await?;
     let before = loader
         .await_idle()

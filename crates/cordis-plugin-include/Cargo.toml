@@ -23,6 +23,8 @@ toml.workspace = true
 tokio = { workspace = true, features = ["rt"] }
 
 [dev-dependencies]
+cordis-plugin-config-editor.workspace = true
+cordis-plugin-settings.workspace = true
 cordis-testkit.workspace = true
 tempfile = "3"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }

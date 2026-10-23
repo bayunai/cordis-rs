@@ -36,7 +36,7 @@ use cordis_loader::{
     IsolationDescriptor, LOADER, Loader, LoaderError, LoaderPlugin, LoaderSnapshot,
     PreparedExtension,
 };
-use cordis_plugin_include::{IncludeFactory, bootstrap_entry};
+use cordis_plugin_include::{IncludeFactory, include_root_entry};
 use cordis_plugin_logger_console::ConsoleLoggerPlugin;
 use db::DbPlugin;
 use futures_util::stream::Stream;
@@ -664,15 +664,11 @@ fn initial_extensions() -> Result<ExtensionsConfig, LoaderError> {
     })
 }
 
-fn write_bootstrap_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
+fn write_cordis_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
     let dir = std::env::temp_dir().join(format!("cordis-plugin-stack-{}", std::process::id()));
     fs::create_dir_all(&dir)?;
     fs::write(
-        dir.join("bootstrap.toml"),
-        "version = 3\n[config]\ndriver = \"file\"\npath = \"extensions.toml\"\n",
-    )?;
-    fs::write(
-        dir.join("extensions.toml"),
+        dir.join("cordis.toml"),
         toml::to_string_pretty(&initial_extensions()?)?,
     )?;
     Ok(dir)
@@ -680,8 +676,8 @@ fn write_bootstrap_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let config_dir = write_bootstrap_dir()?;
-    let bootstrap = config_dir.join("bootstrap.toml");
+    let config_dir = write_cordis_dir()?;
+    let cordis = config_dir.join("cordis.toml");
 
     let runtime = Runtime::new()?;
     let _console = runtime
@@ -696,7 +692,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let loader_fiber = runtime.root().plugin(Arc::new(plugin)).await?;
     let loader = (*runtime.root().get(LOADER)?).clone();
     loader
-        .create(bootstrap_entry("include", &bootstrap).await?, None, None)
+        .create(include_root_entry("include", &cordis)?, None, None)
         .await?;
     let _ = loader.await_idle().await?;
     sys_log(
