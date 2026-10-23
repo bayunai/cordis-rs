@@ -97,7 +97,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .root()
         .plugin(Arc::new(ConfigEditorPlugin::new(editor_config)))
         .await?;
-    let _settings = runtime.root().plugin(Arc::new(SettingsPlugin)).await?;
+    let _settings = runtime.root().plugin(Arc::new(SettingsPlugin::default())).await?;
     let settings = runtime.root().get(SETTINGS)?;
     let before = settings.describe("include:ocr").await?;
     assert!(before.user.is_none());

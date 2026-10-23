@@ -2,9 +2,14 @@
 
 use crate::secrets;
 use cordis_loader::{ConfigRevision, EntryId, LoaderControlError};
-use cordis_plugin_config_editor::LayeredEntryConfig;
+use cordis_plugin_config_editor::{
+    ConfigEditability, ConfigReadOnlyReason, LayeredEntryConfig,
+};
 
-/// 表字段操作。空路径不合法；数组只能整体替换。刻意不实现 Debug，避免泄露输入。
+/// 表字段操作。空路径不合法。刻意不实现 Debug，避免泄露输入。
+///
+/// `Unset` 对齐 DSH：对象字段恢复 `base` 继承（有则写入该值，无则删键）；
+/// 父节点为数组时删除该下标元素。不能硬删下层已提供的继承值。
 #[derive(Clone)]
 pub enum ConfigOperation {
     Set {
@@ -33,24 +38,30 @@ pub struct EntryConfigView {
     pub factory: String,
     /// 用于表单展示的安全投影；最终校验仍由 Rust 类型和 prepare 完成。
     pub schema: serde_json::Value,
-    /// Include path 源文件中的声明（已脱敏）。
+    /// 去除 user 后的继承配置（可含解析默认值，已脱敏）。
     pub base: toml::Value,
     /// 本机 user 整表覆盖（已脱敏）；无覆盖时为 `None`。
     pub user: Option<toml::Value>,
-    /// deploy ∘ user ∘ home 的原始合成配置，字段编辑以此为基础，不能把默认值写回用户层。
+    /// deploy ∘ user ∘ home 的原始合成配置，字段编辑以此为基础。
     pub config: toml::Value,
     /// Active 实例的已解析配置快照（含 Serde 默认值，已脱敏）；其他状态明确为 None。
     pub value: Option<serde_json::Value>,
     pub secrets: Vec<SecretFieldState>,
+    /// 是否允许经 `mutate` 写入；与 `read_only_reason` 同源。
+    pub editable: bool,
+    /// 不可编辑时的原因；能 describe 不代表允许 mutate。
+    pub read_only_reason: Option<ConfigReadOnlyReason>,
     pub revision: ConfigRevision,
 }
 
 pub(crate) fn view_from_layers(
     layers: &LayeredEntryConfig,
+    editability: ConfigEditability,
 ) -> Result<EntryConfigView, LoaderControlError> {
     let (schema, config, secrets) = secrets::redact(&layers.schema, &layers.effective)
         .map_err(|message| LoaderControlError::SecretSchema { message })?;
-    let (_, base, _) = secrets::redact(&layers.schema, &layers.base)
+    // base 常为序列化投影（含 rename 后的秘密字段），按 resolved_schema 脱敏。
+    let (_, base, _) = secrets::redact(&layers.resolved_schema, &layers.base)
         .map_err(|message| LoaderControlError::SecretSchema { message })?;
     let user = match &layers.user {
         Some(raw) => {
@@ -66,6 +77,10 @@ pub(crate) fn view_from_layers(
         .map(|resolved| secrets::redact_json(&layers.resolved_schema, resolved))
         .transpose()
         .map_err(|message| LoaderControlError::SecretSchema { message })?;
+    let (editable, read_only_reason) = match editability {
+        ConfigEditability::Editable => (true, None),
+        ConfigEditability::ReadOnly(reason) => (false, Some(reason)),
+    };
     Ok(EntryConfigView {
         path: layers.path.clone(),
         factory: layers.factory.clone(),
@@ -78,37 +93,124 @@ pub(crate) fn view_from_layers(
             .into_iter()
             .map(|(path, is_set)| SecretFieldState { path, is_set })
             .collect(),
+        editable,
+        read_only_reason,
         revision: layers.revision,
     })
 }
 
+/// 应用一次字段操作。`base` 仅 `Unset` 恢复继承时使用。
 pub(crate) fn apply_operation(
     config: &mut toml::Value,
+    base: &toml::Value,
     operation: ConfigOperation,
 ) -> Result<(), LoaderControlError> {
-    let (path, value) = match operation {
-        ConfigOperation::Set { path, value } => (path, Some(value)),
-        ConfigOperation::Unset { path } => (path, None),
-    };
+    match operation {
+        ConfigOperation::Set { path, value } => apply_set(config, &path, value),
+        ConfigOperation::Unset { path } => apply_unset(config, base, &path),
+    }
+}
+
+fn apply_set(
+    config: &mut toml::Value,
+    path: &[String],
+    value: toml::Value,
+) -> Result<(), LoaderControlError> {
     let (last, parents) = path
         .split_last()
         .ok_or(LoaderControlError::InvalidConfigPath)?;
-    let mut table = config
+    let mut cursor = config
         .as_table_mut()
         .ok_or(LoaderControlError::InvalidConfigPath)?;
     for key in parents {
-        if !table.contains_key(key) && value.is_some() {
-            table.insert(key.clone(), toml::Value::Table(toml::Table::new()));
+        if !cursor.contains_key(key) {
+            cursor.insert(key.clone(), toml::Value::Table(toml::Table::new()));
         }
-        table = table
+        cursor = cursor
             .get_mut(key)
             .and_then(toml::Value::as_table_mut)
             .ok_or(LoaderControlError::InvalidConfigPath)?;
     }
-    if let Some(value) = value {
-        table.insert(last.clone(), value);
-    } else if table.remove(last).is_none() {
-        return Err(LoaderControlError::InvalidConfigPath);
+    cursor.insert(last.clone(), value);
+    Ok(())
+}
+
+fn apply_unset(
+    config: &mut toml::Value,
+    base: &toml::Value,
+    path: &[String],
+) -> Result<(), LoaderControlError> {
+    let (_last, parents) = path
+        .split_last()
+        .ok_or(LoaderControlError::InvalidConfigPath)?;
+    if parent_is_array(config, parents)? {
+        return remove_path(config, path);
+    }
+    match get_path(base, path) {
+        Some(inherited) => apply_set(config, path, inherited.clone()),
+        None => remove_path(config, path),
+    }
+}
+
+fn parent_is_array(root: &toml::Value, parents: &[String]) -> Result<bool, LoaderControlError> {
+    if parents.is_empty() {
+        return Ok(false);
+    }
+    Ok(get_path(root, parents).is_some_and(toml::Value::is_array))
+}
+
+fn get_path<'a>(root: &'a toml::Value, path: &[String]) -> Option<&'a toml::Value> {
+    let mut cursor = root;
+    for key in path {
+        cursor = match cursor {
+            toml::Value::Table(table) => table.get(key)?,
+            toml::Value::Array(items) => {
+                let index: usize = key.parse().ok()?;
+                items.get(index)?
+            }
+            _ => return None,
+        };
+    }
+    Some(cursor)
+}
+
+fn remove_path(root: &mut toml::Value, path: &[String]) -> Result<(), LoaderControlError> {
+    let (last, parents) = path
+        .split_last()
+        .ok_or(LoaderControlError::InvalidConfigPath)?;
+    let mut cursor = root;
+    for key in parents {
+        cursor = match cursor {
+            toml::Value::Table(table) => table
+                .get_mut(key)
+                .ok_or(LoaderControlError::InvalidConfigPath)?,
+            toml::Value::Array(items) => {
+                let index: usize = key
+                    .parse()
+                    .map_err(|_| LoaderControlError::InvalidConfigPath)?;
+                items
+                    .get_mut(index)
+                    .ok_or(LoaderControlError::InvalidConfigPath)?
+            }
+            _ => return Err(LoaderControlError::InvalidConfigPath),
+        };
+    }
+    match cursor {
+        toml::Value::Table(table) => {
+            if table.remove(last).is_none() {
+                return Err(LoaderControlError::InvalidConfigPath);
+            }
+        }
+        toml::Value::Array(items) => {
+            let index: usize = last
+                .parse()
+                .map_err(|_| LoaderControlError::InvalidConfigPath)?;
+            if index >= items.len() {
+                return Err(LoaderControlError::InvalidConfigPath);
+            }
+            items.remove(index);
+        }
+        _ => return Err(LoaderControlError::InvalidConfigPath),
     }
     Ok(())
 }
@@ -118,12 +220,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn paths_are_table_keys_and_arrays_are_atomic() {
+    fn paths_are_table_keys_and_arrays_are_atomic_for_set() {
         let mut config: toml::Value =
             toml::from_str("rows=[1,2]\n[auth]\ntoken='secret'\n").unwrap();
+        let base = config.clone();
         assert!(matches!(
             apply_operation(
                 &mut config,
+                &base,
                 ConfigOperation::Set {
                     path: vec!["rows".into(), "0".into()],
                     value: 3.into()
@@ -133,6 +237,7 @@ mod tests {
         ));
         apply_operation(
             &mut config,
+            &base,
             ConfigOperation::Set {
                 path: vec!["rows".into()],
                 value: toml::Value::Array(vec![3.into()]),
@@ -140,5 +245,54 @@ mod tests {
         )
         .unwrap();
         assert_eq!(config["rows"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn unset_object_restores_inherited_base_value() {
+        let mut config: toml::Value = toml::from_str("limit = 9\nname = 'user'\n").unwrap();
+        let base: toml::Value = toml::from_str("limit = 1\n").unwrap();
+        apply_operation(
+            &mut config,
+            &base,
+            ConfigOperation::Unset {
+                path: vec!["limit".into()],
+            },
+        )
+        .unwrap();
+        assert_eq!(config["limit"].as_integer(), Some(1));
+        assert_eq!(config["name"].as_str(), Some("user"));
+    }
+
+    #[test]
+    fn unset_object_without_base_removes_key() {
+        let mut config: toml::Value = toml::from_str("extra = true\n").unwrap();
+        let base: toml::Value = toml::from_str("").unwrap();
+        apply_operation(
+            &mut config,
+            &base,
+            ConfigOperation::Unset {
+                path: vec!["extra".into()],
+            },
+        )
+        .unwrap();
+        assert!(config.get("extra").is_none());
+    }
+
+    #[test]
+    fn unset_array_index_removes_element() {
+        let mut config: toml::Value = toml::from_str("rows=[1,2,3]\n").unwrap();
+        let base = config.clone();
+        apply_operation(
+            &mut config,
+            &base,
+            ConfigOperation::Unset {
+                path: vec!["rows".into(), "1".into()],
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            config["rows"].as_array().unwrap(),
+            &vec![1.into(), 3.into()]
+        );
     }
 }

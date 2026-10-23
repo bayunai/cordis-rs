@@ -132,7 +132,8 @@ impl PreparedExtension {
         self
     }
 
-    pub(crate) fn resolved(&self) -> Option<serde_json::Value> {
+    /// Factory `prepare` 时序列化的完整配置投影（含 Serde 默认值）。
+    pub fn resolved(&self) -> Option<serde_json::Value> {
         self.resolved.clone()
     }
 

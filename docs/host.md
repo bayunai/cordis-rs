@@ -159,13 +159,13 @@ Group **只**组织 EntryTree / 生命周期 / 父子 Context，**不再** `exte
 
 `Loader` 提供 `entries()`、`factories()`、`injections()`、`isolations()`、`subtree()`、
 `attach_subtree()`、`create()`、`update()`、`remove()`、`reload()` 和 `await_idle()`。
-`attach_subtree()` 接收通用 `EntryTreeSource`，不接收文件路径。根控制面的 CRUD 只操作内存根树，
-不写文件；内存根没有来源可 reload。Include 文件内部用 `LoaderSubtree`
-（`loader.subtree("include")` 或 `loader.subtree("include:reports")`），并传入该文件内的局部路径。
-来源的读取、版本检查、写入预检及持久化均为异步操作；Loader 在所属树的操作锁内等待完成。
+`attach_subtree()` 接收通用 `EntryTreeSource`，不接收文件路径。
+`create` / `update` / `remove` 接受**完整路径**（如 `include:worker`），按路径定位所属来源树后改局部声明；
+`parent` 为 Include 载体路径时表示插入或移动到该来源树顶层。调用方不必先 `subtree()`。
+`subtree("include")` / `subtree("include:reports")` 仍可用于 `reload` 或局部路径 CRUD。
+内存根没有来源可 reload。来源的读取、版本检查、写入预检及持久化均为异步操作；Loader 在所属树的操作锁内等待完成。
 Include 将文件事务放入阻塞任务，文件 I/O 不占用 Tokio 异步工作线程。
-`create` / `update` 接收父 Group 路径与位置；
-`update` 可以移动条目，移动按「旧路径后序释放 → 新路径前序挂载」处理（不做隐式原地迁移）。
+`update` 可以同树内移动条目，移动按「旧路径后序释放 → 新路径前序挂载」处理（不做隐式原地迁移）。
 **跨树移动一律拒绝**（`CrossTreeMove`）。
 
 Loader reconcile 是**局部**的：仅创建、删除、移动、启停或配置/`inject`/`isolate` 变化的 Entry/子树
@@ -192,20 +192,32 @@ Loader **不**提供 `describe_config` / `mutate_config`；表单只走 `SETTING
 Include 初次加载中的业务生命周期失败保留为 Failed 条目，不使其后的编辑、设置、管理服务失效。
 ConfigEditor 的 `apply()` 只注册服务，不执行隐式同步或重试；后续用户编辑的生命周期失败仍返回错误。
 
+`settings.list().await` 返回可表单配置条目目录（根 Include 下非 Group）：路径、Factory、
+`editable` 与 `read_only_reason`。启停库存仍走 `PLUGIN_MANAGER.list_plugins`（含 Group）。
+
 `settings.describe(path).await` 返回 `EntryConfigView`：完整路径、Factory ID、管理 Schema、
-脱敏 `base` / `user` / `config` / `value`、秘密字段存在状态与 `ConfigRevision`。
-`base` 为有序 deploy patch 组成结果；`user` 为本机覆盖；`config` = deploy ∘ user ∘ home 的 raw 配置。
-`value: Option<serde_json::Value>` 来自 Active 实例实际接受的类型解析快照，含 Serde 默认值；
-非 Active 明确为 `None`。Factory 的 Config 需 `Serialize`，读取快照不重新解析或调用 prepare。
-默认值不写回 raw config，Settings 字段操作仍作用于 `config`，而不是运行值。
-Group 仅是树结构，不提供配置表单。Schema 来自静态 Catalog，因此禁用、Pending、Failed 条目
-都能描述；读取不会反序列化或构造插件，也不会要求缺失必填字段的禁用条目先启用。
+脱敏 `base` / `user` / `config` / `value`、秘密字段存在状态、`editable` /
+`read_only_reason` 与 `ConfigRevision`。能描述不代表允许修改；只读原因与
+`CONFIG_EDITOR.editability` 同源（`Group` / `NestedInclude` / `UnmanagedEntry`）。
+`base` 为去除 user 后的继承配置（deploy ∘ home），能解析时含 Serde 默认值（对齐 DSH）；
+`user` 为本机覆盖；`config` = deploy ∘ user ∘ home 的 raw 配置。
+`value: Option<serde_json::Value>` 来自 Active 实例实际接受的类型解析快照；非 Active 为 `None`。
+Factory 的 Config 需 `Serialize`。Settings 字段操作作用于 `config`，而不是把运行值整表写回。
+Group 仅是树结构，不进 Settings 目录。Schema 来自静态 Catalog，因此禁用、Pending、Failed
+条目都能描述。
 
 `settings.mutate(path, expected_revision, operations).await` 在 **user** 上拼装有序字段操作，
 委托 config-editor 写入本机 user patch 并 reconcile；**不** bake 空根或各插件 deploy。
-若 home 盖住导致 effective ≠ 目标则拒绝。`Set` / `Unset` 的路径是配置表的字符串键序列，不含
-Entry 控制字段；空路径、穿过标量或数组、删除不存在的键明确报 `InvalidConfigPath`。
-即使条目禁用，也执行反序列化与 `prepare()`，但不执行延迟构造。嵌套 Include 子树首版不可经此路径编辑。
+不可编辑路径在拼装前即返回 `ConfigNotEditable`。
+`Unset` 对齐 DSH：对象字段从 `base` 恢复继承（有则 set，无则删键）；数组下标删除元素。
+管理 UI 应标「恢复继承」，不能把 `Unset` 标成「删除字段」；不能经表单硬删下层已提供的值。
+若 home 盖住导致 effective ≠ 目标则拒绝。路径是配置表的字符串键序列；空路径、非法路径
+报 `InvalidConfigPath`。即使条目禁用，也执行反序列化与 `prepare()`，但不执行延迟构造。
+
+`settings.subscribe()` 转发 Loader 事件：`SnapshotChanged` → `SettingsEvent::Changed { revision }`；
+订阅落后 → `Resync`（revision 未知，须完整 `list` / `describe`，无哨兵数字）。
+`PLUGIN_MANAGER.subscribe()` 同构（`PluginManagerEvent::Changed` / `Resync` → 完整 `list_plugins`）。
+卸载后订阅与 `list` 返回 `LoaderUnavailable`。
 
 版本令牌包含随机树实例身份与协调代次，支持 `Display` / `FromStr`，不代表授权。
 应用负责自己的 HTTP DTO、身份验证和权限检查。版本检查失败返回
@@ -230,8 +242,8 @@ ConfigEditor 的文件读取、解析和写入在完整阻塞任务内执行；p
 
 Config 字段通过 `#[schemars(extend("writeOnly" = true))]` 标记秘密。
 描述中删除秘密值，`secrets` 的路径与 `is_set` 仅表示原始配置中是否存在该字段。
-未提交的秘密保留；Set 明确替换；Unset 明确删除并重新校验完整配置。替换父对象或数组
-就是替换整个值，不自动恢复被删除的秘密。数组元素含秘密时，整个数组被隐藏；根配置
+未提交的秘密保留；Set 明确替换；Unset 恢复继承（或删数组元素）并重新校验完整配置。
+替换父对象或数组就是替换整个值，不自动恢复被删除的秘密。数组元素含秘密时，整个数组被隐藏；根配置
 整体标记 writeOnly 时整份配置隐藏，但空路径仍不可操作，建议将标记放到实际字段上。
 
 管理 Schema 保守合并组合分支的秘密标记，展开本地 JSON Pointer 引用，并移除秘密及其

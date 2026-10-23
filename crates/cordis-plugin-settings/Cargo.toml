@@ -16,6 +16,7 @@ cordis-core.workspace = true
 cordis-loader.workspace = true
 cordis-plugin-config-editor = { path = "../cordis-plugin-config-editor" }
 serde_json.workspace = true
+tokio = { workspace = true, features = ["sync"] }
 toml.workspace = true
 
 [dev-dependencies]

@@ -28,6 +28,9 @@ PluginKey：`cordis.plugin-manager`。
 页面退出丢弃接收端即可；插件卸载后通道关闭，旧服务句柄不能重新订阅或发起启停。
 重新挂载建立独立通道，旧订阅不会收到新实例事件。
 
-列表与启停入口共同使用 ConfigEditor 的 `can_edit()` 能力判断。
+`PluginManagerEvent::Changed { revision }` 携带 Loader 快照代次；`Resync` 表示订阅落后、
+中间事件已丢，revision 未知，须完整 `list_plugins`，勿把哨兵数字当成真实版本。
+
+列表与启停入口共同使用 ConfigEditor 的 `editability()`（`ConfigReadOnlyReason`）判断。
 Group、嵌套 Include 载体，以及不属于可编辑 deploy 层的条目均明确标为只读；
 嵌套 Include 内的业务条目不会被误报为可启停。

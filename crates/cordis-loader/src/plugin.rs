@@ -276,6 +276,12 @@ impl LoaderInner {
         best
     }
 
+    /// Include 载体完整路径对应的已附着子树（用于在来源树顶层 create / 移动）。
+    pub(crate) fn subtree_at_prefix(&self, path: &str) -> Option<Arc<RuntimeTree>> {
+        let registry = self.subtrees.lock().expect("subtree registry");
+        registry.by_prefix.get(&EntryId::from(path)).cloned()
+    }
+
     pub(crate) async fn attach_subtree(
         self: &Arc<Self>,
         owner: &Context,

@@ -7,9 +7,12 @@ mod secrets;
 mod service;
 
 pub use form::{ConfigOperation, EntryConfigView, SecretFieldState};
-pub use service::{SETTINGS, SettingsPlugin, SettingsService};
+pub use service::{
+    SETTINGS, SettingsCatalogEntry, SettingsConfig, SettingsEvent, SettingsPlugin, SettingsService,
+};
 
 pub use cordis_loader::{ConfigRevision, LoaderControlError};
 pub use cordis_plugin_config_editor::{
-    CONFIG_EDITOR, ConfigEditorConfig, ConfigEditorPlugin, ConfigEditorService,
+    CONFIG_EDITOR, ConfigEditability, ConfigEditorConfig, ConfigEditorPlugin, ConfigEditorService,
+    ConfigReadOnlyReason,
 };

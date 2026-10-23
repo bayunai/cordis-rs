@@ -438,6 +438,74 @@ async fn failed_child_keeps_include_control_plane_and_independent_sibling() {
 }
 
 #[tokio::test]
+async fn loader_full_path_crud_routes_to_source_tree() {
+    let dir = tempfile::tempdir().unwrap();
+    let include = ExtensionsConfig {
+        version: 3,
+        extensions: vec![EntryOptions::new("child", "demo.value")],
+    };
+    let root = ExtensionsConfig {
+        version: 3,
+        extensions: vec![include_entry("nested.toml")],
+    };
+    let cordis = write_tree(dir.path(), &root, &include);
+    let root_text_before = fs::read_to_string(dir.path().join("cordis.toml")).unwrap();
+    let (runtime, _fiber, loader) = mount(&cordis).await;
+    loader.await_idle().await.unwrap();
+
+    loader
+        .update(
+            "include:reports:child",
+            EntryUpdate {
+                disabled: Some(true),
+                ..Default::default()
+            },
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let snapshot = loader.await_idle().await.unwrap();
+    assert!(!snapshot.entry("include:reports:child").unwrap().enabled);
+    let nested: ExtensionsConfig =
+        toml::from_str(&fs::read_to_string(dir.path().join("nested.toml")).unwrap()).unwrap();
+    assert!(nested.extensions[0].disabled);
+
+    loader
+        .create(
+            EntryOptions::new("extra", "demo.noop"),
+            Some("include:reports"),
+            None,
+        )
+        .await
+        .unwrap();
+    let snapshot = loader.await_idle().await.unwrap();
+    assert_eq!(
+        snapshot.entry("include:reports:extra").unwrap().state,
+        Some(FiberState::Active)
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join("cordis.toml")).unwrap(),
+        root_text_before
+    );
+
+    loader.remove("include:reports:extra").await.unwrap();
+    loader.await_idle().await.unwrap();
+    assert!(matches!(
+        loader.entry_context("include:reports:extra"),
+        Err(LoaderControlError::Loader(
+            LoaderError::UnknownInstance { .. }
+        ))
+    ));
+    let nested: ExtensionsConfig =
+        toml::from_str(&fs::read_to_string(dir.path().join("nested.toml")).unwrap()).unwrap();
+    assert_eq!(nested.extensions.len(), 1);
+    assert_eq!(nested.extensions[0].id, "child");
+
+    runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn cross_tree_move_is_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let include = ExtensionsConfig {

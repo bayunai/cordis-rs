@@ -10,7 +10,9 @@ mod service;
 mod user_patch;
 
 pub use composition::prepare_root_include;
-pub use layers::{ConfigEditorConfig, LayeredEntryConfig};
+pub use layers::{
+    ConfigEditability, ConfigEditorConfig, ConfigReadOnlyReason, LayeredEntryConfig,
+};
 pub use patch_file::{
     PATCH_FILE_VERSION, PatchFileDocument, compose_entries, load_ordered_patches,
 };

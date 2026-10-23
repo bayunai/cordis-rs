@@ -61,7 +61,7 @@ struct UploadConfig {
 该快照不会在查询时重新计算默认值；自定义 Serialize 的错误或 panic 会在生命周期执行前明确拒绝。
 Settings 的 `config` 为原始字段编辑源，`value` 是仅 Active 存在的解析快照；不能把展示默认值回填到用户覆盖。
 
-应用挂载 `SettingsPlugin` 后使用 `settings.describe()` 展示表单，再通过
+应用挂载 `SettingsPlugin` 后使用 `settings.list()` / `describe()` 展示表单，再通过
 `settings.mutate()` 提交有序字段操作和版本（写回经 config-editor）。
 未修改的秘密不要从脱敏表单补为空字符串；只有用户明确替换或删除时才提交相应操作。
 管理端无需依赖插件自身的客户端入口，未启用或失败的实例同样能修复配置。
@@ -75,10 +75,10 @@ Settings 的 `config` 为原始字段编辑源，`value` 是仅 Active 存在的
 启动和运行期统一先挂载 `LoaderPlugin::new(catalog)`，再通过 `loader.create(entry, None, None).await`
 登记条目；Loader 构造不再接收任何初始条目列表。
 
-业务服务通过 `loader.entry_context("include:插件")` 读取；文件树 CRUD 使用
+业务服务通过 `loader.entry_context("include:插件")` 读取；文件树 CRUD 可直接用完整路径
+（如 `loader.update("include:插件", …)`），Loader 按路径路由到来源树。也可用
 `loader.subtree("include")` 的局部路径。表单 `describe` / `mutate` 使用完整路径，由
-settings → config-editor → Loader 定位来源。Loader 内存根 CRUD 不持久化，不能把文件修改
-发到根控制面。
+settings → config-editor → Loader 定位来源。仅内存根上的条目 CRUD 不持久化。
 
 需要文件目录时读取 Include 提供的 `INCLUDE_LOCATION`，不要假定 `EntryLocation` 包含文件信息。
 该元数据只在 Include 来源的上下文中存在；内存根中的 Include 应使用绝对路径。
@@ -231,7 +231,7 @@ impl ExtensionFactory for GreeterFactory {
   Key 与父同槽，可共享也可 `ServiceConflict`。
 - **Include**：`cordis-plugin-include` 的 `cordis:include` 将独立 v3 TOML／JSON／YAML 文档附着为
   Loader 来源树，并拥有文件读取、patches、版本检查与写回；须 Catalog 显式注册。
-  文件管理用 `loader.subtree(path)` 与局部路径，外部改文件后须显式 `reload()`。
+  文件 CRUD 可用完整路径或 `loader.subtree(path)` 局部路径；外部改文件后须显式 `reload()`。
 
 ## ServiceKey / Event Key
 

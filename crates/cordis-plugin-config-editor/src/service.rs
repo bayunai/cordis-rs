@@ -1,7 +1,7 @@
 //! ConfigEditor：user 层持久化与受信任整表读写。
 
 use crate::{
-    layers::{ConfigEditorConfig, LayerEngine, LayeredEntryConfig},
+    layers::{ConfigEditability, ConfigEditorConfig, LayerEngine, LayeredEntryConfig},
     user_patch::UserPatchStore,
 };
 use async_trait::async_trait;
@@ -28,7 +28,15 @@ impl ConfigEditorService {
     pub async fn can_edit(&self, path: impl AsRef<str>) -> Result<bool, LoaderControlError> {
         self.engine.can_edit(path.as_ref()).await
     }
-    /// 分层读取（base=deploy / user / effective=deploy∘user∘home）；可含明文秘密。
+
+    /// 可编辑性及只读原因；与 `can_edit` 同源。
+    pub async fn editability(
+        &self,
+        path: impl AsRef<str>,
+    ) -> Result<ConfigEditability, LoaderControlError> {
+        self.engine.editability(path.as_ref()).await
+    }
+    /// 分层读取（base=deploy∘home 可含解析默认 / user / effective=deploy∘user∘home）；可含明文秘密。
     pub async fn layers(
         &self,
         path: impl AsRef<str>,

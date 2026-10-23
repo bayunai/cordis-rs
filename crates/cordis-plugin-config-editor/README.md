@@ -9,7 +9,7 @@
 
 | 做 | 不做 |
 | --- | --- |
-| `layers`：base=deploy / user / effective=deploy∘user∘home | Schema 表单投影、秘密脱敏 |
+| `layers`：base=deploy∘home（可含解析默认）/ user / effective=deploy∘user∘home | Schema 表单投影、秘密脱敏 |
 | `edit` / `set_enabled`：只写 user patch 并全量 reconcile | 写空根、deploy、home |
 | home 盖住时拒绝 `edit` | 页面组件、HTTP、鉴权 |
 | `read` / `commit_source`：受信任整表（运维） | 用户偏好文档（非 Entry Config） |
@@ -35,7 +35,8 @@ ctx.plugin(Arc::new(ConfigEditorPlugin::new(config))).await?;
 - `layers(path) -> LayeredEntryConfig`（raw `effective` 与 Active 的可选 `resolved` 分开）
 - `edit(path, expected, effective) -> LayeredEntryConfig`
 - `set_enabled(path, enabled)`
-- `can_edit(path)`：按 deploy 所有权判断是否支持编辑；嵌套 Include 后代不冒充可编辑。
+- `can_edit(path)` / `editability(path)`：按 deploy 所有权判断是否支持编辑，并给出
+  `ConfigReadOnlyReason`（`Group` / `NestedInclude` / `UnmanagedEntry`）；嵌套 Include 后代不冒充可编辑。
 - `read` / `commit_source` — 后者可能 bake Include path；表单不得使用
 - `reload()` — 显式重读各层并协调，外部修改冲突后由调用方刷新，不自动重试编辑
 

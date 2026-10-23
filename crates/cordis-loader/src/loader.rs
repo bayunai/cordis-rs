@@ -129,11 +129,8 @@ impl Loader {
         let inner = self.inner()?;
         let _control = inner.config_operations.lock().await;
         let path = path.as_ref();
-        let tree = inner
-            .subtree_owning_path(path)
-            .unwrap_or_else(|| inner.root.clone());
-        let local = config_local_path(&tree, path);
-        crate::config_control::snapshot(&tree, local).await
+        let (tree, local) = resolve_entry_path(&inner, path);
+        crate::config_control::snapshot(&tree, &local).await
     }
 
     /// 整表替换 Entry 配置；expected 必须来自最近一次快照或表单描述。
@@ -148,16 +145,8 @@ impl Loader {
     ) -> Result<crate::EntryConfigSnapshot, LoaderControlError> {
         let inner = self.inner()?;
         let path = path.as_ref();
-        let tree = inner
-            .subtree_owning_path(path)
-            .unwrap_or_else(|| inner.root.clone());
-        crate::config_control::commit(
-            &tree,
-            config_local_path(&tree, path),
-            expected_revision,
-            config,
-        )
-        .await
+        let (tree, local) = resolve_entry_path(&inner, path);
+        crate::config_control::commit(&tree, &local, expected_revision, config).await
     }
 
     pub(crate) fn new(inner: Arc<LoaderInner>) -> Self {
@@ -185,18 +174,30 @@ impl Loader {
         factory: &str,
         config: &toml::Value,
     ) -> Result<(), LoaderControlError> {
-        self.inner()?
-            .catalog
-            .prepare(factory, config)
-            .map(|_| ())
-            .map_err(|error| match error {
+        self.resolve_entry_config(factory, config).map(|_| ())
+    }
+
+    /// 反序列化并序列化 Factory Config，得到含 Serde 默认值的投影；失败表示无法解析。
+    ///
+    /// 对齐 DSH `resolveConfig`：供 settings 的 `base` 继承投影使用，不修改条目树。
+    pub fn resolve_entry_config(
+        &self,
+        factory: &str,
+        config: &toml::Value,
+    ) -> Result<serde_json::Value, LoaderControlError> {
+        let prepared = self.inner()?.catalog.prepare(factory, config).map_err(
+            |error| match error {
                 LoaderError::InvalidConfig { .. }
                 | LoaderError::FactoryPanic { .. }
                 | LoaderError::PluginBuild { .. }
                 | LoaderError::PluginPanic { .. }
                 | LoaderError::UnknownFactory { .. } => LoaderControlError::ConfigValidation,
                 other => LoaderControlError::Loader(other),
-            })
+            },
+        )?;
+        prepared
+            .resolved()
+            .ok_or(LoaderControlError::ConfigValidation)
     }
 
     pub fn injections(&self) -> Result<Vec<InjectionDescriptorInfo>, LoaderControlError> {
@@ -257,6 +258,7 @@ impl Loader {
         })
     }
 
+    /// 在完整路径所指树上创建条目。`parent` 为 Include 载体路径时插入该来源树顶层。
     pub async fn create(
         &self,
         entry: EntryOptions,
@@ -264,15 +266,24 @@ impl Loader {
         position: Option<usize>,
     ) -> Result<LoaderSnapshot, LoaderControlError> {
         let inner = self.inner()?;
-        reject_cross_tree(&inner, parent)?;
-        let parent = parent.map(str::to_owned);
-        mutate_tree(&inner.root, true, move |config| {
-            insert_entry(&mut config.extensions, parent.as_deref(), position, entry)
+        let (tree, parent_local) = match parent {
+            None => (inner.root.clone(), None),
+            Some(parent) => resolve_parent_path(&inner, parent),
+        };
+        let retain = Arc::ptr_eq(&tree, &inner.root);
+        mutate_tree(&tree, retain, move |config| {
+            insert_entry(
+                &mut config.extensions,
+                parent_local.as_deref(),
+                position,
+                entry,
+            )
         })
         .await
         .map(|_| inner.aggregate_snapshot())
     }
 
+    /// 按完整路径更新（可同树内移动）。路径与目标 parent 分属不同来源树时返回 `CrossTreeMove`。
     pub async fn update(
         &self,
         path: impl AsRef<str>,
@@ -282,27 +293,34 @@ impl Loader {
     ) -> Result<LoaderSnapshot, LoaderControlError> {
         let path = path.as_ref().to_owned();
         let inner = self.inner()?;
-        if inner.subtree_owning_path(&path).is_some() {
-            return Err(LoaderControlError::CrossTreeMove { path });
-        }
-        if let Some(Some(parent)) = parent {
-            reject_cross_tree(&inner, Some(parent))?;
-        }
-        let parent = parent.map(|parent| parent.map(str::to_owned));
-        mutate_tree(&inner.root, false, move |config| {
+        let (tree, local_path) = resolve_entry_path(&inner, &path);
+        let parent = match parent {
+            None => None,
+            Some(None) => Some(None),
+            Some(Some(parent)) => {
+                let (parent_tree, parent_local) = resolve_parent_path(&inner, parent);
+                if !Arc::ptr_eq(&tree, &parent_tree) {
+                    return Err(LoaderControlError::CrossTreeMove { path });
+                }
+                Some(parent_local)
+            }
+        };
+        mutate_tree(&tree, false, move |config| {
             let destination = if let Some(parent) = parent.as_ref() {
                 let parent = parent.as_deref();
                 if parent.is_some_and(|parent| {
-                    parent == path || parent.starts_with(&(path.clone() + ":"))
+                    parent == local_path || parent.starts_with(&(local_path.clone() + ":"))
                 }) {
-                    return Err(LoaderControlError::InvalidMove { path: path.clone() });
+                    return Err(LoaderControlError::InvalidMove {
+                        path: path.clone(),
+                    });
                 }
-                let entry = remove_entry(&mut config.extensions, &path)?;
+                let entry = remove_entry(&mut config.extensions, &local_path)?;
                 let next_path = join_path(parent, &entry.id);
                 insert_entry(&mut config.extensions, parent, position, entry)?;
                 next_path
             } else {
-                path.clone()
+                local_path.clone()
             };
             patch_entry(&mut config.extensions, &destination, patch)
         })
@@ -310,17 +328,16 @@ impl Loader {
         .map(|_| inner.aggregate_snapshot())
     }
 
+    /// 按完整路径删除条目。
     pub async fn remove(
         &self,
         path: impl AsRef<str>,
     ) -> Result<LoaderSnapshot, LoaderControlError> {
         let path = path.as_ref().to_owned();
         let inner = self.inner()?;
-        if inner.subtree_owning_path(&path).is_some() {
-            return Err(LoaderControlError::CrossTreeMove { path });
-        }
-        mutate_tree(&inner.root, false, move |config| {
-            remove_entry(&mut config.extensions, &path).map(|_| ())
+        let (tree, local_path) = resolve_entry_path(&inner, &path);
+        mutate_tree(&tree, false, move |config| {
+            remove_entry(&mut config.extensions, &local_path).map(|_| ())
         })
         .await
         .map(|_| inner.aggregate_snapshot())
@@ -353,10 +370,8 @@ impl ConfigTransaction {
     ) -> Result<crate::EntryConfigSnapshot, LoaderControlError> {
         let inner = self.loader.inner()?;
         let path = path.as_ref();
-        let tree = inner
-            .subtree_owning_path(path)
-            .unwrap_or_else(|| inner.root.clone());
-        crate::config_control::snapshot(&tree, config_local_path(&tree, path)).await
+        let (tree, local) = resolve_entry_path(&inner, path);
+        crate::config_control::snapshot(&tree, &local).await
     }
 
     pub async fn await_idle(&self) -> Result<LoaderSnapshot, LoaderControlError> {
@@ -380,11 +395,8 @@ impl ConfigTransaction {
     ) -> Result<crate::EntryConfigSnapshot, LoaderControlError> {
         let inner = self.loader.inner()?;
         let path = path.as_ref();
-        let tree = inner
-            .subtree_owning_path(path)
-            .unwrap_or_else(|| inner.root.clone());
-        crate::config_control::commit_owned(&tree, config_local_path(&tree, path), expected, config)
-            .await
+        let (tree, local) = resolve_entry_path(&inner, path);
+        crate::config_control::commit_owned(&tree, &local, expected, config).await
     }
 }
 
@@ -513,15 +525,27 @@ impl LoaderSubtree {
     }
 }
 
-fn reject_cross_tree(inner: &LoaderInner, parent: Option<&str>) -> Result<(), LoaderControlError> {
-    if let Some(parent) = parent
-        && inner.subtree_owning_path(parent).is_some()
-    {
-        return Err(LoaderControlError::CrossTreeMove {
-            path: parent.into(),
-        });
+/// 条目完整路径 → 所属树与树内局部路径。Include 载体本身落在父树（通常为内存根）。
+fn resolve_entry_path(inner: &LoaderInner, full: &str) -> (Arc<RuntimeTree>, String) {
+    if let Some(tree) = inner.subtree_owning_path(full) {
+        let local = config_local_path(&tree, full).to_owned();
+        (tree, local)
+    } else {
+        (inner.root.clone(), full.to_owned())
     }
-    Ok(())
+}
+
+/// 父 Group / 来源树根的完整路径 → 所属树与局部 parent（`None` = 该树顶层）。
+fn resolve_parent_path(inner: &LoaderInner, full: &str) -> (Arc<RuntimeTree>, Option<String>) {
+    if let Some(tree) = inner.subtree_at_prefix(full) {
+        return (tree, None);
+    }
+    let (tree, local) = resolve_entry_path(inner, full);
+    if local.is_empty() {
+        (tree, None)
+    } else {
+        (tree, Some(local))
+    }
 }
 
 fn config_local_path<'a>(tree: &RuntimeTree, full: &'a str) -> &'a str {

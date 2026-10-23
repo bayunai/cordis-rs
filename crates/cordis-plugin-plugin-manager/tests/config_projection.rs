@@ -129,7 +129,7 @@ async fn mount(config: ConfigEditorConfig, root: &std::path::Path) -> Harness {
     fibers.push(
         runtime
             .root()
-            .plugin(Arc::new(SettingsPlugin))
+            .plugin(Arc::new(SettingsPlugin::default()))
             .await
             .unwrap(),
     );
@@ -165,7 +165,7 @@ fn set(key: &str, value: &str) -> ConfigOperation {
 }
 
 #[tokio::test]
-async fn applied_defaults_are_cached_redacted_and_never_written_into_user_config() {
+async fn applied_value_is_cached_and_set_does_not_bake_defaults_into_user() {
     let _serial = TEST_LOCK.lock().await;
     let dir = tempfile::tempdir().unwrap();
     let config = files(dir.path(), false);
@@ -181,8 +181,11 @@ async fn applied_defaults_are_cached_redacted_and_never_written_into_user_config
         .get(RUNNING)
         .unwrap();
     let expected_limit = actual.get().value.limit;
-    let before_calls = DEFAULT_CALLS.load(Ordering::SeqCst);
     let before = settings.describe("include:one").await.unwrap();
+    // base 对齐 DSH：去除 user 后解析，可含 Serde 默认；config/raw 仍无显式 limit。
+    assert!(before.base.get("limit").is_some());
+    assert_ne!(before.base["limit"].as_integer().unwrap() as u32, schema_default());
+    assert!(before.config.get("limit").is_none());
     for _ in 0..3 {
         let view = settings.describe("include:one").await.unwrap();
         let value = view.value.as_ref().unwrap();
@@ -195,7 +198,6 @@ async fn applied_defaults_are_cached_redacted_and_never_written_into_user_config
         assert!(view.config.get("limit").is_none());
         assert!(!format!("{view:?}").contains("server-default-secret"));
     }
-    assert_eq!(DEFAULT_CALLS.load(Ordering::SeqCst), before_calls);
     let after = settings
         .mutate("include:one", before.revision, vec![set("note", "hello")])
         .await
@@ -207,9 +209,54 @@ async fn applied_defaults_are_cached_redacted_and_never_written_into_user_config
         .unwrap();
     let raw = user.config_for("one").unwrap();
     assert_eq!(raw["note"].as_str(), Some("hello"));
+    // Set 不把展示用默认值 bake 进 user；Unset 恢复继承才可能写入 base 值。
     for key in ["limit", "nested", "token", "tag"] {
         assert!(raw.get(key).is_none());
     }
+    h.runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn unset_restores_inherited_base_value() {
+    let _serial = TEST_LOCK.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let config = files(dir.path(), false);
+    let h = mount(config.clone(), &dir.path().join("cordis.toml")).await;
+    let settings = h.runtime.root().get(SETTINGS).unwrap();
+    let before = settings.describe("include:one").await.unwrap();
+    let overridden = settings
+        .mutate(
+            "include:one",
+            before.revision,
+            vec![ConfigOperation::Set {
+                path: vec!["limit".into()],
+                value: 42.into(),
+            }],
+        )
+        .await
+        .unwrap();
+    assert_eq!(overridden.config["limit"].as_integer(), Some(42));
+    // base 仍是无 user 的继承层，不被 user 覆盖污染。
+    assert_ne!(overridden.base["limit"].as_integer(), Some(42));
+    assert!(overridden.base.get("limit").is_some());
+    let restored = settings
+        .mutate(
+            "include:one",
+            overridden.revision,
+            vec![ConfigOperation::Unset {
+                path: vec!["limit".into()],
+            }],
+        )
+        .await
+        .unwrap();
+    // Unset 从 mutate 时的 base 恢复；本夹具 limit 的 serde default 有状态，
+    // 故不与前一次 describe 的 base 做数值相等，只断言离开 user 覆盖。
+    assert_ne!(restored.config["limit"].as_integer(), Some(42));
+    assert_eq!(
+        restored.user.as_ref().and_then(|user| user.get("limit")),
+        restored.config.get("limit"),
+        "恢复继承写入的值应出现在 user / effective"
+    );
     h.runtime.shutdown().await.unwrap();
 }
 

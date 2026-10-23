@@ -409,10 +409,10 @@ fn map_loader(e: impl std::fmt::Display) -> (StatusCode, Json<ErrJson>) {
     err(StatusCode::BAD_REQUEST, e.to_string())
 }
 
-/// UI 使用完整路径；文件树控制面使用局部路径，不能把文件编辑发往内存根树。
-fn main_local_path(path: &str) -> Result<&str, (StatusCode, Json<ErrJson>)> {
+fn require_include_path(path: &str) -> Result<(), (StatusCode, Json<ErrJson>)> {
     path.strip_prefix("include:")
         .filter(|local| !local.is_empty())
+        .map(|_| ())
         .ok_or_else(|| err(StatusCode::BAD_REQUEST, "仅允许操作 include 文件树内的条目"))
 }
 
@@ -434,11 +434,10 @@ async fn api_disable(
     State(app): State<Arc<AppState>>,
     Json(body): Json<DisableBody>,
 ) -> Result<Json<StateJson>, (StatusCode, Json<ErrJson>)> {
+    require_include_path(&body.path)?;
     app.loader
-        .subtree("include")
-        .map_err(map_loader)?
         .update(
-            main_local_path(&body.path)?,
+            &body.path,
             EntryUpdate {
                 disabled: Some(body.disabled),
                 ..Default::default()
@@ -481,12 +480,10 @@ async fn api_reorder(
         0
     };
     app.loader
-        .subtree("include")
-        .map_err(map_loader)?
         .update(
-            "app:http",
+            "include:app:http",
             EntryUpdate::default(),
-            Some(Some("app")),
+            Some(Some("include:app")),
             Some(target),
         )
         .await
@@ -504,10 +501,8 @@ async fn api_replace_http_config(
 ) -> Result<Json<StateJson>, (StatusCode, Json<ErrJson>)> {
     let label = format!("v{}", stamp());
     app.loader
-        .subtree("include")
-        .map_err(map_loader)?
         .update(
-            "app:http",
+            "include:app:http",
             EntryUpdate {
                 config: Some(toml::Value::Table({
                     let mut table = toml::Table::new();
@@ -540,10 +535,9 @@ async fn api_remove(
     State(app): State<Arc<AppState>>,
     Json(body): Json<PathBody>,
 ) -> Result<Json<StateJson>, (StatusCode, Json<ErrJson>)> {
+    require_include_path(&body.path)?;
     app.loader
-        .subtree("include")
-        .map_err(map_loader)?
-        .remove(main_local_path(&body.path)?)
+        .remove(&body.path)
         .await
         .map_err(map_loader)?;
     sys_log(&app.runtime, format!("sys: removed {}", body.path)).map_err(map_core)?;
@@ -559,9 +553,7 @@ async fn api_create_http(
         toml::Value::Table(table)
     });
     app.loader
-        .subtree("include")
-        .map_err(map_loader)?
-        .create(entry, Some("app"), None)
+        .create(entry, Some("include:app"), None)
         .await
         .map_err(map_loader)?;
     sys_log(&app.runtime, "sys: created include:app:http").map_err(map_core)?;

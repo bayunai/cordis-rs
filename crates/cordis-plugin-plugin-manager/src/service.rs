@@ -3,13 +3,18 @@
 use async_trait::async_trait;
 use cordis_core::{Context, CoreError, FiberState, Plugin, PluginKey, ServiceId, ServiceKey};
 use cordis_loader::{LOADER, Loader, LoaderControlError, LoaderEvent};
-use cordis_plugin_config_editor::{CONFIG_EDITOR, ConfigEditorService};
+use cordis_plugin_config_editor::{
+    CONFIG_EDITOR, ConfigEditability, ConfigEditorService, ConfigReadOnlyReason,
+};
 use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
 
 /// PluginManager 服务 Key。
 pub static PLUGIN_MANAGER: ServiceKey<PluginManagerService> =
     ServiceKey::new("cordis.plugin-manager");
+
+/// 与 ConfigEditor 共用的只读原因（对齐 DSH `readOnlyReason`）。
+pub type ReadOnlyReason = ConfigReadOnlyReason;
 
 /// Host 注入的管理器配置。
 #[derive(Clone, Debug)]
@@ -34,17 +39,6 @@ impl PluginManagerConfig {
     }
 }
 
-/// 条目不可经 PluginManager 启停的原因（对齐 DSH `readOnlyReason`）。
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ReadOnlyReason {
-    /// Group 仅组织树，不接受启停。
-    Group,
-    /// 嵌套 Include 载体；启停由树 CRUD / 重载路径处理。
-    NestedInclude,
-    /// 不属于 ConfigEditor 可编辑的 deploy 条目（含嵌套来源内的业务条目）。
-    UnmanagedEntry,
-}
-
 /// 根 Include 下一条可管理（或只读列出）的 Entry。
 #[derive(Clone, Debug)]
 pub struct PluginInfo {
@@ -60,7 +54,23 @@ pub struct PluginInfo {
 /// 库存已失效；订阅者须重新 `list_plugins`。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PluginManagerEvent {
+    /// Loader 快照已变；`revision` 来自 `LoaderEvent::SnapshotChanged`。
     Changed { revision: u64 },
+    /// 订阅落后，中间事件已丢；revision 未知，须完整刷新（勿信任此前版本）。
+    Resync,
+}
+
+/// 将 Loader 订阅结果映射为 PluginManager 事件；`Closed` 返回 `None`（结束转发）。
+pub(crate) fn event_from_loader_recv(
+    result: Result<LoaderEvent, broadcast::error::RecvError>,
+) -> Option<PluginManagerEvent> {
+    match result {
+        Ok(LoaderEvent::SnapshotChanged { revision }) => {
+            Some(PluginManagerEvent::Changed { revision })
+        }
+        Err(broadcast::error::RecvError::Lagged(_)) => Some(PluginManagerEvent::Resync),
+        Err(broadcast::error::RecvError::Closed) => None,
+    }
 }
 
 /// 插件库存与启停门面。
@@ -84,14 +94,14 @@ impl PluginManagerService {
             if path == self.include_root || !path.starts_with(&prefix) {
                 continue;
             }
+            // 树快照的 group 标志优先；其余与 ConfigEditor.editability 同源。
             let read_only_reason = if entry.group {
-                Some(ReadOnlyReason::Group)
-            } else if entry.name == "cordis:include" {
-                Some(ReadOnlyReason::NestedInclude)
-            } else if !self.editor.can_edit(path).await? {
-                Some(ReadOnlyReason::UnmanagedEntry)
+                Some(ConfigReadOnlyReason::Group)
             } else {
-                None
+                match self.editor.editability(path).await? {
+                    ConfigEditability::Editable => None,
+                    ConfigEditability::ReadOnly(reason) => Some(reason),
+                }
             };
             out.push(PluginInfo {
                 path: path.to_owned(),
@@ -119,18 +129,6 @@ impl PluginManagerService {
             return Err(LoaderControlError::EntryNotFound {
                 path: path.to_owned(),
             });
-        }
-        let snapshot = self.loader.await_idle().await?;
-        let entry = snapshot
-            .entry(path)
-            .ok_or_else(|| LoaderControlError::EntryNotFound {
-                path: path.to_owned(),
-            })?;
-        if entry.group {
-            return Err(LoaderControlError::ConfigNotEditable);
-        }
-        if entry.name == "cordis:include" {
-            return Err(LoaderControlError::ConfigNotEditable);
         }
         if !self.editor.can_edit(path).await? {
             return Err(LoaderControlError::ConfigNotEditable);
@@ -208,14 +206,9 @@ impl Plugin for PluginManagerPlugin {
                 let event = tokio::select! {
                     biased;
                     _ = cancel.cancelled() => break,
-                    result = loader_rx.recv() => match result {
-                        Ok(LoaderEvent::SnapshotChanged { revision }) => {
-                            PluginManagerEvent::Changed { revision }
-                        }
-                        Err(broadcast::error::RecvError::Lagged(_)) => {
-                            PluginManagerEvent::Changed { revision: 0 }
-                        }
-                        Err(broadcast::error::RecvError::Closed) => break,
+                    result = loader_rx.recv() => match event_from_loader_recv(result) {
+                        Some(event) => event,
+                        None => break,
                     },
                 };
                 // send 仅在当前没有订阅者时失败；事件本身是有损失效通知。
@@ -234,5 +227,26 @@ impl Plugin for PluginManagerPlugin {
             },
         )?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn loader_recv_maps_changed_resync_and_closed() {
+        assert_eq!(
+            event_from_loader_recv(Ok(LoaderEvent::SnapshotChanged { revision: 7 })),
+            Some(PluginManagerEvent::Changed { revision: 7 })
+        );
+        assert_eq!(
+            event_from_loader_recv(Err(broadcast::error::RecvError::Lagged(3))),
+            Some(PluginManagerEvent::Resync)
+        );
+        assert_eq!(
+            event_from_loader_recv(Err(broadcast::error::RecvError::Closed)),
+            None
+        );
     }
 }

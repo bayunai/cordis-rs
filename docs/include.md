@@ -108,9 +108,9 @@ let settings = host.root().get(cordis_plugin_settings::SETTINGS)?;
 let form = settings.describe("include:worker").await?;
 ```
 
-根 Loader 的 create/update/remove 只修改内存声明，不会保存任何文件。
-文件树 CRUD 使用对应 `LoaderSubtree` 与文件内局部路径；配置描述和安全字段编辑经
-settings / config-editor，使用完整路径定位来源。根 Include 自身仍是应用提供的内存
+根 Loader 的 `create` / `update` / `remove` 接受完整路径，按路径定位所属来源树并写回该文件；
+纯内存根条目的变更不落盘。也可用 `LoaderSubtree` 与文件内局部路径。配置描述和安全字段编辑经
+settings / config-editor，同样使用完整路径。根 Include 自身仍是应用提供的内存
 启动声明；需要持久化该启动组合时应由应用明确保存。
 
 Include 写回的是**当前有效树**。它不反向恢复原始基础层、不自动清空 patches，也不另存
@@ -183,7 +183,8 @@ Include 将路径规范化、读取与解析、版本检查、写回验证及原
 - 自定义来源必须实现纯内存的 `enable_logs()`，明确是否输出所属条目的生命周期信息日志。
 - 删除 `attach_file_subtree`；自定义来源使用通用 `attach_subtree`，不把文件路径交给 Loader。
 - 删除 `EntryLocation.source_dir`；文件目录从 Include 的 `INCLUDE_LOCATION` 读取。
-- 所有文件条目服务查询、路由参数与配置描述增加实际 Include 前缀；文件 CRUD 改用来源树局部路径。
+- 所有文件条目服务查询、路由参数与配置描述增加实际 Include 前缀；文件 CRUD 可用完整路径
+  （Loader 自动路由）或 `LoaderSubtree` 局部路径。
 - 外部工作台和网关需要独立迁移；本仓库不替它们增加兼容入口或旧路径别名。
 
 运行示例：
