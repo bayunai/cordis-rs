@@ -41,7 +41,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         host::build_catalog()?,
         ExtensionsConfig {
             version: CONFIG_VERSION,
-            extensions: vec![bootstrap_entry("include", bootstrap_path)?],
+            extensions: vec![bootstrap_entry("include", bootstrap_path).await?],
         },
     )?;
     let _loader_fiber = host.root().plugin(Arc::new(loader)).await?;

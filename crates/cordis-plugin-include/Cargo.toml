@@ -11,6 +11,7 @@ readme.workspace = true
 description = "File-backed TOML, JSON and YAML entry trees for cordis-loader."
 
 [dependencies]
+async-trait.workspace = true
 cordis-core.workspace = true
 cordis-loader.workspace = true
 schemars.workspace = true
@@ -19,9 +20,9 @@ serde_json.workspace = true
 serde_yaml_ng = "0.10"
 thiserror.workspace = true
 toml.workspace = true
+tokio = { workspace = true, features = ["rt"] }
 
 [dev-dependencies]
-async-trait.workspace = true
 cordis-testkit.workspace = true
 tempfile = "3"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }

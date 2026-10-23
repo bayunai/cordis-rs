@@ -185,7 +185,9 @@ impl Harness {
         let fiber = runtime
             .root()
             .plugin(Arc::new(
-                file_plugin(catalog, directory.path().join("bootstrap.toml")).unwrap(),
+                file_plugin(catalog, directory.path().join("bootstrap.toml"))
+                    .await
+                    .unwrap(),
             ))
             .await
             .unwrap();
@@ -419,11 +421,12 @@ async fn comparison_panic_is_rejected_before_any_runtime_or_file_change() {
     h.runtime.shutdown().await.unwrap();
 }
 
-fn file_plugin(
+async fn file_plugin(
     catalog: ExtensionCatalog,
     bootstrap: impl AsRef<std::path::Path>,
 ) -> Result<LoaderPlugin, LoaderError> {
     let entry = cordis_plugin_include::bootstrap_entry("include", bootstrap)
+        .await
         .map_err(|error| LoaderError::invalid_config(error.to_string()))?;
     LoaderPlugin::new(
         catalog,

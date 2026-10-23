@@ -110,7 +110,7 @@ async fn mount(bootstrap: &std::path::Path) -> (Runtime, cordis_core::Fiber, Loa
     let runtime = Runtime::new().unwrap();
     let fiber = runtime
         .root()
-        .plugin(Arc::new(file_plugin(catalog(), bootstrap).unwrap()))
+        .plugin(Arc::new(file_plugin(catalog(), bootstrap).await.unwrap()))
         .await
         .unwrap();
     let loader = (*runtime.root().get(LOADER).unwrap()).clone();
@@ -138,7 +138,9 @@ async fn root_include_id_is_application_owned_and_has_no_path_aliases() {
             ExtensionsConfig {
                 version: 3,
                 extensions: vec![
-                    cordis_plugin_include::bootstrap_entry(root_id, &bootstrap).unwrap(),
+                    cordis_plugin_include::bootstrap_entry(root_id, &bootstrap)
+                        .await
+                        .unwrap(),
                 ],
             },
         )
@@ -358,7 +360,7 @@ async fn invalid_include_fails_apply_without_residue() {
     let runtime = Runtime::new().unwrap();
     let fiber = runtime
         .root()
-        .plugin(Arc::new(file_plugin(catalog(), &bootstrap).unwrap()))
+        .plugin(Arc::new(file_plugin(catalog(), &bootstrap).await.unwrap()))
         .await
         .expect("handle returned");
     assert_eq!(fiber.state(), FiberState::Active);
@@ -424,7 +426,7 @@ async fn failed_child_keeps_include_control_plane_and_independent_sibling() {
     let runtime = Runtime::new().unwrap();
     let mut fiber = runtime
         .root()
-        .plugin(Arc::new(file_plugin(catalog, bootstrap).unwrap()))
+        .plugin(Arc::new(file_plugin(catalog, bootstrap).await.unwrap()))
         .await
         .unwrap();
     let loader = runtime.root().get(LOADER).unwrap();
@@ -513,7 +515,7 @@ async fn duplicate_include_file_fails() {
     let runtime = Runtime::new().unwrap();
     let fiber = runtime
         .root()
-        .plugin(Arc::new(file_plugin(catalog(), &bootstrap).unwrap()))
+        .plugin(Arc::new(file_plugin(catalog(), &bootstrap).await.unwrap()))
         .await
         .expect("handle");
     assert_eq!(fiber.state(), FiberState::Active);
@@ -562,7 +564,7 @@ async fn include_cycle_fails_only_cyclic_entry_without_registering_another_tree(
     let runtime = Runtime::new().unwrap();
     let fiber = runtime
         .root()
-        .plugin(Arc::new(file_plugin(catalog(), &bootstrap).unwrap()))
+        .plugin(Arc::new(file_plugin(catalog(), &bootstrap).await.unwrap()))
         .await
         .expect("handle returned");
     assert_eq!(fiber.state(), FiberState::Active);
@@ -617,6 +619,7 @@ async fn concurrent_attach_reserves_one_subtree_source() {
                     cordis_plugin_include::IncludeConfig::new("nested.toml"),
                     &left_context,
                 )
+                .await
                 .unwrap(),
             )
             .await
@@ -632,6 +635,7 @@ async fn concurrent_attach_reserves_one_subtree_source() {
                     cordis_plugin_include::IncludeConfig::new("nested.toml"),
                     &right_context,
                 )
+                .await
                 .unwrap(),
             )
             .await
@@ -716,11 +720,12 @@ async fn nested_include_prefixes_paths() {
     runtime.shutdown().await.unwrap();
 }
 
-fn file_plugin(
+async fn file_plugin(
     catalog: ExtensionCatalog,
     bootstrap: impl AsRef<std::path::Path>,
 ) -> Result<LoaderPlugin, LoaderError> {
     let entry = cordis_plugin_include::bootstrap_entry("include", bootstrap)
+        .await
         .map_err(|error| LoaderError::invalid_config(error.to_string()))?;
     LoaderPlugin::new(
         catalog,

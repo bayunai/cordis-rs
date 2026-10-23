@@ -10,7 +10,7 @@ let mut catalog = build_catalog()?;
 catalog.register(cordis_plugin_include::IncludeFactory)?;
 let plugin = LoaderPlugin::new(catalog, ExtensionsConfig {
     version: CONFIG_VERSION,
-    extensions: vec![cordis_plugin_include::bootstrap_entry("include", "bootstrap.toml")?],
+    extensions: vec![cordis_plugin_include::bootstrap_entry("include", "bootstrap.toml").await?],
 })?;
 let _loader_fiber = host.root().plugin(Arc::new(plugin)).await?;
 let loader = host.root().get(LOADER)?;
@@ -165,6 +165,8 @@ Group **只**组织 EntryTree / 生命周期 / 父子 Context，**不再** `exte
 `attach_subtree()` 接收通用 `EntryTreeSource`，不接收文件路径。根控制面的 CRUD 只操作内存根树，
 不写文件；内存根没有来源可 reload。Include 文件内部用 `LoaderSubtree`
 （`loader.subtree("include")` 或 `loader.subtree("include:reports")`），并传入该文件内的局部路径。
+来源的读取、版本检查、写入预检及持久化均为异步操作；Loader 在所属树的操作锁内等待完成。
+Include 将文件事务放入阻塞任务，文件 I/O 不占用 Tokio 异步工作线程。
 `create` / `update` 接收父 Group 路径与位置；
 `update` 可以移动条目，移动按「旧路径后序释放 → 新路径前序挂载」处理（不做隐式原地迁移）。
 **跨树移动一律拒绝**（`CrossTreeMove`）。

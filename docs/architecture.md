@@ -40,7 +40,7 @@ path = "extensions.toml"
 
 ```text
 bootstrap.toml
-  → Include.bootstrap_entry("include", path) 构造显式根 Include 声明
+  → await Include.bootstrap_entry("include", path) 构造显式根 Include 声明
   → 应用入口构造内存 LoaderPlugin
   → root.plugin(LoaderPlugin)
   → include Include 读取文件、提供来源上下文与文件版本

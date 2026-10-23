@@ -8,11 +8,14 @@ use crate::{
 use cordis_core::{Context, CoreError, Plugin, PluginKey};
 use std::{
     any::Any,
+    future::Future,
+    pin::Pin,
     sync::{Arc, Mutex},
 };
 
-pub(crate) type TreeOpener =
-    Arc<dyn Fn(&Context) -> Result<Arc<dyn EntryTreeSource>, SourceError> + Send + Sync>;
+pub(crate) type SourceFuture =
+    Pin<Box<dyn Future<Output = Result<Arc<dyn EntryTreeSource>, SourceError>> + Send + 'static>>;
+pub(crate) type TreeOpener = Arc<dyn Fn(Context) -> SourceFuture + Send + Sync>;
 
 /// 源载体实际存活状态。重新激活使用最后成功提交的配置，而不是最初构造时的配置。
 pub(crate) struct TreeState {
@@ -32,7 +35,9 @@ impl Plugin for TreePlugin {
     }
     async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
         let open = self.state.opener.lock().expect("tree opener").clone();
-        let source = open(ctx).map_err(|error| CoreError::PluginApply(error.to_string()))?;
+        let source = open(ctx.clone())
+            .await
+            .map_err(|error| CoreError::PluginApply(error.to_string()))?;
         let loader = ctx.config(ENTRY_LOCATION)?.loader.clone();
         let tree = loader
             .attach_subtree(ctx, source)
@@ -60,16 +65,14 @@ pub struct PreparedExtension {
 }
 
 impl PreparedExtension {
-    /// 通用来源树载体。settings 改变执行完整替换；config 改变同步协调原子树。
-    /// open 只负责构造来源，Loader 不感知文件或格式；业务插件不需要此分支。
-    pub fn tree<S, C, F>(key: PluginKey, settings: S, config: C, open: F) -> Self
+    /// 通用来源树载体。settings 改变执行完整替换；config 改变等待原子树协调完成。
+    /// open 拥有 Context 并异步构造来源；Loader 不感知文件或格式。
+    pub fn tree<S, C, F, Fut>(key: PluginKey, settings: S, config: C, open: F) -> Self
     where
         S: Clone + PartialEq + Send + Sync + 'static,
         C: Clone + PartialEq + Send + Sync + 'static,
-        F: Fn(S, C, &Context) -> Result<Arc<dyn EntryTreeSource>, SourceError>
-            + Send
-            + Sync
-            + 'static,
+        F: Fn(S, C, Context) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<Arc<dyn EntryTreeSource>, SourceError>> + Send + 'static,
     {
         Self {
             inner: Box::new(TreePrepared {
@@ -184,11 +187,12 @@ impl<S: Send + Sync + 'static, C: Send + Sync + 'static> ConfigBinding for TreeB
         self
     }
 }
-impl<S, C, F> PreparedConfig for TreePrepared<S, C, F>
+impl<S, C, F, Fut> PreparedConfig for TreePrepared<S, C, F>
 where
     S: Clone + PartialEq + Send + Sync + 'static,
     C: Clone + PartialEq + Send + Sync + 'static,
-    F: Fn(S, C, &Context) -> Result<Arc<dyn EntryTreeSource>, SourceError> + Send + Sync + 'static,
+    F: Fn(S, C, Context) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<Arc<dyn EntryTreeSource>, SourceError>> + Send + 'static,
 {
     fn resolve(
         self: Box<Self>,
@@ -203,7 +207,7 @@ where
         let open_settings = settings.clone();
         let open_config = config.clone();
         let open: TreeOpener =
-            Arc::new(move |ctx| open(open_settings.clone(), open_config.clone(), ctx));
+            Arc::new(move |ctx| Box::pin(open(open_settings.clone(), open_config.clone(), ctx)));
         if let Some(current) = current
             && let Some(binding) = current.as_any().downcast_ref::<TreeBinding<S, C>>()
             && binding.key == key

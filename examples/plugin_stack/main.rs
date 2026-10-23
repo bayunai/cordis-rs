@@ -696,7 +696,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         catalog,
         ExtensionsConfig {
             version: cordis_loader::CONFIG_VERSION,
-            extensions: vec![bootstrap_entry("include", &bootstrap)?],
+            extensions: vec![bootstrap_entry("include", &bootstrap).await?],
         },
     )?;
     let loader_fiber = runtime.root().plugin(Arc::new(plugin)).await?;

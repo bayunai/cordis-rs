@@ -65,7 +65,7 @@ struct UploadConfig {
 ## 文件来源与树载体
 
 文件读取、路径、编解码、patches 与文件写回属于可选 `cordis-plugin-include`，不是 Factory
-或 Core 的通用职责。Host 显式注册 IncludeFactory，并用 `bootstrap_entry("include", path)` 构造
+或 Core 的通用职责。Host 显式注册 IncludeFactory，并用 `bootstrap_entry("include", path).await?` 构造
 根文件条目；文件中的实例完整路径因此带 `include:` 前缀。原始文件内的局部 ID 不需要增加前缀。
 
 业务服务通过 `loader.entry_context("include:插件")` 读取；文件树 CRUD 使用

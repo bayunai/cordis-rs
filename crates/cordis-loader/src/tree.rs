@@ -193,7 +193,7 @@ impl RuntimeTree {
         revision: Option<SourceRevision>,
         prepared: Option<(EntryId, PreparedExtension)>,
     ) -> Result<LoaderSnapshot, LoaderError> {
-        let plan = self.prepare_plan(config, revision, prepared)?;
+        let plan = self.prepare_plan(config, revision, prepared).await?;
         self.apply_plan(plan).await
     }
 
@@ -202,29 +202,35 @@ impl RuntimeTree {
         config: ExtensionsConfig,
         revision: Option<SourceRevision>,
         prepared: Option<(EntryId, PreparedExtension)>,
-    ) -> Result<PreparedTreePlan, LoaderError> {
-        let prefix = if self.prefix.as_str().is_empty() {
-            None
-        } else {
-            Some(self.prefix.as_str())
-        };
-        let (mut desired, roots) = index_desired_tree(&self.catalog, &config, prefix)?;
-        let mut plan = {
-            let entries = self.entries.lock().expect("entries");
-            plan_reconcile(&entries, &desired, &roots)?
-        };
-        build_plan_plugins(
-            &self.catalog,
-            &mut desired,
-            &mut plan,
-            &self.entries,
-            prepared,
-        )?;
-        Ok(PreparedTreePlan {
-            desired,
-            plan,
-            config,
-            revision,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<PreparedTreePlan, LoaderError>> + Send + '_>,
+    > {
+        // 来源定义可递归预检嵌套树，装箱打断 Future 类型递归。
+        Box::pin(async move {
+            let prefix = if self.prefix.as_str().is_empty() {
+                None
+            } else {
+                Some(self.prefix.as_str())
+            };
+            let (mut desired, roots) = index_desired_tree(&self.catalog, &config, prefix)?;
+            let mut plan = {
+                let entries = self.entries.lock().expect("entries");
+                plan_reconcile(&entries, &desired, &roots)?
+            };
+            build_plan_plugins(
+                &self.catalog,
+                &mut desired,
+                &mut plan,
+                &self.entries,
+                prepared,
+            )
+            .await?;
+            Ok(PreparedTreePlan {
+                desired,
+                plan,
+                config,
+                revision,
+            })
         })
     }
 
@@ -264,6 +270,14 @@ impl RuntimeTree {
             }
             result
         })
+    }
+
+    /// 对外稳定边界包含异步来源预检与写回；内部已持锁的提交使用 await_idle。
+    pub(crate) async fn await_operations_idle(
+        self: &Arc<Self>,
+    ) -> Result<LoaderSnapshot, LoaderError> {
+        let _operation = self.operations.lock().await;
+        self.await_idle().await
     }
 
     pub(crate) async fn await_idle(self: &Arc<Self>) -> Result<LoaderSnapshot, LoaderError> {
@@ -421,16 +435,24 @@ impl RuntimeTree {
     }
 
     pub(crate) async fn reload(self: &Arc<Self>) -> Result<LoaderSnapshot, LoaderError> {
-        let _operation = self.operations.lock().await;
-        self.ensure_open()?;
-        let source = self
-            .source
-            .lock()
-            .expect("source")
-            .clone()
-            .ok_or(LoaderError::NoConfigSource)?;
-        let document = source.read()?;
-        self.apply(document.config, Some(document.revision)).await
+        let tree = self.clone();
+        // read 可能初始化缺失来源。接受后保留整次 reload，取消等待不遗留文件工作。
+        tokio::spawn(async move {
+            let _operation = tree.operations.lock().await;
+            tree.ensure_open()?;
+            let source = tree
+                .source
+                .lock()
+                .expect("source")
+                .clone()
+                .ok_or(LoaderError::NoConfigSource)?;
+            let document = source.read().await?;
+            tree.apply(document.config, Some(document.revision)).await
+        })
+        .await
+        .map_err(|_| LoaderError::ReconcileAborted {
+            reason: "来源重载任务异常结束".into(),
+        })?
     }
 
     pub(crate) fn ensure_open(&self) -> Result<(), LoaderError> {
@@ -454,17 +476,18 @@ fn next_config_identity() -> Result<u128, LoaderError> {
 }
 
 /// 供控制面把 revision 冲突转成 `ConfigConflict`。
-pub(crate) fn ensure_tree_revision_control(
+pub(crate) async fn ensure_tree_revision_control(
     tree: &RuntimeTree,
 ) -> Result<(), crate::loader::LoaderControlError> {
-    if let Some(source) = tree.source.lock().expect("source").clone() {
+    let source = tree.source.lock().expect("source").clone();
+    if let Some(source) = source {
         let revision = tree
             .revision
             .lock()
             .expect("revision")
             .clone()
             .ok_or(LoaderError::NoConfigSource)?;
-        source.check_revision(&revision).map_err(|error| {
+        source.check_revision(&revision).await.map_err(|error| {
             crate::loader::LoaderControlError::from_source(source.identity(), error)
         })?;
     }

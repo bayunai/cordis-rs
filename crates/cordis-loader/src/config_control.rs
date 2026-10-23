@@ -128,7 +128,7 @@ async fn mutate_owned(
     if expected != tree.config_revision() {
         return Err(LoaderControlError::ConfigRevisionConflict);
     }
-    ensure_tree_revision_control(tree)?;
+    ensure_tree_revision_control(tree).await?;
     let mut target = tree.desired.lock().expect("desired").clone();
     let mut entry = find(&target.extensions, local)?;
     if entry.group {

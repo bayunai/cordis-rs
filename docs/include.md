@@ -16,7 +16,7 @@ catalog.register(IncludeFactory)?;
 // 继续登记本应用的业务 Factory。
 let plugin = LoaderPlugin::new(catalog, ExtensionsConfig {
     version: CONFIG_VERSION,
-    extensions: vec![bootstrap_entry("include", "bootstrap.toml")?],
+    extensions: vec![bootstrap_entry("include", "bootstrap.toml").await?],
 })?;
 let _loader_fiber = host.root().plugin(std::sync::Arc::new(plugin)).await?;
 ```
@@ -134,22 +134,32 @@ reload 显式重新读取文件，不启动自动监听；未来监听／HMR 插
 
 ## 提交与释放边界
 
+来源接口的 `read`、`check_revision`、`validate_write`、`write` 均为异步方法。
+`identity` 与 `context` 只访问已解析的内存元数据，不执行文件 I/O。来源构造函数接收拥有的
+`Context` 并返回 `Send + 'static` Future，Loader 在异步预检和协调中显式等待来源准备完成。
+Include 将路径规范化、读取与解析、版本检查、写回验证及原子文件事务放入 `spawn_blocking`，
+避免阻塞 Tokio 异步工作线程；每次处理完整工作单元，不逐个系统调用切换任务。
+
 每棵树使用同一操作锁完成版本检查、预检、协调与来源写回。Include 在实际写入前再次检查
 来源版本，使用同目录临时文件、同步和原子替换；Unix 创建与替换文件为 0600，不生成备份。
 符号链接规范化后共享同一来源身份，重复挂载和祖先循环会明确拒绝。
+对外 `await_idle()` 也等待已进入操作锁的来源预检与写回，不在异步读取期间提前返回稳定快照。
 
 运行时先应用，再写文件。生命周期失败不写回，但已经触及的实例不会回滚；写回失败返回
 `Persist` 与实际运行快照，不能解释为从未执行。初始业务子条目失败保留声明和 Failed 状态，
 不撤销 Include 控制面或无关插件；文件、格式、来源登记等错误落在对应 Include 条目。
 
-取消调用方等待不会中断已接受提交。停用 Include 时拒绝新操作，等待已执行提交结算，
+取消调用方等待不会中断已接受提交。已经开始的阻塞任务不可强制取消，不会另起无人结算的
+后台写回；阻塞任务异常退出会明确返回脱敏的来源错误，不自动重试。停用 Include 时拒绝新操作，等待已执行提交结算，
 后序释放嵌套树并注销来源；保留的旧控制句柄不可用于新实例。秘密字段的安全描述仍由配置
 控制面处理；文件权限不是加密，业务插件不得把配置正文或凭据放入错误、日志与 panic。
 
 ## 破坏性 API 迁移
 
-- 删除 `LoaderPlugin::bootstrap`；改为 `LoaderPlugin::new` 加显式 `bootstrap_entry("include", …)`。
+- 删除 `LoaderPlugin::bootstrap`；改为 `LoaderPlugin::new` 加显式 `bootstrap_entry("include", …).await?`。
 - 文件 bootstrap/read 辅助函数改从 `cordis_plugin_include` 导入，不保留 Loader 重导出。
+- `FileSource::open` / `from_config`、`load_bootstrap`、`bootstrap_entry`、`load_extensions` 统一改为异步，调用方须使用 `.await`，不提供同步兼容入口。
+- 自定义 `EntryTreeSource` 使用 `async_trait` 实现异步读写方法；`PreparedExtension::tree` 的来源构造闭包改为接收拥有的 `Context` 并返回异步结果。
 - 删除 `attach_file_subtree`；自定义来源使用通用 `attach_subtree`，不把文件路径交给 Loader。
 - 删除 `EntryLocation.source_dir`；文件目录从 Include 的 `INCLUDE_LOCATION` 读取。
 - 所有文件条目服务查询、路由参数与配置描述增加实际 Include 前缀；文件 CRUD 改用来源树局部路径。

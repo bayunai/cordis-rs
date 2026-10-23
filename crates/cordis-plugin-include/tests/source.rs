@@ -32,15 +32,21 @@ async fn formats_roundtrip_and_write_is_revision_checked() {
     for extension in ["toml", "json", "yaml", "yml"] {
         let path = dir.path().join(format!("config.{extension}"));
         save(&path, &document(vec![entry("one", 1)]));
-        let source = FileSource::open(IncludeConfig::new(&path), &runtime.root()).unwrap();
-        let initial = source.read().unwrap();
+        let source = FileSource::open(IncludeConfig::new(&path), &runtime.root())
+            .await
+            .unwrap();
+        let initial = source.read().await.unwrap();
         let target = document(vec![entry("one", 2)]);
-        source.validate_write(&target).unwrap();
-        let revision = source.write(&target, &initial.revision).unwrap();
-        assert_eq!(source.read().unwrap().config, target);
-        assert_eq!(source.read().unwrap().revision, revision);
+        source.validate_write(&target).await.unwrap();
+        let revision = source.write(&target, &initial.revision).await.unwrap();
+        assert_eq!(source.read().await.unwrap().config, target);
+        assert_eq!(source.read().await.unwrap().revision, revision);
         assert_eq!(
-            source.write(&target, &initial.revision).unwrap_err().kind,
+            source
+                .write(&target, &initial.revision)
+                .await
+                .unwrap_err()
+                .kind,
             SourceErrorKind::Conflict
         );
         assert!(!format!("{revision:?}").contains("value"));
@@ -56,13 +62,13 @@ async fn explicit_initial_only_creates_missing_files() {
         let path = dir.path().join(format!("initial.{extension}"));
         let mut config = IncludeConfig::new(&path);
         config.initial = Some(vec![entry("initial", 7)]);
-        let source = FileSource::open(config, &runtime.root()).unwrap();
+        let source = FileSource::open(config, &runtime.root()).await.unwrap();
         assert_eq!(
-            source.read().unwrap().config,
+            source.read().await.unwrap().config,
             document(vec![entry("initial", 7)])
         );
         fs::write(&path, "invalid-existing-file secret-payload").unwrap();
-        let error = source.read().err().unwrap();
+        let error = source.read().await.err().unwrap();
         assert_eq!(error.kind, SourceErrorKind::InvalidData);
         assert!(!error.to_string().contains("secret-payload"));
         assert_eq!(
@@ -70,12 +76,12 @@ async fn explicit_initial_only_creates_missing_files() {
             "invalid-existing-file secret-payload"
         );
         fs::write(&path, "").unwrap();
-        assert!(source.read().is_err());
+        assert!(source.read().await.is_err());
     }
     let missing = dir.path().join("missing-parent/config.toml");
     let mut config = IncludeConfig::new(missing);
     config.initial = Some(vec![]);
-    assert!(FileSource::open(config, &runtime.root()).is_err());
+    assert!(FileSource::open(config, &runtime.root()).await.is_err());
     runtime.shutdown().await.unwrap();
 }
 
@@ -86,10 +92,10 @@ async fn initial_does_not_overwrite_a_file_created_after_open() {
     let path = dir.path().join("new.toml");
     let mut config = IncludeConfig::new(&path);
     config.initial = Some(vec![entry("initial", 1)]);
-    let source = FileSource::open(config, &runtime.root()).unwrap();
+    let source = FileSource::open(config, &runtime.root()).await.unwrap();
     save(&path, &document(vec![entry("other", 2)]));
     assert_eq!(
-        source.read().unwrap().config,
+        source.read().await.unwrap().config,
         document(vec![entry("other", 2)])
     );
     runtime.shutdown().await.unwrap();
@@ -183,15 +189,18 @@ async fn write_materializes_overrides_but_rejects_non_roundtrippable_patches() {
         disabled: Some(true),
         ..Default::default()
     }];
-    let source = FileSource::open(config, &runtime.root()).unwrap();
-    let initial = source.read().unwrap();
+    let source = FileSource::open(config, &runtime.root()).await.unwrap();
+    let initial = source.read().await.unwrap();
     assert!(initial.config.extensions[0].disabled);
-    let revision = source.write(&initial.config, &initial.revision).unwrap();
-    assert!(load_extensions(&path).unwrap().extensions[0].disabled);
+    let revision = source
+        .write(&initial.config, &initial.revision)
+        .await
+        .unwrap();
+    assert!(load_extensions(&path).await.unwrap().extensions[0].disabled);
     let mut impossible = initial.config;
     impossible.extensions[0].disabled = false;
     assert_eq!(
-        source.write(&impossible, &revision).unwrap_err().kind,
+        source.write(&impossible, &revision).await.unwrap_err().kind,
         SourceErrorKind::Conflict
     );
     let mut config = IncludeConfig::new(&path);
@@ -199,10 +208,14 @@ async fn write_materializes_overrides_but_rejects_non_roundtrippable_patches() {
         insert: Some(vec![entry("inserted", 2)]),
         ..Default::default()
     }];
-    let source = FileSource::open(config, &runtime.root()).unwrap();
-    let initial = source.read().unwrap();
+    let source = FileSource::open(config, &runtime.root()).await.unwrap();
+    let initial = source.read().await.unwrap();
     assert_eq!(
-        source.validate_write(&initial.config).unwrap_err().kind,
+        source
+            .validate_write(&initial.config)
+            .await
+            .unwrap_err()
+            .kind,
         SourceErrorKind::Conflict
     );
     runtime.shutdown().await.unwrap();
@@ -216,10 +229,16 @@ async fn source_context_controls_relative_paths_and_log_inheritance() {
     save(&path, &document(vec![]));
     let mut config = IncludeConfig::new(&path);
     config.enable_logs = Some(true);
-    let source = FileSource::open(config, &runtime.root()).unwrap();
-    assert!(FileSource::open(IncludeConfig::new("child.toml"), &runtime.root()).is_err());
+    let source = FileSource::open(config, &runtime.root()).await.unwrap();
+    assert!(
+        FileSource::open(IncludeConfig::new("child.toml"), &runtime.root())
+            .await
+            .is_err()
+    );
     let context = source.context(&runtime.root()).unwrap();
-    let child = FileSource::open(IncludeConfig::new("child.toml"), &context).unwrap();
+    let child = FileSource::open(IncludeConfig::new("child.toml"), &context)
+        .await
+        .unwrap();
     assert_eq!(
         child.path(),
         dir.path().canonicalize().unwrap().join("child.toml")
@@ -236,6 +255,7 @@ async fn source_context_controls_relative_paths_and_log_inheritance() {
     disabled.enable_logs = Some(false);
     assert!(
         !FileSource::open(disabled, &context)
+            .await
             .unwrap()
             .context(&context)
             .unwrap()
@@ -274,16 +294,18 @@ async fn invalid_values_and_secrets_never_become_parser_errors() {
     ] {
         let path = dir.path().join(name);
         fs::write(&path, text).unwrap();
-        let source = FileSource::open(IncludeConfig::new(path), &runtime.root()).unwrap();
-        let error = source.read().err().unwrap();
+        let source = FileSource::open(IncludeConfig::new(path), &runtime.root())
+            .await
+            .unwrap();
+        let error = source.read().await.err().unwrap();
         assert_eq!(error.kind, SourceErrorKind::InvalidData);
         assert!(!error.to_string().contains("secret-payload"));
     }
     runtime.shutdown().await.unwrap();
 }
 
-#[test]
-fn bootstrap_is_owned_by_include_and_does_not_hide_invalid_input() {
+#[tokio::test]
+async fn bootstrap_is_owned_by_include_and_does_not_hide_invalid_input() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("bootstrap.toml");
     fs::write(
@@ -291,12 +313,12 @@ fn bootstrap_is_owned_by_include_and_does_not_hide_invalid_input() {
         "version=3\n[config]\ndriver='file'\npath='extensions.yaml'\n",
     )
     .unwrap();
-    let (_, resolved) = load_bootstrap(&path).unwrap();
+    let (_, resolved) = load_bootstrap(&path).await.unwrap();
     assert_eq!(
         resolved,
         dir.path().canonicalize().unwrap().join("extensions.yaml")
     );
-    let entry = bootstrap_entry("include", &path).unwrap();
+    let entry = bootstrap_entry("include", &path).await.unwrap();
     assert_eq!(entry.id, "include");
     assert_eq!(entry.name, "cordis:include");
     let config: IncludeConfig = entry.config.try_into().unwrap();
@@ -308,6 +330,7 @@ fn bootstrap_is_owned_by_include_and_does_not_hide_invalid_input() {
     .unwrap();
     assert!(
         !load_bootstrap(&path)
+            .await
             .err()
             .unwrap()
             .to_string()
@@ -324,21 +347,26 @@ async fn canonical_identity_and_atomic_writes_have_private_permissions() {
     let path = dir.path().join("main.toml");
     let mut config = IncludeConfig::new(&path);
     config.initial = Some(vec![]);
-    let source = FileSource::open(config, &runtime.root()).unwrap();
-    let initial = source.read().unwrap();
+    let source = FileSource::open(config, &runtime.root()).await.unwrap();
+    let initial = source.read().await.unwrap();
     assert_eq!(
         fs::metadata(&path).unwrap().permissions().mode() & 0o777,
         0o600
     );
     fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
-    source.write(&initial.config, &initial.revision).unwrap();
+    source
+        .write(&initial.config, &initial.revision)
+        .await
+        .unwrap();
     assert_eq!(
         fs::metadata(&path).unwrap().permissions().mode() & 0o777,
         0o600
     );
     let alias = dir.path().join("alias.toml");
     symlink(&path, &alias).unwrap();
-    let alias = FileSource::open(IncludeConfig::new(alias), &runtime.root()).unwrap();
+    let alias = FileSource::open(IncludeConfig::new(alias), &runtime.root())
+        .await
+        .unwrap();
     assert_eq!(alias.identity(), source.identity());
     assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 2);
     runtime.shutdown().await.unwrap();

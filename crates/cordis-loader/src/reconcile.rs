@@ -174,14 +174,17 @@ impl RuntimeTree {
                     .expect("source")
                     .clone()
                     .ok_or(LoaderError::NoConfigSource)?;
-                old_source.check_revision(&update.old_revision)?;
-                update.source.check_revision(
-                    &update
-                        .prepared
-                        .revision
-                        .clone()
-                        .ok_or(LoaderError::NoConfigSource)?,
-                )?;
+                old_source.check_revision(&update.old_revision).await?;
+                update
+                    .source
+                    .check_revision(
+                        &update
+                            .prepared
+                            .revision
+                            .clone()
+                            .ok_or(LoaderError::NoConfigSource)?,
+                    )
+                    .await?;
                 // 失败可能已改变部分子实例。相同旧定义重试也必须重新协调，不能误报无变化。
                 update.state.dirty.store(true, Ordering::Release);
                 update.tree.apply_plan(update.prepared).await?;
@@ -775,7 +778,7 @@ fn preorder_from_desired(
     out
 }
 
-pub(crate) fn build_plan_plugins(
+pub(crate) async fn build_plan_plugins(
     catalog: &ExtensionCatalog,
     desired: &mut BTreeMap<EntryId, DesiredNode>,
     plan: &mut ReconcilePlan,
@@ -880,8 +883,8 @@ pub(crate) fn build_plan_plugins(
                     .expect("source")
                     .clone()
                     .ok_or(LoaderError::NoConfigSource)?;
-                old_source.check_revision(&old_revision)?;
-                let source = open(&ctx)?;
+                old_source.check_revision(&old_revision).await?;
+                let source = open(ctx).await?;
                 if Some(source.identity()) != tree.source_id {
                     return Err(crate::SourceError::new(
                         crate::SourceErrorKind::Conflict,
@@ -889,8 +892,10 @@ pub(crate) fn build_plan_plugins(
                     )
                     .into());
                 }
-                let document = source.read()?;
-                let prepared = tree.prepare_plan(document.config, Some(document.revision), None)?;
+                let document = source.read().await?;
+                let prepared = tree
+                    .prepare_plan(document.config, Some(document.revision), None)
+                    .await?;
                 let fiber_id = current
                     .and_then(|entry| entry.active_fiber)
                     .expect("active tree fiber");

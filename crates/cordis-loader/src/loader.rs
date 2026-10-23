@@ -336,7 +336,7 @@ impl LoaderSubtree {
 
     pub async fn await_idle(&self) -> Result<LoaderSnapshot, LoaderControlError> {
         self.ensure_alive()?;
-        let snapshot = self.tree.await_idle().await;
+        let snapshot = self.tree.await_operations_idle().await;
         self.ensure_alive()?;
         Ok(snapshot?)
     }
@@ -412,9 +412,7 @@ impl LoaderSubtree {
 
     /// 由 Include dispose 调用：后序释放并注销。
     pub async fn detach(self) -> Result<(), LoaderControlError> {
-        if !self.loader.alive.load(std::sync::atomic::Ordering::Acquire) {
-            return Ok(());
-        }
+        // 控制面已关闭不代表提交已经结算。停机时也必须等待来源树操作并注销资源。
         self.loader.detach_subtree(&self.tree).await?;
         Ok(())
     }
@@ -462,7 +460,7 @@ where
         let _operation = tree.operations.lock().await;
         tree.ensure_open()?;
         tree.await_idle().await?;
-        ensure_tree_revision_control(&tree)?;
+        ensure_tree_revision_control(&tree).await?;
         let mut target = tree.desired.lock().expect("desired").clone();
         mutate(&mut target)?;
         commit_tree_locked(&tree, target, None).await
@@ -482,6 +480,7 @@ pub(crate) async fn commit_tree_locked(
     if let Some(source) = &source {
         source
             .validate_write(&target)
+            .await
             .map_err(|error| LoaderControlError::from_source(source.identity(), error))?;
     }
     let snapshot = tree.apply_prepared(target.clone(), None, prepared).await?;
@@ -494,7 +493,7 @@ pub(crate) async fn commit_tree_locked(
         .expect("revision")
         .clone()
         .ok_or(LoaderError::NoConfigSource)?;
-    match source.write(&target, &expected) {
+    match source.write(&target, &expected).await {
         Ok(revision) => {
             *tree.revision.lock().expect("revision") = Some(revision);
             Ok(snapshot)

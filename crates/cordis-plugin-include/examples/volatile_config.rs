@@ -105,7 +105,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             catalog,
             ExtensionsConfig {
                 version: cordis_loader::CONFIG_VERSION,
-                extensions: vec![bootstrap_entry("include", &bootstrap)?],
+                extensions: vec![bootstrap_entry("include", &bootstrap).await?],
             },
         )?))
         .await?;

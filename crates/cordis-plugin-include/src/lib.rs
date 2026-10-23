@@ -35,7 +35,7 @@ impl ExtensionFactory for IncludeFactory {
             PluginKey::new("cordis.include"),
             config.path.clone(),
             config,
-            |_, config, ctx| FileSource::from_config(config, ctx),
+            |_, config, ctx| async move { FileSource::from_config(config, &ctx).await },
         ))
     }
 }

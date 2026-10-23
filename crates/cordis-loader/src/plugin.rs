@@ -165,9 +165,9 @@ impl LoaderInner {
                 });
             }
 
-            let _ = self.root.await_idle().await?;
+            let _ = self.root.await_operations_idle().await?;
             for tree in self.runtime_trees() {
-                let _ = tree.await_idle().await?;
+                let _ = tree.await_operations_idle().await?;
             }
             if !self.alive.load(Ordering::Acquire) {
                 return Err(LoaderError::Runtime {
@@ -315,7 +315,7 @@ impl LoaderInner {
             .config(crate::meta::ENTRY_LOCATION)
             .map_err(|_| LoaderError::EntryLocationMissing)?;
         let source_id = source.identity();
-        let document = source.read()?;
+        let document = source.read().await?;
         preflight(&self.catalog, &document.config)?;
 
         let prefix = EntryId::from(location.path.as_str());

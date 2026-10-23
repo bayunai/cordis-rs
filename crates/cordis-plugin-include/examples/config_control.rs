@@ -74,10 +74,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             catalog,
             ExtensionsConfig {
                 version: cordis_loader::CONFIG_VERSION,
-                extensions: vec![bootstrap_entry(
-                    "include",
-                    directory.path().join("bootstrap.toml"),
-                )?],
+                extensions: vec![
+                    bootstrap_entry("include", directory.path().join("bootstrap.toml")).await?,
+                ],
             },
         )?))
         .await?;

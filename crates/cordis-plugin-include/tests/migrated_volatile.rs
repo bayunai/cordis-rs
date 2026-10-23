@@ -230,7 +230,9 @@ impl Harness {
         )
         .unwrap();
         let runtime = Runtime::new().unwrap();
-        let plugin = file_plugin(catalog(state), directory.path().join("bootstrap.toml")).unwrap();
+        let plugin = file_plugin(catalog(state), directory.path().join("bootstrap.toml"))
+            .await
+            .unwrap();
         let fiber = runtime.root().plugin(Arc::new(plugin)).await.unwrap();
         assert_eq!(fiber.state(), FiberState::Active);
         let loader = runtime.root().get(LOADER).unwrap();
@@ -884,11 +886,12 @@ async fn partial_hot_commit_is_visible_and_retry_does_not_duplicate_revision() {
     h.runtime.shutdown().await.unwrap();
 }
 
-fn file_plugin(
+async fn file_plugin(
     catalog: ExtensionCatalog,
     bootstrap: impl AsRef<std::path::Path>,
 ) -> Result<LoaderPlugin, LoaderError> {
     let entry = cordis_plugin_include::bootstrap_entry("include", bootstrap)
+        .await
         .map_err(|error| LoaderError::invalid_config(error.to_string()))?;
     LoaderPlugin::new(
         catalog,

@@ -110,7 +110,7 @@ cargo run -p cordis-core --example plugin_stack
 cargo run -p cordis-host --example host_bootstrap
 ```
 
-应用入口用 Include 的 `bootstrap_entry("include", "bootstrap.toml")` 构造根文件条目，再通过
+应用入口用 Include 的 `bootstrap_entry("include", "bootstrap.toml").await?` 构造根文件条目，再通过
 `LoaderPlugin::new(catalog, config)` 显式挂载 LoaderPlugin。Loader 根树只保存在内存；文件编辑
 使用 `loader.subtree("include")` 的局部路径，服务读取使用 `loader.entry_context("include:父:子")`。
 应用与受信任插件通过 `ctx.get(LOADER)` 取得管理服务。Factory 与可配置 inject 均为静态、

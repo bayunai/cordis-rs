@@ -52,14 +52,16 @@ pub struct SourceDocument {
 
 /// 所有方法在所属树的提交串行边界内调用；write 必须再次检查 expected。
 /// validate_write 必须拒绝无法往返到目标声明的写入，且不得产生持久化副作用。
+/// identity/context 只访问内存；来源实现必须隔离阻塞 I/O，不得阻塞异步调度线程。
+#[async_trait::async_trait]
 pub trait EntryTreeSource: Send + Sync + 'static {
     fn identity(&self) -> String;
     /// 建立来源元数据；定义原地更新成功后也会调用，以提交提供方的共享上下文策略。
     fn context(&self, owner: &Context) -> Result<Context, SourceError>;
-    fn read(&self) -> Result<SourceDocument, SourceError>;
-    fn check_revision(&self, expected: &SourceRevision) -> Result<(), SourceError>;
-    fn validate_write(&self, config: &ExtensionsConfig) -> Result<(), SourceError>;
-    fn write(
+    async fn read(&self) -> Result<SourceDocument, SourceError>;
+    async fn check_revision(&self, expected: &SourceRevision) -> Result<(), SourceError>;
+    async fn validate_write(&self, config: &ExtensionsConfig) -> Result<(), SourceError>;
+    async fn write(
         &self,
         config: &ExtensionsConfig,
         expected: &SourceRevision,

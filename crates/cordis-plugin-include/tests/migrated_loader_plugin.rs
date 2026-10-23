@@ -292,7 +292,7 @@ async fn mount_with_file(
     )
     .unwrap();
     fs::write(&extensions, toml::to_string(&config(entries)).unwrap()).unwrap();
-    let (runtime, fiber, loader) = mount(file_plugin(catalog, &bootstrap).unwrap()).await;
+    let (runtime, fiber, loader) = mount(file_plugin(catalog, &bootstrap).await.unwrap()).await;
     (runtime, fiber, loader, directory, extensions)
 }
 
@@ -316,7 +316,7 @@ async fn disabling_provider_returns_consumer_to_pending_then_recovers() {
     .unwrap();
     fs::write(&extensions, toml::to_string(&config(vec![group])).unwrap()).unwrap();
     let (runtime, _loader_fiber, loader) =
-        mount(file_plugin(dep_catalog(), &bootstrap).unwrap()).await;
+        mount(file_plugin(dep_catalog(), &bootstrap).await.unwrap()).await;
     assert_eq!(
         loader
             .await_idle()
@@ -395,6 +395,7 @@ async fn persistent_create_move_and_conflict_use_paths() {
             }]),
             &bootstrap,
         )
+        .await
         .unwrap(),
     )
     .await;
@@ -526,6 +527,7 @@ async fn deleting_group_disposes_children_in_postorder() {
             ]),
             &bootstrap,
         )
+        .await
         .unwrap(),
     )
     .await;
@@ -1638,12 +1640,13 @@ async fn update_enable_disable_notifies_subscribers_with_increasing_revision() {
     runtime.shutdown().await.unwrap();
 }
 
-fn file_plugin(
+async fn file_plugin(
     mut catalog: ExtensionCatalog,
     bootstrap: impl AsRef<std::path::Path>,
 ) -> Result<LoaderPlugin, LoaderError> {
     catalog.register(cordis_plugin_include::IncludeFactory)?;
     let entry = cordis_plugin_include::bootstrap_entry("include", bootstrap)
+        .await
         .map_err(|error| LoaderError::invalid_config(error.to_string()))?;
     LoaderPlugin::new(
         catalog,
