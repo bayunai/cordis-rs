@@ -19,7 +19,7 @@
         ├─► cordis-plugin-plugin-manager  ← list_plugins / set_plugin_enabled / subscribe
         │         │ 启停委托
         ▼         ▼
-cordis-plugin-settings          ← describe / 字段操作 / 脱敏（base · user · value）
+cordis-plugin-settings          ← describe / 字段操作 / 脱敏（base · user · config · value）
         │  委托 user 层提交
         ▼
 cordis-plugin-config-editor     ← deploy ∘ user ∘ home → Include.patches
@@ -34,7 +34,7 @@ cordis-plugin-config-editor     ← deploy ∘ user ∘ home → Include.patches
 | 层 | 拥有 | 不拥有 |
 | --- | --- | --- |
 | **plugin-manager** | 根 Include 下 Entry 库存、`set_plugin_enabled`、快照失效订阅 | 表单字段、HTTP、pnpm、bundle 安装/选层 |
-| **settings** | 安全 Schema、脱敏 `base` / `user` / `value`、secrets、revision、有序 Set/Unset | 文件 I/O、直接明文 `update` |
+| **settings** | 安全 Schema、脱敏 `base` / `user` / `config` / `value`、secrets、revision、有序 Set/Unset | 文件 I/O、直接明文 `update` |
 | **config-editor** | 有序 deploy 路径、user/home 文档、组成与 reconcile；运维用整表 `commit_source` | 表单投影、HTTP |
 | **Loader** | Catalog、EntryTree、reconcile、`EntryTreeSource`、snapshot/commit 原语 | 表单 DTO、文件格式、产品 user 语义 |
 | **Include** | 路径、编解码、文件事务；`patches` 为组成载体 | 管理界面语义、本机 user 权威 |
@@ -48,7 +48,8 @@ cordis-plugin-config-editor     ← deploy ∘ user ∘ home → Include.patches
 | **deploy** | 各插件有序 `cordis.patch.toml`（通常根 `insert`） | 包内文件；UI 不写 |
 | **user** | 本机覆盖：Entry `config` 与启停 `disabled` | Host 注入（如 `user.patches.toml`） |
 | **home** | 更高优先本机覆盖 | Host 注入（如 `home.patches.toml`）；UI 不写 |
-| **value / effective** | deploy ∘ user ∘ home | 不单独落盘；经 Include `patches` 同步 |
+| **config / effective** | deploy ∘ user ∘ home 的 raw 配置 | 不单独落盘；经 Include `patches` 同步 |
+| **value / resolved** | Active 实例的类型解析快照（含真实 Serde 默认值）；其他状态为 None | 仅展示，不写回 user |
 
 产品 **user ≠** Include 配置里的 `patches` 字段语义：后者是调和载体；权威在独立文档与各插件 deploy 文件。  
 **user ≠** 应用偏好（例如工作台 `settings.toml` / `workbench-settings`）：那是第三命名空间。
@@ -65,7 +66,11 @@ Host 在代码中挂根 Include（空根 `cordis.toml`），不使用独立 boot
 | settings | `cordis.settings` |
 | plugin-manager | `cordis.plugin-manager` |
 
-挂载顺序：Loader（及根 Include）→ `ConfigEditorPlugin::new(ConfigEditorConfig { deploy_patch_paths, user_patch_path, home_patch_path, … })` → `SettingsPlugin` → `PluginManagerPlugin`。
+挂载顺序：Loader → `prepare_root_include(path, &config).await` 组合完整 patches →
+`loader.create(entry, None, None).await` 初次挂载根 Include → `ConfigEditorPlugin::new(config)` →
+`SettingsPlugin` → `PluginManagerPlugin`。启动组合函数与运行期编辑共用分层读取规则；
+ConfigEditor 挂载仅注册服务，不读取或协调业务声明。初次业务 Failed 不会拖掉配置控制面，
+后续编辑失败仍必须通过操作返回值报告。
 
 ## 非目标
 

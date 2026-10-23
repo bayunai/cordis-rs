@@ -10,6 +10,26 @@ type Redacted = (Value, toml::Value, SecretPaths);
 ///
 /// 数组按整体编辑，因此数组元素中的秘密使整个数组成为秘密。
 pub(crate) fn redact(schema: &Value, config: &toml::Value) -> Result<Redacted, String> {
+    let json = serde_json::to_value(config).map_err(|_| "无法投影配置值")?;
+    let (management_schema, secrets) = redaction_plan(schema, &json)?;
+    let mut value = config.clone();
+    for (path, _) in &secrets {
+        remove(&mut value, path);
+    }
+    Ok((management_schema, value, secrets))
+}
+
+/// 运行时解析快照保留 JSON 的 null 等值；与原始 TOML 共用同一秘密策略。
+pub(crate) fn redact_json(schema: &Value, config: &Value) -> Result<Value, String> {
+    let (_, secrets) = redaction_plan(schema, config)?;
+    let mut value = config.clone();
+    for (path, _) in secrets {
+        remove_json(&mut value, &path);
+    }
+    Ok(value)
+}
+
+fn redaction_plan(schema: &Value, config: &Value) -> Result<(Value, SecretPaths), String> {
     let expanded = expand(schema, schema, &mut Vec::new())?;
     let mut secrets = BTreeMap::new();
     collect(&expanded, Some(config), &mut Vec::new(), &mut secrets)?;
@@ -19,13 +39,9 @@ pub(crate) fn redact(schema: &Value, config: &toml::Value) -> Result<Redacted, S
             .iter()
             .any(|ancestor| ancestor.len() < path.len() && path.starts_with(ancestor))
     });
-    let mut value = config.clone();
-    for path in secrets.keys() {
-        remove(&mut value, path);
-    }
     let mut management_schema = expanded;
     sanitize(&mut management_schema, &paths, &mut Vec::new(), false);
-    Ok((management_schema, value, secrets.into_iter().collect()))
+    Ok((management_schema, secrets.into_iter().collect()))
 }
 
 const SCHEMA_MAPS: &[&str] = &[
@@ -169,7 +185,7 @@ fn contains_secret(schema: &Value) -> bool {
 
 fn collect(
     schema: &Value,
-    value: Option<&toml::Value>,
+    value: Option<&Value>,
     path: &mut Vec<String>,
     secrets: &mut BTreeMap<Vec<String>, bool>,
 ) -> Result<(), String> {
@@ -198,7 +214,7 @@ fn collect(
     {
         return Err("秘密字段 Schema 含无法安全投影的属性模式或内容 Schema".into());
     }
-    let table = value.and_then(toml::Value::as_table);
+    let table = value.and_then(Value::as_object);
     if let Some(properties) = schema.get("properties").and_then(Value::as_object) {
         for (name, child) in properties {
             path.push(name.clone());
@@ -246,6 +262,18 @@ fn remove(value: &mut toml::Value, path: &[String]) {
             table.remove(&path[0]);
         } else if let Some(child) = table.get_mut(&path[0]) {
             remove(child, &path[1..]);
+        }
+    }
+}
+
+fn remove_json(value: &mut Value, path: &[String]) {
+    if path.is_empty() {
+        *value = Value::Object(Map::new());
+    } else if let Some(table) = value.as_object_mut() {
+        if path.len() == 1 {
+            table.remove(&path[0]);
+        } else if let Some(child) = table.get_mut(&path[0]) {
+            remove_json(child, &path[1..]);
         }
     }
 }

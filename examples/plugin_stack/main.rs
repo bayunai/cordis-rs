@@ -49,7 +49,7 @@ use serde::{Deserialize, Serialize};
 use side::SidePlugin;
 use std::{convert::Infallible, fs, path::PathBuf, sync::Arc};
 
-#[derive(Clone, Deserialize, JsonSchema)]
+#[derive(serde::Serialize, Clone, Deserialize, JsonSchema)]
 struct Empty {}
 
 struct AppState {

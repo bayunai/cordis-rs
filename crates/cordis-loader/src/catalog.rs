@@ -7,7 +7,7 @@ use crate::{
 };
 use cordis_core::{ConfigKey, Context, CoreError, IsolationLabel, ServiceId, ServiceKey};
 use schemars::JsonSchema;
-use serde::de::DeserializeOwned;
+use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value as JsonValue;
 use std::{
     collections::HashMap,
@@ -23,10 +23,17 @@ fn parse_config<T: DeserializeOwned>(config: &toml::Value, id: &str) -> Result<T
 }
 
 fn schema_descriptor<T: JsonSchema>(id: &'static str) -> Result<FactoryDescriptor, LoaderError> {
+    let output = schemars::generate::SchemaSettings::default()
+        .for_serialize()
+        .into_generator()
+        .into_root_schema_for::<T>();
     serde_json::to_value(schemars::schema_for!(T))
-        .map(|schema| FactoryDescriptor {
-            id: id.into(),
-            schema,
+        .and_then(|schema| {
+            Ok(FactoryDescriptor {
+                id: id.into(),
+                schema,
+                resolved_schema: serde_json::to_value(output)?,
+            })
         })
         .map_err(|error| LoaderError::FactorySchema {
             factory: id.into(),
@@ -45,7 +52,7 @@ type IsolateNamed =
 ///
 /// `prepare` 完成业务校验并返回延迟构造结果；不得在准备阶段挂载资源或执行 `apply`。
 pub trait ExtensionFactory: Send + Sync + 'static {
-    type Config: DeserializeOwned + JsonSchema + Send + Sync + 'static;
+    type Config: DeserializeOwned + Serialize + JsonSchema + Send + Sync + 'static;
     fn id(&self) -> &'static str;
     fn prepare(&self, config: Self::Config) -> Result<PreparedExtension, LoaderError>;
 }
@@ -60,7 +67,16 @@ struct FactoryAdapter<F> {
 impl<F: ExtensionFactory> ErasedExtensionFactory for FactoryAdapter<F> {
     fn prepare(&self, config: &toml::Value) -> Result<PreparedExtension, LoaderError> {
         let config = parse_config::<F::Config>(config, self.factory.id())?;
-        self.factory.prepare(config)
+        // 保存本次实际解析的值，不能在查询时重新运行可能有状态的 Serde 默认函数。
+        // 自定义 Serialize 的错误与 panic 都不能将秘密值带出 Factory 边界。
+        let resolved = catch_unwind(AssertUnwindSafe(|| serde_json::to_value(&config)))
+            .map_err(|_| {
+                LoaderError::invalid_config("factory resolved config serialization panicked")
+            })?
+            .map_err(|_| {
+                LoaderError::invalid_config("factory resolved config serialization failed")
+            })?;
+        Ok(self.factory.prepare(config)?.with_resolved(resolved))
     }
     fn descriptor(&self, id: &'static str) -> Result<FactoryDescriptor, LoaderError> {
         schema_descriptor::<F::Config>(id)
@@ -71,6 +87,8 @@ impl<F: ExtensionFactory> ErasedExtensionFactory for FactoryAdapter<F> {
 pub struct FactoryDescriptor {
     pub id: String,
     pub schema: JsonValue,
+    /// 序列化视图；处理 serde 的非对称字段重命名，运行值脱敏不得误用输入 Schema。
+    pub resolved_schema: JsonValue,
 }
 #[derive(Clone)]
 struct FactoryRecord {
@@ -257,10 +275,12 @@ impl ExtensionCatalog {
         factory: &str,
         config: &toml::Value,
     ) -> Result<PreparedExtension, LoaderError> {
-        let factory = self.get(factory).ok_or_else(|| LoaderError::UnknownFactory {
-            instance: String::new(),
-            factory: factory.into(),
-        })?;
+        let factory = self
+            .get(factory)
+            .ok_or_else(|| LoaderError::UnknownFactory {
+                instance: String::new(),
+                factory: factory.into(),
+            })?;
         catch_unwind(AssertUnwindSafe(|| factory.prepare(config))).map_err(|payload| {
             LoaderError::FactoryPanic {
                 message: format_panic_message("extension factory prepare", payload),

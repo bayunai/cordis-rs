@@ -15,9 +15,9 @@ static DEP: ServiceKey<()> = ServiceKey::new("loader.tree.dep@1");
 static VALUE: ServiceKey<String> = ServiceKey::new("loader.tree.value@1");
 static LABEL: ConfigKey<LabelConfig> = ConfigKey::new("loader.tree.label@1");
 
-#[derive(Clone, serde::Deserialize, JsonSchema)]
+#[derive(serde::Serialize, Clone, serde::Deserialize, JsonSchema)]
 struct Empty {}
-#[derive(Clone, serde::Deserialize, JsonSchema)]
+#[derive(serde::Serialize, Clone, serde::Deserialize, JsonSchema)]
 struct LabelConfig {
     label: String,
 }

@@ -17,7 +17,7 @@ use std::{
     },
 };
 
-#[derive(Clone, Deserialize, JsonSchema)]
+#[derive(serde::Serialize, Clone, Deserialize, JsonSchema)]
 struct Input {
     value: u32,
     #[serde(default)]
@@ -399,8 +399,8 @@ async fn carrier_description_does_not_expose_secrets_embedded_in_initial_or_patc
     }];
     h.update(&config).await.unwrap();
     let form = h.settings.describe("include").await.unwrap();
-    assert!(form.value.get("initial").is_none());
-    assert!(form.value.get("patches").is_none());
+    assert!(form.config.get("initial").is_none());
+    assert!(form.config.get("patches").is_none());
     assert!(!format!("{form:?}").contains("embedded-private-token"));
     assert!(
         form.secrets

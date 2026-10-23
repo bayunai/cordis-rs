@@ -120,7 +120,7 @@ impl EntryTreeSource for MemorySource {
         Ok(self.revision())
     }
 }
-#[derive(Clone, PartialEq, Deserialize, JsonSchema)]
+#[derive(serde::Serialize, Clone, PartialEq, Deserialize, JsonSchema)]
 struct Empty {}
 struct Carrier(Arc<MemorySource>);
 impl ExtensionFactory for Carrier {
@@ -141,7 +141,7 @@ impl ExtensionFactory for Carrier {
         ))
     }
 }
-#[derive(Deserialize, JsonSchema)]
+#[derive(serde::Serialize, Deserialize, JsonSchema)]
 struct Input {
     value: u32,
 }

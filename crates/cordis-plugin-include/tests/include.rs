@@ -13,7 +13,7 @@ use tokio::sync::Barrier;
 
 static VALUE: ServiceKey<String> = ServiceKey::new("include.test.value@1");
 
-#[derive(Clone, serde::Deserialize, schemars::JsonSchema)]
+#[derive(serde::Serialize, Clone, serde::Deserialize, schemars::JsonSchema)]
 struct Empty {}
 
 struct ValueFactory {

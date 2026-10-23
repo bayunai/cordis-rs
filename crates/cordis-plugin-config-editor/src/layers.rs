@@ -1,8 +1,9 @@
 //! 空根 ∘ deploy ∘ user ∘ home；运行时经根 Include.patches 全量同步。
 
 use crate::{
+    composition::{layer_error as user_layer_error, read_layer_patches},
     patch_file::{compose_entries, load_ordered_patches},
-    user_patch::{UserPatchDocument, UserPatchStore},
+    user_patch::{UserPatchDocument, UserPatchEdit, UserPatchStore},
 };
 use cordis_loader::{
     ConfigRevision, ConfigTransaction, EntryId, EntryOptions, Loader, LoaderControlError,
@@ -46,12 +47,15 @@ pub struct LayeredEntryConfig {
     pub path: EntryId,
     pub factory: String,
     pub schema: serde_json::Value,
+    pub resolved_schema: serde_json::Value,
     /// 仅 deploy 组成后的声明。
     pub base: toml::Value,
     /// user patch 中的整表覆盖；无覆盖时为 `None`。
     pub user: Option<toml::Value>,
     /// deploy ∘ user ∘ home。
     pub effective: toml::Value,
+    /// Active 实例实际接收的类型解析快照（含 Serde 默认值），并非重新解析声明。
+    pub resolved: Option<serde_json::Value>,
     pub revision: ConfigRevision,
 }
 
@@ -92,24 +96,6 @@ impl LayerEngine {
             .await
     }
 
-    pub async fn sync_patches(&self) -> Result<(), LoaderControlError> {
-        let engine = self.clone();
-        self.loader
-            .config_transaction(move |tx| {
-                Box::pin(async move {
-                    let document = engine.store.load().await.map_err(user_layer_error)?;
-                    // 启动时不主动重试 Include 已加载的失败声明。
-                    if engine.include_config(tx).await?.0.patches
-                        == engine.runtime_patches(&document).await?
-                    {
-                        return Ok(());
-                    }
-                    engine.apply_include_patches(tx, &document).await
-                })
-            })
-            .await
-    }
-
     pub async fn layers(&self, full_path: &str) -> Result<LayeredEntryConfig, LoaderControlError> {
         let engine = self.clone();
         let path = full_path.to_owned();
@@ -125,6 +111,16 @@ impl LayerEngine {
         tx: &ConfigTransaction,
         full_path: &str,
     ) -> Result<LayeredEntryConfig, LoaderControlError> {
+        let edit = self.store.begin_edit().await.map_err(user_layer_error)?;
+        self.layers_with_edit(tx, &edit, full_path).await
+    }
+
+    async fn layers_with_edit(
+        &self,
+        tx: &ConfigTransaction,
+        edit: &UserPatchEdit,
+        full_path: &str,
+    ) -> Result<LayeredEntryConfig, LoaderControlError> {
         let snapshot = tx.snapshot_entry_config(full_path).await?;
         // 根 Include 载体本身：无产品 user 层，仅投影当前声明。
         if full_path == self.include_root {
@@ -132,14 +128,16 @@ impl LayerEngine {
                 path: snapshot.path,
                 factory: snapshot.factory,
                 schema: snapshot.schema,
+                resolved_schema: snapshot.resolved_schema,
                 base: snapshot.config.clone(),
                 user: None,
                 effective: snapshot.config,
+                resolved: snapshot.resolved,
                 revision: snapshot.revision,
             });
         }
         let local = self.local_id(full_path)?;
-        let document = self.store.load().await.map_err(user_layer_error)?;
+        let document = edit.load().await.map_err(user_layer_error)?;
         let user = document.config_for(&local).cloned();
         let base_entry = match self.read_deploy_entry(&local).await {
             Ok(entry) => entry,
@@ -149,9 +147,11 @@ impl LayerEngine {
                     path: snapshot.path,
                     factory: snapshot.factory,
                     schema: snapshot.schema,
+                    resolved_schema: snapshot.resolved_schema,
                     base: snapshot.config.clone(),
                     user,
                     effective: snapshot.config,
+                    resolved: snapshot.resolved,
                     revision: snapshot.revision,
                 });
             }
@@ -166,9 +166,11 @@ impl LayerEngine {
             path: snapshot.path,
             factory: snapshot.factory,
             schema: snapshot.schema,
+            resolved_schema: snapshot.resolved_schema,
             base: base_entry.config,
             user,
             effective: effective_entry.config,
+            resolved: snapshot.resolved,
             revision: snapshot.revision,
         })
     }
@@ -188,6 +190,7 @@ impl LayerEngine {
         self.loader
             .config_transaction(move |tx| {
                 Box::pin(async move {
+                    let edit = engine.store.begin_edit().await.map_err(user_layer_error)?;
                     let base_entry = engine
                         .read_deploy_entry(&local)
                         .await
@@ -200,7 +203,8 @@ impl LayerEngine {
                     } else {
                         Some(next_disabled)
                     };
-                    let previous = engine.store.load().await.map_err(user_layer_error)?;
+                    let previous = edit.load().await.map_err(user_layer_error)?;
+                    engine.ensure_layers_current(tx, &previous).await?;
                     let mut document = previous.clone();
                     document.upsert_disabled(&local, &factory, override_disabled);
                     let composed = engine.compose_full(&document).await?;
@@ -209,13 +213,11 @@ impl LayerEngine {
                     {
                         return Err(LoaderControlError::ConfigNotEditable);
                     }
-                    engine
-                        .store
-                        .store(&document)
-                        .await
-                        .map_err(user_layer_error)?;
+                    edit.store(&document).await.map_err(user_layer_error)?;
                     if let Err(error) = engine.apply_include_patches(tx, &document).await {
-                        return Err(engine.restore_user_after_failure(&previous, error).await);
+                        return Err(engine
+                            .restore_user_after_failure(&edit, &previous, error)
+                            .await);
                     }
                     Ok(())
                 })
@@ -238,6 +240,7 @@ impl LayerEngine {
         self.loader
             .config_transaction(move |tx| {
                 Box::pin(async move {
+                    let edit = engine.store.begin_edit().await.map_err(user_layer_error)?;
                     let base_entry = engine
                         .read_deploy_entry(&local)
                         .await
@@ -256,7 +259,8 @@ impl LayerEngine {
                     if needs_explicit_prepare {
                         tx.prepare_entry_config(&factory, &next_effective)?;
                     }
-                    let previous = engine.store.load().await.map_err(user_layer_error)?;
+                    let previous = edit.load().await.map_err(user_layer_error)?;
+                    engine.ensure_layers_current(tx, &previous).await?;
                     let mut document = previous.clone();
                     if next_effective == base_entry.config {
                         document.upsert_config(&local, &factory, None);
@@ -273,15 +277,13 @@ impl LayerEngine {
                     if after.config != next_effective {
                         return Err(LoaderControlError::ConfigNotEditable);
                     }
-                    engine
-                        .store
-                        .store(&document)
-                        .await
-                        .map_err(user_layer_error)?;
+                    edit.store(&document).await.map_err(user_layer_error)?;
                     if let Err(error) = engine.apply_include_patches(tx, &document).await {
-                        return Err(engine.restore_user_after_failure(&previous, error).await);
+                        return Err(engine
+                            .restore_user_after_failure(&edit, &previous, error)
+                            .await);
                     }
-                    engine.layers_in_transaction(tx, &full_path).await
+                    engine.layers_with_edit(tx, &edit, &full_path).await
                 })
             })
             .await
@@ -291,17 +293,7 @@ impl LayerEngine {
         &self,
         user: &UserPatchDocument,
     ) -> Result<Vec<EntryPatch>, LoaderControlError> {
-        let mut patches = load_ordered_patches(&self.deploy_patch_paths)
-            .await
-            .map_err(user_layer_error)?;
-        patches.extend(user.to_entry_patches());
-        patches.extend(
-            crate::patch_file::PatchFileDocument::load(&self.home_patch_path)
-                .await
-                .map_err(user_layer_error)?
-                .patches,
-        );
-        Ok(patches)
+        read_layer_patches(&self.deploy_patch_paths, user, &self.home_patch_path).await
     }
 
     async fn compose_full(
@@ -338,10 +330,11 @@ impl LayerEngine {
 
     async fn restore_user_after_failure(
         &self,
+        edit: &UserPatchEdit,
         previous: &UserPatchDocument,
         error: LoaderControlError,
     ) -> LoaderControlError {
-        match self.store.store(previous).await {
+        match edit.store(previous).await {
             Ok(()) => map_form_edit_error(error),
             Err(restore_error) => LoaderControlError::Source {
                 source: SourceError::new(
@@ -350,6 +343,32 @@ impl LayerEngine {
                 ),
             },
         }
+    }
+
+    async fn ensure_layers_current(
+        &self,
+        tx: &ConfigTransaction,
+        user: &UserPatchDocument,
+    ) -> Result<(), LoaderControlError> {
+        if self.include_config(tx).await?.0.patches != self.runtime_patches(user).await? {
+            return Err(LoaderControlError::ConfigConflict {
+                source_id: self.store.path().display().to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    pub async fn reload(&self) -> Result<(), LoaderControlError> {
+        let engine = self.clone();
+        self.loader
+            .config_transaction(move |tx| {
+                Box::pin(async move {
+                    let edit = engine.store.begin_edit().await.map_err(user_layer_error)?;
+                    let document = edit.load().await.map_err(user_layer_error)?;
+                    engine.apply_include_patches(tx, &document).await
+                })
+            })
+            .await
     }
 
     async fn include_config(
@@ -400,12 +419,6 @@ fn find_entry(entries: &[EntryOptions], path: &str) -> Option<EntryOptions> {
         find_entry(&children, tail)
     } else {
         Some(entry.clone())
-    }
-}
-
-fn user_layer_error(message: String) -> LoaderControlError {
-    LoaderControlError::Source {
-        source: SourceError::new(SourceErrorKind::InvalidData, message),
     }
 }
 

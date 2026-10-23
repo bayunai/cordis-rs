@@ -322,6 +322,7 @@ dependencies = [
  "cordis-loader",
  "cordis-plugin-config-editor",
  "cordis-plugin-include",
+ "cordis-plugin-settings",
  "cordis-testkit",
  "schemars",
  "serde",

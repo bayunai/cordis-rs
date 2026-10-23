@@ -37,8 +37,10 @@ pub struct EntryConfigView {
     pub base: toml::Value,
     /// 本机 user 整表覆盖（已脱敏）；无覆盖时为 `None`。
     pub user: Option<toml::Value>,
-    /// effective = base ∘ user（已脱敏）。
-    pub value: toml::Value,
+    /// deploy ∘ user ∘ home 的原始合成配置，字段编辑以此为基础，不能把默认值写回用户层。
+    pub config: toml::Value,
+    /// Active 实例的已解析配置快照（含 Serde 默认值，已脱敏）；其他状态明确为 None。
+    pub value: Option<serde_json::Value>,
     pub secrets: Vec<SecretFieldState>,
     pub revision: ConfigRevision,
 }
@@ -46,7 +48,7 @@ pub struct EntryConfigView {
 pub(crate) fn view_from_layers(
     layers: &LayeredEntryConfig,
 ) -> Result<EntryConfigView, LoaderControlError> {
-    let (schema, value, secrets) = secrets::redact(&layers.schema, &layers.effective)
+    let (schema, config, secrets) = secrets::redact(&layers.schema, &layers.effective)
         .map_err(|message| LoaderControlError::SecretSchema { message })?;
     let (_, base, _) = secrets::redact(&layers.schema, &layers.base)
         .map_err(|message| LoaderControlError::SecretSchema { message })?;
@@ -58,12 +60,19 @@ pub(crate) fn view_from_layers(
         }
         None => None,
     };
+    let value = layers
+        .resolved
+        .as_ref()
+        .map(|resolved| secrets::redact_json(&layers.resolved_schema, resolved))
+        .transpose()
+        .map_err(|message| LoaderControlError::SecretSchema { message })?;
     Ok(EntryConfigView {
         path: layers.path.clone(),
         factory: layers.factory.clone(),
         schema,
         base,
         user,
+        config,
         value,
         secrets: secrets
             .into_iter()

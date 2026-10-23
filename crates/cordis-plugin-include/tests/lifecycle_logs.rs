@@ -12,7 +12,7 @@ use serde::Deserialize;
 use std::{fs, path::Path, sync::Arc};
 
 static SERVICE: ServiceKey<()> = ServiceKey::new("log-test.service@1");
-#[derive(Deserialize, JsonSchema)]
+#[derive(serde::Serialize, Deserialize, JsonSchema)]
 struct Input {
     live: u32,
     #[serde(default)]
@@ -214,7 +214,10 @@ async fn readonly_preflight_rejects_edit_without_changing_runtime_revision_or_fi
     let path = dir.path().join("entries.toml");
     save(&path, vec![leaf("worker", 1, false, false)]);
     let (runtime, _fiber, loader) = mount(vec![include("include", &path, Some(true))]).await;
-    let before = loader.snapshot_entry_config("include:worker").await.unwrap();
+    let before = loader
+        .snapshot_entry_config("include:worker")
+        .await
+        .unwrap();
     let id = loader
         .await_idle()
         .await
@@ -243,7 +246,10 @@ async fn readonly_preflight_rejects_edit_without_changing_runtime_revision_or_fi
         matches!(result, Err(cordis_loader::LoaderControlError::Source { source })
         if source.kind == cordis_loader::SourceErrorKind::ReadOnly)
     );
-    let after = loader.snapshot_entry_config("include:worker").await.unwrap();
+    let after = loader
+        .snapshot_entry_config("include:worker")
+        .await
+        .unwrap();
     assert_eq!(before.revision, after.revision);
     assert_eq!(before.config, after.config);
     assert_eq!(

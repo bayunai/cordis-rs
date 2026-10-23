@@ -34,6 +34,8 @@ pub(crate) struct RuntimeEntry {
     /// 挂载时的自身配置（Group 的 children 嵌在 `config` 中，比较时单独处理）。
     pub(crate) options: crate::config::EntryOptions,
     pub(crate) binding: Option<Arc<dyn crate::prepared::ConfigBinding>>,
+    /// 当前已安装实例实际解析的完整配置；只在 Active 时向控制面投影。
+    pub(crate) resolved: Option<serde_json::Value>,
 }
 
 pub struct LoaderPlugin {

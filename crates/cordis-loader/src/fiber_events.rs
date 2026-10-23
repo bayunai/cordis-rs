@@ -86,7 +86,7 @@ mod tests {
         }
     }
 
-    #[derive(Deserialize, JsonSchema)]
+    #[derive(Deserialize, serde::Serialize, JsonSchema)]
     struct Empty {}
     struct Carrier(Arc<TestSource>);
     impl ExtensionFactory for Carrier {

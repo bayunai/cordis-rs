@@ -20,6 +20,10 @@ pub struct ConfigEditorService {
 }
 
 impl ConfigEditorService {
+    /// 显式重新读取分层文件并协调；外部编辑冲突后由调用方决定是否刷新，不自动重试写入。
+    pub async fn reload(&self) -> Result<(), LoaderControlError> {
+        self.engine.reload().await
+    }
     /// 是否具有本编辑器拥有的 deploy 声明；嵌套来源和未登记条目不冒充可编辑。
     pub async fn can_edit(&self, path: impl AsRef<str>) -> Result<bool, LoaderControlError> {
         self.engine.can_edit(path.as_ref()).await
@@ -111,18 +115,8 @@ impl Plugin for ConfigEditorPlugin {
             deploy_patch_paths: self.config.deploy_patch_paths.clone(),
             home_patch_path: self.config.home_patch_path.clone(),
         });
-        // 先提供服务，再 sync：deploy insert 可能立刻挂载依赖 CONFIG_EDITOR 的插件。
-        ctx.provide(
-            CONFIG_EDITOR,
-            ConfigEditorService {
-                loader,
-                engine: engine.clone(),
-            },
-        )?;
-        engine
-            .sync_patches()
-            .await
-            .map_err(|error| CoreError::PluginApply(error.to_string()))?;
+        // 启动组合属于应用入口；服务挂载不得执行任何业务树协调或文件读取。
+        ctx.provide(CONFIG_EDITOR, ConfigEditorService { loader, engine })?;
         Ok(())
     }
 }

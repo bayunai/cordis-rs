@@ -16,7 +16,7 @@ use std::{
 static LIVE: ServiceKey<ConfigRef<Live>> = ServiceKey::new("test.volatile.live@1");
 static DEP: ServiceKey<()> = ServiceKey::new("test.volatile.dep@1");
 
-#[derive(serde::Deserialize, JsonSchema)]
+#[derive(serde::Serialize, serde::Deserialize, JsonSchema)]
 struct Input {
     address: String,
     limit: u32,
@@ -398,11 +398,21 @@ async fn lifecycle_failure_preserves_committed_desired_and_hot_and_same_target_r
         );
         let published = h.loader.snapshot_entry_config("include:a").await.unwrap();
         assert_eq!(published.config["limit"].as_integer(), Some(1));
+        assert_eq!(published.resolved.as_ref().unwrap()["limit"], 1);
     }
     h.write(vec![entry("a", "db", 2), entry("b", "fixed", 2)]);
     h.loader.subtree("include").unwrap().reload().await.unwrap();
     assert_eq!(first.get().revision, 1);
     assert_eq!(first.get().value.limit, 2);
+    assert_eq!(
+        h.loader
+            .snapshot_entry_config("include:a")
+            .await
+            .unwrap()
+            .resolved
+            .unwrap()["limit"],
+        2
+    );
     h.runtime.shutdown().await.unwrap();
 }
 

@@ -19,7 +19,7 @@ use std::sync::{
 };
 
 static MISSING: ServiceKey<()> = ServiceKey::new("config.control.missing");
-#[derive(Deserialize, JsonSchema)]
+#[derive(serde::Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct Input {
     address: String,
@@ -183,7 +183,7 @@ async fn disabled_edit_validates_once_without_constructing_and_preserves_secrets
     assert_eq!(h.counts.prepares.load(Ordering::SeqCst), 0);
     let before = h.settings.describe("include:one").await.unwrap();
     assert!(before.user.is_none());
-    assert!(before.value.get("token").is_none());
+    assert!(before.config.get("token").is_none());
     assert_eq!(before.secrets[0].path, ["token"]);
     assert!(before.secrets[0].is_set);
     assert!(!format!("{before:?}").contains("secret-value"));
@@ -350,7 +350,7 @@ async fn failed_and_pending_instances_can_be_fixed_and_failure_invalidates_revis
             Some(FiberState::Failed)
         );
         let failed = h.settings.describe("include:one").await.unwrap();
-        assert_eq!(failed.value["address"].as_str(), Some("ok"));
+        assert_eq!(failed.config["address"].as_str(), Some("ok"));
         assert_ne!(failed.revision, after.revision);
         h.settings
             .mutate("include:one", failed.revision, vec![set("address", "ok")])
@@ -584,8 +584,8 @@ async fn form_mutate_writes_user_and_leaves_base_file_unchanged() {
         )
         .await
         .unwrap();
-    assert_eq!(current.value["limit"].as_integer(), Some(9));
-    assert_eq!(current.value["address"].as_str(), Some("updated"));
+    assert_eq!(current.config["limit"].as_integer(), Some(9));
+    assert_eq!(current.config["address"].as_str(), Some("updated"));
     assert!(current.user.is_some());
     assert_ne!(current.revision, form.revision);
     assert_eq!(h.file(), base_before);
@@ -606,8 +606,8 @@ async fn ordered_operations_and_secret_replacement_do_not_restore_deleted_fields
         )
         .await
         .unwrap();
-    assert_eq!(form.value["limit"].as_integer(), Some(3));
-    assert!(form.value.get("token").is_none());
+    assert_eq!(form.config["limit"].as_integer(), Some(3));
+    assert!(form.config.get("token").is_none());
     assert!(!format!("{form:?}").contains("new-secret"));
     assert!(!h.file().contains("new-secret"));
     assert!(h.user_file().contains("new-secret"));
@@ -653,7 +653,7 @@ async fn describe_waits_for_in_flight_config_commit_and_returns_matching_revisio
     let committed = update.await.unwrap().unwrap();
     let observed = read.await.unwrap().unwrap();
     assert_eq!(observed.revision, committed.revision);
-    assert_eq!(observed.value["address"].as_str(), Some("blocked"));
+    assert_eq!(observed.config["address"].as_str(), Some("blocked"));
     h.runtime.shutdown().await.unwrap();
 }
 
@@ -712,7 +712,7 @@ async fn instance_edits_preserve_other_instance_config_and_fiber() {
         .await
         .unwrap();
     assert_eq!(
-        settings.describe("include:two").await.unwrap().value["limit"].as_integer(),
+        settings.describe("include:two").await.unwrap().config["limit"].as_integer(),
         Some(7)
     );
     assert_eq!(
@@ -771,7 +771,7 @@ async fn cancelling_the_waiter_does_not_skip_persistence_after_reconcile() {
     assert!(waiter.await.unwrap_err().is_cancelled());
     h.counts.release.notify_one();
     let after = h.settings.describe("include:one").await.unwrap();
-    assert_eq!(after.value["address"].as_str(), Some("blocked"));
+    assert_eq!(after.config["address"].as_str(), Some("blocked"));
     assert!(!h.file().contains("blocked"));
     assert!(h.user_file().contains("blocked"));
     h.runtime.shutdown().await.unwrap();
@@ -785,27 +785,14 @@ async fn mount_file(
     user_patch: impl AsRef<std::path::Path>,
     home_patch: impl AsRef<std::path::Path>,
 ) -> (Vec<Fiber>, SettingsService) {
-    let mut entry = cordis_plugin_include::include_root_entry("include", cordis).unwrap();
-    // 初次声明属于 Include 初始化：业务失败也保留声明供 Settings 修复。
-    // ConfigEditor 后续 edit 则必须向调用方返回生命周期错误。
-    let mut include: cordis_plugin_include::IncludeConfig = entry.config.try_into().unwrap();
-    include.patches = cordis_plugin_config_editor::load_ordered_patches(&[deploy_patch.as_ref()])
+    let config = ConfigEditorConfig::new(
+        vec![deploy_patch.as_ref().to_path_buf()],
+        user_patch.as_ref(),
+        home_patch.as_ref(),
+    );
+    let entry = cordis_plugin_config_editor::prepare_root_include(cordis, &config)
         .await
         .unwrap();
-    include.patches.extend(
-        cordis_plugin_config_editor::UserPatchStore::new(user_patch.as_ref())
-            .load()
-            .await
-            .unwrap()
-            .to_entry_patches(),
-    );
-    include.patches.extend(
-        PatchFileDocument::load(home_patch.as_ref())
-            .await
-            .unwrap()
-            .patches,
-    );
-    entry.config = toml::Value::try_from(include).unwrap();
     let loader_fiber = runtime
         .root()
         .plugin(Arc::new(LoaderPlugin::new(catalog)))
@@ -820,11 +807,7 @@ async fn mount_file(
         .unwrap();
     let editor_fiber = runtime
         .root()
-        .plugin(Arc::new(ConfigEditorPlugin::new(ConfigEditorConfig::new(
-            vec![deploy_patch.as_ref().to_path_buf()],
-            user_patch.as_ref(),
-            home_patch.as_ref(),
-        ))))
+        .plugin(Arc::new(ConfigEditorPlugin::new(config)))
         .await
         .unwrap();
     let settings_fiber = runtime

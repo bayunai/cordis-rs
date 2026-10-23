@@ -6,7 +6,7 @@
 ## 类型化热配置
 
 所有插件统一实现 `ExtensionFactory::prepare()`，并由 Catalog 调用 `register(factory)`。
-`Config` 是正常的 `Deserialize + JsonSchema` 输入类型；`prepare()` 校验全部字段并返回
+`Config` 是 `Deserialize + Serialize + JsonSchema` 类型；`prepare()` 校验全部字段并返回
 延迟构造的 `PreparedExtension`。普通插件使用 `PreparedExtension::ordinary(build)`，无需
 空 Live、配置引用或额外划分方法。
 
@@ -37,11 +37,11 @@ cargo run -p cordis-plugin-include --example volatile_config
 
 ## 配置表单与秘密字段
 
-Factory 的 `Config: Deserialize + JsonSchema` 同时提供输入类型与表单描述。
+Factory 的 `Config: Deserialize + Serialize + JsonSchema` 同时提供输入类型、解析快照与表单描述。
 字段的 Rust 文档注释可提供说明；秘密字段使用标准 Schema 标记，不在另一份目录中登记：
 
 ```rust
-#[derive(serde::Deserialize, schemars::JsonSchema)]
+#[derive(serde::Deserialize, serde::Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct UploadConfig {
     /// 上传服务地址。
@@ -56,6 +56,10 @@ struct UploadConfig {
 `prepare()` 必须校验完整配置，不挂载资源；通过 `ordinary()` / `volatile()` 表达实际更新能力。
 禁用实例的表单编辑也会调用 prepare，因此不要将启用期资源访问放到该阶段。
 不要在错误、panic 或日志中拼接 Token 或其他秘密。
+
+`Serialize` 用于在反序列化之后、消费 Config 之前缓存真实解析值，不用于生成持久化配置。
+该快照不会在查询时重新计算默认值；自定义 Serialize 的错误或 panic 会在生命周期执行前明确拒绝。
+Settings 的 `config` 为原始字段编辑源，`value` 是仅 Active 存在的解析快照；不能把展示默认值回填到用户覆盖。
 
 应用挂载 `SettingsPlugin` 后使用 `settings.describe()` 展示表单，再通过
 `settings.mutate()` 提交有序字段操作和版本（写回经 config-editor）。
@@ -187,7 +191,7 @@ use std::sync::Arc;
 
 struct GreeterFactory;
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(Deserialize, serde::Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct GreeterConfig {
     name: String,

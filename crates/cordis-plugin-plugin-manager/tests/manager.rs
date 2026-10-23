@@ -8,14 +8,15 @@ use cordis_loader::{
 };
 use cordis_plugin_config_editor::{
     ConfigEditorConfig, ConfigEditorPlugin, PATCH_FILE_VERSION, PatchFileDocument,
+    prepare_root_include,
 };
-use cordis_plugin_include::{EntryPatch, IncludeConfig, IncludeFactory, include_root_entry};
+use cordis_plugin_include::{EntryPatch, IncludeConfig, IncludeFactory};
 use cordis_plugin_plugin_manager::{PLUGIN_MANAGER, PluginManagerPlugin, ReadOnlyReason};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use std::sync::Arc;
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(serde::Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct Input {
     #[allow(dead_code)]
@@ -81,12 +82,19 @@ async fn harness() -> (Runtime, tempfile::TempDir, Vec<cordis_core::Fiber>) {
         .plugin(Arc::new(LoaderPlugin::new(catalog)))
         .await
         .unwrap();
+    let editor_config = ConfigEditorConfig::new(
+        vec![dir.path().join("deploy.patches.toml")],
+        dir.path().join("user.patches.toml"),
+        dir.path().join("home.patches.toml"),
+    );
     runtime
         .root()
         .get(LOADER)
         .unwrap()
         .create(
-            include_root_entry("include", dir.path().join("cordis.toml")).unwrap(),
+            prepare_root_include(dir.path().join("cordis.toml"), &editor_config)
+                .await
+                .unwrap(),
             None,
             None,
         )
@@ -94,11 +102,7 @@ async fn harness() -> (Runtime, tempfile::TempDir, Vec<cordis_core::Fiber>) {
         .unwrap();
     let editor_fiber = runtime
         .root()
-        .plugin(Arc::new(ConfigEditorPlugin::new(ConfigEditorConfig::new(
-            vec![dir.path().join("deploy.patches.toml")],
-            dir.path().join("user.patches.toml"),
-            dir.path().join("home.patches.toml"),
-        ))))
+        .plugin(Arc::new(ConfigEditorPlugin::new(editor_config)))
         .await
         .unwrap();
     let manager_fiber = runtime

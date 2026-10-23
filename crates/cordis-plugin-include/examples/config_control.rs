@@ -8,14 +8,15 @@ use cordis_loader::{
 };
 use cordis_plugin_config_editor::{
     ConfigEditorConfig, ConfigEditorPlugin, PATCH_FILE_VERSION, PatchFileDocument,
+    prepare_root_include,
 };
-use cordis_plugin_include::{EntryPatch, IncludeFactory, include_root_entry};
+use cordis_plugin_include::{EntryPatch, IncludeFactory};
 use cordis_plugin_settings::{ConfigOperation, SETTINGS, SettingsPlugin};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use std::{fs, sync::Arc};
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(serde::Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct Config {
     /// OCR 服务器的完整上传地址。
@@ -80,20 +81,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .plugin(Arc::new(LoaderPlugin::new(catalog)))
         .await?;
     let loader = runtime.root().get(LOADER)?;
+    let editor_config = ConfigEditorConfig::new(
+        vec![deploy_path.clone()],
+        directory.path().join("user.patches.toml"),
+        directory.path().join("home.patches.toml"),
+    );
     loader
         .create(
-            include_root_entry("include", directory.path().join("cordis.toml"))?,
+            prepare_root_include(directory.path().join("cordis.toml"), &editor_config).await?,
             None,
             None,
         )
         .await?;
     let _editor = runtime
         .root()
-        .plugin(Arc::new(ConfigEditorPlugin::new(ConfigEditorConfig::new(
-            vec![deploy_path.clone()],
-            directory.path().join("user.patches.toml"),
-            directory.path().join("home.patches.toml"),
-        ))))
+        .plugin(Arc::new(ConfigEditorPlugin::new(editor_config)))
         .await?;
     let _settings = runtime.root().plugin(Arc::new(SettingsPlugin)).await?;
     let settings = runtime.root().get(SETTINGS)?;
@@ -117,7 +119,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .await?;
     assert!(after.user.is_some());
-    assert!(after.value.get("token").is_none());
+    assert!(after.config.get("token").is_none());
     assert!(
         after
             .secrets

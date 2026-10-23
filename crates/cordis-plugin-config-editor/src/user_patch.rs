@@ -107,11 +107,52 @@ impl UserPatchDocument {
     }
 }
 
-/// 进程内串行 + 原子写回的 user patch 存储。
+/// 进程内串行、跨进程排他锁与原子写回的 user patch 存储。
 #[derive(Debug)]
 pub struct UserPatchStore {
     path: PathBuf,
     lock: Arc<tokio::sync::Mutex<()>>,
+}
+
+/// 一次完整读改写的排他事务。必须覆盖读取、协调及失败回写的整个期间。
+///
+/// 锁文件是持久锚点，不随事务删除，避免等待者锁住已经脱离路径的旧 inode。
+#[derive(Debug)]
+pub struct UserPatchEdit {
+    path: PathBuf,
+    held: Arc<HeldEdit>,
+}
+
+#[derive(Debug)]
+struct HeldEdit {
+    _process: tokio::sync::OwnedMutexGuard<()>,
+    // 关闭文件释放 OS 锁；不显式 unlock，确保最后一个在途操作结算后才释放。
+    _file: fs::File,
+}
+
+impl UserPatchEdit {
+    pub async fn load(&self) -> Result<UserPatchDocument, String> {
+        self.transaction(|path| load_document(&path)).await
+    }
+
+    pub async fn store(&self, document: &UserPatchDocument) -> Result<(), String> {
+        let document = document.clone();
+        self.transaction(move |path| save_document(&path, &document))
+            .await
+    }
+
+    async fn transaction<T: Send + 'static>(
+        &self,
+        operation: impl FnOnce(PathBuf) -> Result<T, String> + Send + 'static,
+    ) -> Result<T, String> {
+        let held = self.held.clone();
+        let path = self.path.clone();
+        file_task(move || {
+            let _held = held;
+            operation(path)
+        })
+        .await
+    }
 }
 
 impl UserPatchStore {
@@ -127,28 +168,93 @@ impl UserPatchStore {
     }
 
     pub async fn load(&self) -> Result<UserPatchDocument, String> {
-        self.transaction(|path| load_document(&path)).await
+        self.begin_edit().await?.load().await
     }
 
     pub async fn store(&self, document: &UserPatchDocument) -> Result<(), String> {
-        let document = document.clone();
-        self.transaction(move |path| save_document(&path, &document))
-            .await
+        self.begin_edit().await?.store(document).await
     }
 
-    async fn transaction<T: Send + 'static>(
-        &self,
-        operation: impl FnOnce(PathBuf) -> Result<T, String> + Send + 'static,
-    ) -> Result<T, String> {
+    pub async fn begin_edit(&self) -> Result<UserPatchEdit, String> {
         let guard = self.lock.clone().lock_owned().await;
         let path = self.path.clone();
         file_task(move || {
-            // 阻塞事务启动后不能取消；锁随事务结算，不随调用方取消等待释放。
-            let _guard = guard;
-            operation(path)
+            // 阻塞等待 OS 锁不占用 Tokio 工作线程；调用者取消后结果自动释放。
+            let file = acquire_file_lock(&path)?;
+            Ok(UserPatchEdit {
+                path,
+                held: Arc::new(HeldEdit {
+                    _process: guard,
+                    _file: file,
+                }),
+            })
         })
         .await
     }
+}
+
+fn ensure_parent(path: &Path) -> Result<&Path, String> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut directory = fs::DirBuilder::new();
+    directory.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        directory.mode(0o700);
+    }
+    directory
+        .create(parent)
+        .map_err(|error| format!("无法创建 user patch 目录：{error}"))?;
+    Ok(parent)
+}
+
+fn acquire_file_lock(path: &Path) -> Result<fs::File, String> {
+    let parent = ensure_parent(path)?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| "user patch 路径没有文件名".to_owned())?;
+    let mut lock_name = std::ffi::OsString::from(".");
+    lock_name.push(name);
+    lock_name.push(".lock");
+    let lock_path = parent.join(lock_name);
+    // 不截断现有锚点，不允许符号链接或非普通文件作为锁。
+    match fs::symlink_metadata(&lock_path) {
+        Ok(metadata) if !metadata.is_file() => return Err("user patch 锁必须是普通文件".into()),
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("无法检查 user patch 锁：{error}")),
+    }
+    let mut options = fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options
+        .open(&lock_path)
+        .map_err(|error| format!("无法打开 user patch 锁：{error}"))?;
+    let metadata = fs::symlink_metadata(&lock_path)
+        .map_err(|error| format!("无法检查 user patch 锁：{error}"))?;
+    if !metadata.is_file() {
+        return Err("user patch 锁必须是普通文件".into());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let opened = file
+            .metadata()
+            .map_err(|error| format!("无法检查 user patch 锁句柄：{error}"))?;
+        if metadata.dev() != opened.dev() || metadata.ino() != opened.ino() {
+            return Err("user patch 锁文件在打开期间被替换".into());
+        }
+    }
+    file.lock()
+        .map_err(|error| format!("无法锁定 user patch：{error}"))?;
+    Ok(file)
 }
 
 fn load_document(path: &Path) -> Result<UserPatchDocument, String> {
@@ -180,24 +286,10 @@ fn save_document(path: &Path, document: &UserPatchDocument) -> Result<(), String
             Err(error) => Err(format!("无法清除 user patch {}: {error}", path.display())),
         }
     } else {
-        let parent = path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
+        let parent = ensure_parent(path)?;
         let name = path
             .file_name()
             .ok_or_else(|| "user patch 路径没有文件名".to_owned())?;
-        let mut directory = fs::DirBuilder::new();
-        directory.recursive(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            // 只限制本次创建的目录，不修改已有共享父目录权限。
-            directory.mode(0o700);
-        }
-        directory
-            .create(parent)
-            .map_err(|error| format!("无法创建 user patch 目录：{error}"))?;
         let mut document = document.clone();
         document.version = USER_PATCH_VERSION;
         let text = toml::to_string_pretty(&document)
@@ -264,20 +356,27 @@ mod tests {
         let writer = tokio::spawn({
             let store = store.clone();
             async move {
-                store
-                    .transaction(move |path| {
-                        started.send(()).unwrap();
-                        barrier.recv().unwrap();
-                        save_document(&path, &document())
-                    })
-                    .await
+                let edit = store.begin_edit().await.unwrap();
+                edit.transaction(move |path| {
+                    started.send(()).unwrap();
+                    barrier.recv().unwrap();
+                    save_document(&path, &document())
+                })
+                .await
             }
         });
         ready.await.unwrap();
+        let anchor = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(dir.path().join(".user.toml.lock"))
+            .unwrap();
         assert!(store.lock.try_lock().is_err());
+        assert!(anchor.try_lock().is_err());
         writer.abort();
         assert!(writer.await.unwrap_err().is_cancelled());
         assert!(store.lock.try_lock().is_err());
+        assert!(anchor.try_lock().is_err());
         release.send(()).unwrap();
         // load 必须等待前一事务完成；完成后读到已落盘值，而不是并发读取半成品。
         let loaded = store.load().await.unwrap();
@@ -285,6 +384,123 @@ mod tests {
             loaded.config_for("demo").unwrap()["token"].as_str(),
             Some("secret")
         );
+        anchor.try_lock().unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn independent_stores_serialize_complete_read_modify_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("user.toml");
+        let first = UserPatchStore::new(&path);
+        let second = Arc::new(UserPatchStore::new(&path));
+        let edit = first.begin_edit().await.unwrap();
+        let mut first_document = edit.load().await.unwrap();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let other = tokio::spawn(async move {
+            started.send(()).unwrap();
+            let edit = second.begin_edit().await.unwrap();
+            let mut doc = edit.load().await.unwrap();
+            doc.upsert_disabled("second", "demo", Some(true));
+            edit.store(&doc).await.unwrap();
+        });
+        // 在单线程 runtime 上，等待文件锁不得阻止该任务继续运行。
+        ready.await.unwrap();
+        first_document.upsert_disabled("first", "demo", Some(true));
+        edit.store(&first_document).await.unwrap();
+        drop(edit);
+        other.await.unwrap();
+        let doc = first.load().await.unwrap();
+        assert_eq!(doc.disabled_for("first"), Some(true));
+        assert_eq!(doc.disabled_for("second"), Some(true));
+        assert!(dir.path().join(".user.toml.lock").is_file());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancelled_lock_waiter_releases_lock_after_acquisition() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("user.toml");
+        let holder = UserPatchStore::new(&path);
+        let store = UserPatchStore::new(&path);
+        let edit = holder.begin_edit().await.unwrap();
+        {
+            let waiting = store.begin_edit();
+            tokio::pin!(waiting);
+            // 首次轮询开始阻塞锁任务后立即取消，不依赖固定睡眠。
+            tokio::select! {
+                biased;
+                result = &mut waiting => panic!("排他锁未生效：{result:?}"),
+                () = std::future::ready(()) => {},
+            }
+            assert!(store.lock.try_lock().is_err());
+        }
+        drop(edit);
+        // 被取消任务最终取得的句柄必须自动关闭，否则该次读取永久阻塞。
+        assert_eq!(store.load().await.unwrap(), UserPatchDocument::empty());
+    }
+
+    #[test]
+    fn child_process_lock_holder() {
+        let Some(path) = std::env::var_os("CORDIS_USER_LOCK_TEST_PATH") else {
+            return;
+        };
+        let _lock = acquire_file_lock(Path::new(&path)).unwrap();
+        use std::io::Read;
+        println!("user-lock-acquired");
+        std::io::stdout().flush().unwrap();
+        // 父进程杀死子进程，验证 OS 自动释放，而非依赖 Rust Drop。
+        let mut byte = [0];
+        std::io::stdin().read_exact(&mut byte).unwrap();
+    }
+
+    #[test]
+    fn os_lock_is_exclusive_across_processes_and_released_on_exit() {
+        use std::io::BufRead;
+        use std::process::{Command, Stdio};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("user.toml");
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "user_patch::tests::child_process_lock_holder",
+                "--nocapture",
+            ])
+            .env("CORDIS_USER_LOCK_TEST_PATH", &path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut output = std::io::BufReader::new(child.stdout.take().unwrap());
+        loop {
+            let mut line = String::new();
+            assert_ne!(
+                output.read_line(&mut line).unwrap(),
+                0,
+                "child exited before locking"
+            );
+            if line.contains("user-lock-acquired") {
+                break;
+            }
+        }
+        let anchor = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(dir.path().join(".user.toml.lock"))
+            .unwrap();
+        assert!(anchor.try_lock().is_err());
+        child.kill().unwrap();
+        child.wait().unwrap();
+        anchor.try_lock().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lock_anchor_rejects_symlinks_without_modifying_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim");
+        fs::write(&victim, "preserve").unwrap();
+        std::os::unix::fs::symlink(&victim, dir.path().join(".user.toml.lock")).unwrap();
+        assert!(acquire_file_lock(&dir.path().join("user.toml")).is_err());
+        assert_eq!(fs::read_to_string(victim).unwrap(), "preserve");
     }
 
     fn document() -> UserPatchDocument {

@@ -20,6 +20,7 @@ tokio = { workspace = true, features = ["sync"] }
 [dev-dependencies]
 async-trait.workspace = true
 cordis-plugin-include = { workspace = true }
+cordis-plugin-settings.workspace = true
 cordis-testkit.workspace = true
 schemars.workspace = true
 serde = { workspace = true }

@@ -30,6 +30,7 @@ pub(crate) struct DesiredNode {
     plugin: Option<Arc<dyn Plugin>>,
     plugin_key: Option<PluginKey>,
     binding: Option<Arc<dyn ConfigBinding>>,
+    resolved: Option<serde_json::Value>,
 }
 
 pub(crate) struct ReconcilePlan {
@@ -62,6 +63,7 @@ impl ReconcilePlan {
 }
 
 struct TreeCommit {
+    resolved: Option<serde_json::Value>,
     state: Arc<crate::prepared::TreeState>,
     fiber_id: u64,
     binding: Arc<dyn ConfigBinding>,
@@ -74,6 +76,7 @@ struct TreeCommit {
 }
 
 struct HotCommit {
+    resolved: Option<serde_json::Value>,
     fiber_id: u64,
     binding: Arc<dyn ConfigBinding>,
     commit: Box<dyn FnOnce() + Send>,
@@ -204,6 +207,12 @@ impl RuntimeTree {
                 update.source.context(&update.tree.owner)?;
                 *update.tree.source.lock().expect("source") = Some(update.source);
                 (update.commit)();
+                self.entries
+                    .lock()
+                    .expect("entries")
+                    .get_mut(&path)
+                    .expect("validated source entry")
+                    .resolved = update.resolved;
                 update.state.dirty.store(false, Ordering::Release);
                 self.log_reload(
                     &path,
@@ -225,7 +234,7 @@ impl RuntimeTree {
 
         // 所有生命周期成功后才提交热值，不等待业务订阅者。
         for (path, hot) in plan.hot {
-            let entries = self.entries.lock().expect("entries");
+            let mut entries = self.entries.lock().expect("entries");
             let current = entries.get(&path);
             let valid = !self.owner.is_disposed()
                 && current.is_some_and(|entry| {
@@ -246,7 +255,9 @@ impl RuntimeTree {
                     message: format_panic_message("hot config commit", payload),
                 }
             })?;
-            let factory = current.expect("validated hot entry").factory.clone();
+            let entry = entries.get_mut(&path).expect("validated hot entry");
+            entry.resolved = hot.resolved;
+            let factory = entry.factory.clone();
             drop(entries);
             if let Some(factory) = factory {
                 self.log_reload(&path, &factory);
@@ -343,6 +354,7 @@ impl RuntimeTree {
             // 成功返回（包括 Pending）或已进入候选 apply 才切换绑定。
             if replace_result.is_ok() || replacement.applied.load(Ordering::Acquire) {
                 entry.binding = node.binding.clone();
+                entry.resolved = node.resolved.clone();
             }
             if fiber.is_disposed() {
                 entry.binding = None;
@@ -489,6 +501,7 @@ impl RuntimeTree {
                 factory: (!node.options.group).then(|| node.options.name.clone()),
                 options: node.options.clone(),
                 binding: enabled.then(|| node.binding.clone()).flatten(),
+                resolved: enabled.then(|| node.resolved.clone()).flatten(),
             },
         );
         drop(entries);
@@ -570,6 +583,7 @@ fn index_entries(
                 plugin: None,
                 plugin_key: None,
                 binding: None,
+                resolved: None,
             },
         );
     }
@@ -881,7 +895,10 @@ pub(crate) async fn build_plan_plugins(
             } else {
                 factory.prepare(&node.options.config)?
             };
-            candidate.resolve(current.and_then(|entry| entry.binding.as_ref()))
+            let resolved = candidate.resolved();
+            candidate
+                .resolve(current.and_then(|entry| entry.binding.as_ref()))
+                .map(|outcome| (outcome, resolved))
         }))
         .map_err(|payload| LoaderError::FactoryPanic {
             message: format_panic_message("extension factory prepare/construct", payload),
@@ -891,6 +908,8 @@ pub(crate) async fn build_plan_plugins(
             factory: node.options.name.clone(),
             message: error.to_string(),
         })?;
+        let (result, resolved) = result;
+        node.resolved = resolved.clone();
         let (plugin, binding) = match result {
             PreparedOutcome::TreeUpdate {
                 binding,
@@ -941,6 +960,7 @@ pub(crate) async fn build_plan_plugins(
                 plan.tree_updates.insert(
                     path.clone(),
                     TreeCommit {
+                        resolved,
                         state,
                         fiber_id,
                         binding,
@@ -963,6 +983,7 @@ pub(crate) async fn build_plan_plugins(
                     plan.hot.insert(
                         path.clone(),
                         HotCommit {
+                            resolved,
                             fiber_id,
                             binding,
                             commit,
@@ -1126,6 +1147,7 @@ mod tests {
                 factory: None,
                 options: EntryOptions::group("blocked", vec![]).unwrap(),
                 binding: None,
+                resolved: None,
             },
         );
         let path = EntryId::from("blocked:child");
@@ -1138,6 +1160,7 @@ mod tests {
                 plugin: None,
                 plugin_key: None,
                 binding: None,
+                resolved: None,
             },
         )]);
         for _ in 0..2 {

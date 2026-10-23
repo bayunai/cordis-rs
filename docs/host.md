@@ -22,9 +22,10 @@ Loader 挂载后即为空树 Active；启动条目与运行期条目统一使用
 
 ## 配置树
 
-Host 用 `include_root_entry` 直挂根 v3 文档（约定名 `cordis.toml`）。产品路径常为空根，
-业务 Entry 由 config-editor 的 deploy ∘ user ∘ home 经 Include `patches` 同步；测试与示例也可把
-条目直接写进该文件。文档结构：
+Host 直挂根 v3 文档（约定名 `cordis.toml`）。不分层时用 `include_root_entry`；
+产品分层启动先调用 `prepare_root_include(path, &config).await`，将 deploy ∘ user ∘ home
+作为完整 Include `patches` 交给 `loader.create()`。ConfigEditor 本身不负责初次挂载；
+测试与示例也可把条目直接写进该文件。文档结构：
 
 ```toml
 # cordis.toml
@@ -185,9 +186,18 @@ Loader **不**提供 `describe_config` / `mutate_config`；表单只走 `SETTING
 **user** 层；库存与启停走 `PLUGIN_MANAGER`（内部仍调 `CONFIG_EDITOR.set_enabled`）。
 运维整表写回走 `CONFIG_EDITOR.commit_source`（其下为 `commit_entry_config`）。
 
+分层启动使用同一个 `ConfigEditorConfig`：先 `prepare_root_include(path, &config).await?`，
+再 `loader.create(entry, None, None).await?`，最后挂载 `ConfigEditorPlugin::new(config)`。
+组合函数只读取配置并生成声明；非法层文档或 Loader 预检错误明确返回。
+Include 初次加载中的业务生命周期失败保留为 Failed 条目，不使其后的编辑、设置、管理服务失效。
+ConfigEditor 的 `apply()` 只注册服务，不执行隐式同步或重试；后续用户编辑的生命周期失败仍返回错误。
+
 `settings.describe(path).await` 返回 `EntryConfigView`：完整路径、Factory ID、管理 Schema、
-脱敏 `base` / `user` / `value`（effective）、秘密字段存在状态与 `ConfigRevision`。
-`base` 为有序 deploy patch 组成结果；`user` 为本机覆盖；`value` = deploy ∘ user ∘ home。
+脱敏 `base` / `user` / `config` / `value`、秘密字段存在状态与 `ConfigRevision`。
+`base` 为有序 deploy patch 组成结果；`user` 为本机覆盖；`config` = deploy ∘ user ∘ home 的 raw 配置。
+`value: Option<serde_json::Value>` 来自 Active 实例实际接受的类型解析快照，含 Serde 默认值；
+非 Active 明确为 `None`。Factory 的 Config 需 `Serialize`，读取快照不重新解析或调用 prepare。
+默认值不写回 raw config，Settings 字段操作仍作用于 `config`，而不是运行值。
 Group 仅是树结构，不提供配置表单。Schema 来自静态 Catalog，因此禁用、Pending、Failed 条目
 都能描述；读取不会反序列化或构造插件，也不会要求缺失必填字段的禁用条目先启用。
 
@@ -209,6 +219,9 @@ user 文档写回。Host 须注入有序 `deploy_patch_paths`、`user_patch_path
 reload 也使用该准入边界。事务回调只能使用传入的 `ConfigTransaction` 执行受控读写，
 不得递归调用普通变更接口；事务不是业务副作用回滚。取消等待后仍结算，
 `await_idle()` 等待该边界。不同 Loader 实例之间不共享锁。
+跨 Loader / 进程通过 user 文件的 OS 排他锁协调，覆盖完整读改写及失败恢复；锁锚点持久保留。
+磁盘层与当前 Loader 已加载 patches 不同则拒绝写入；调用方显式 `CONFIG_EDITOR.reload().await`
+刷新后重新读取描述，不自动重试旧表单。文件锁只约束遵守协议的写入者。
 ConfigEditor 的文件读取、解析和写入在完整阻塞任务内执行；patch 文件读取 API 必须 `.await`。
 
 表单路径约定为「先原子写 user，再 reconcile」；校验或应用失败回滚 user 文档。

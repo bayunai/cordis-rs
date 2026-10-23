@@ -74,6 +74,7 @@ impl Plugin for TreePlugin {
 /// 捕获的配置和依赖必须由闭包拥有，业务校验应在 Factory 的 `prepare()` 中完成。
 pub struct PreparedExtension {
     inner: Box<dyn PreparedConfig>,
+    resolved: Option<serde_json::Value>,
 }
 
 impl PreparedExtension {
@@ -87,6 +88,7 @@ impl PreparedExtension {
         Fut: Future<Output = Result<Arc<dyn EntryTreeSource>, SourceError>> + Send + 'static,
     {
         Self {
+            resolved: None,
             inner: Box::new(TreePrepared {
                 key,
                 settings,
@@ -100,6 +102,7 @@ impl PreparedExtension {
         build: impl FnOnce() -> Result<Arc<dyn Plugin>, LoaderError> + Send + 'static,
     ) -> Self {
         Self {
+            resolved: None,
             inner: Box::new(Ordinary(build)),
         }
     }
@@ -115,12 +118,22 @@ impl PreparedExtension {
         L: PartialEq + Send + Sync + 'static,
     {
         Self {
+            resolved: None,
             inner: Box::new(Volatile {
                 settings,
                 live,
                 build,
             }),
         }
+    }
+
+    pub(crate) fn with_resolved(mut self, resolved: serde_json::Value) -> Self {
+        self.resolved = Some(resolved);
+        self
+    }
+
+    pub(crate) fn resolved(&self) -> Option<serde_json::Value> {
+        self.resolved.clone()
     }
 
     pub(crate) fn resolve(

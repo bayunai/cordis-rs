@@ -62,8 +62,12 @@ pub struct EntryConfigSnapshot {
     pub factory: String,
     /// Catalog 登记的 Schema，未经秘密投影。
     pub schema: serde_json::Value,
+    pub resolved_schema: serde_json::Value,
     /// 已加载的原始声明，可含秘密。
     pub config: toml::Value,
+    /// 当前 Active 实例实际解析的值（包括 Serde 默认值），可含明文秘密。
+    /// 禁用、Pending、Failed 或尚未安装实例时为 None；读取不会重新解析配置。
+    pub resolved: Option<serde_json::Value>,
     pub revision: ConfigRevision,
 }
 
@@ -173,11 +177,26 @@ fn view(
         .into_iter()
         .find(|f| f.id == entry.name)
         .ok_or(LoaderControlError::ConfigNotEditable)?;
+    let path = full_path(tree, local);
+    let resolved = tree
+        .entries
+        .lock()
+        .expect("entries")
+        .get(&path)
+        .and_then(|entry| {
+            entry
+                .fiber
+                .as_ref()
+                .filter(|fiber| fiber.state() == cordis_core::FiberState::Active)?;
+            entry.resolved.clone()
+        });
     Ok(EntryConfigSnapshot {
-        path: full_path(tree, local),
+        path,
         factory: entry.name.clone(),
         schema: descriptor.schema,
+        resolved_schema: descriptor.resolved_schema,
         config: entry.config.clone(),
+        resolved,
         revision: tree.config_revision(),
     })
 }

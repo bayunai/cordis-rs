@@ -10,12 +10,12 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use std::{error::Error, fs, sync::Arc};
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(serde::Serialize, Deserialize, JsonSchema)]
 struct Config {
     address: String,
     live: Limits,
 }
-#[derive(Deserialize, JsonSchema, PartialEq)]
+#[derive(serde::Serialize, Deserialize, JsonSchema, PartialEq)]
 struct Limits {
     rate_limit: u32,
     timeout_ms: u64,

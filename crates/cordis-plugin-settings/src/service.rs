@@ -45,9 +45,11 @@ impl SettingsService {
             path: layers.path.clone(),
             factory: layers.factory.clone(),
             schema: layers.schema.clone(),
+            resolved_schema: layers.resolved_schema.clone(),
             base: layers.base.clone(),
             user: Some(config.clone()),
             effective: config.clone(),
+            resolved: None,
             revision: layers.revision,
         })?;
         let committed = self.editor.edit(path, expected, config).await?;

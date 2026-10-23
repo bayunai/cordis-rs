@@ -12,7 +12,7 @@ use crate::keys::{HTTP, KEY_HTTP};
 use crate::url_redact::redact_url;
 
 /// Loader 可替换配置；仅改 label 时应走 `Fiber::replace` 且保留 Fiber ID。
-#[derive(Clone, Debug, serde::Deserialize, schemars::JsonSchema)]
+#[derive(serde::Serialize, Clone, Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct HttpConfig {
     #[serde(default = "default_http_label")]
     pub label: String,

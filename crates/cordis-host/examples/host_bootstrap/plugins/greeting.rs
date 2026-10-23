@@ -10,7 +10,7 @@ pub static GREETING: ServiceKey<Greeting> = ServiceKey::new("demo.host.greeting@
 #[derive(Debug)]
 pub struct Greeting(pub String);
 
-#[derive(Deserialize, JsonSchema)]
+#[derive(serde::Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct GreetingConfig {
     message: String,

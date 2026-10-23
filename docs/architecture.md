@@ -24,15 +24,16 @@
 
 宿主在代码中显式构造根 Include，指向本地可人工恢复的根文档（约定 `cordis.toml`）。
 不再经独立 bootstrap 配方文件间接指向扩展清单。产品路径常挂空根，业务 Entry 由
-config-editor 的 deploy ∘ user ∘ home 组成；见 [config-surface.md](config-surface.md)。
+独立启动组合函数的 deploy ∘ user ∘ home 组成；见 [config-surface.md](config-surface.md)。
 
 ```text
 应用入口构造 LoaderPlugin::new(catalog)
   → root.plugin(LoaderPlugin)
-  → Include.include_root_entry("include", cordis.toml) 构造显式根 Include 声明
+  → 分层应用 await prepare_root_include(cordis.toml, &config)，或直接 include_root_entry(id, path)
   → await loader.create(entry, None, None)
   → include Include 读取文件、提供来源上下文与文件版本
   → Loader 预检文件条目并收敛为 include:* 子树
+  → 显式挂载 ConfigEditor / Settings / PluginManager；服务挂载不再协调业务树
 ```
 
 - 根 Include 的 `path` 须为绝对路径（`include_root_entry` 负责解析）；嵌套 Include 相对于所属文件目录。
