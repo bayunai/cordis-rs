@@ -1,11 +1,17 @@
 # `cordis-loader`：静态 EntryTree Host
 
 `cordis-host` 只创建和关闭 Runtime。`cordis-loader` 的 `LoaderPlugin` 是应用显式挂载的
-普通插件：它从静态 Catalog 构造业务插件，并把 `extensions.toml` 收敛为一棵可管理的 EntryTree。
+普通插件：它从静态 Catalog 构造业务插件，并把配置声明收敛为一棵可管理的 EntryTree。
+Loader 根树只在内存中；根文件和嵌套文件均由显式登记的 Include 来源树承载。
 
 ```rust
 let host = CordisHost::new()?;
-let plugin = LoaderPlugin::bootstrap(build_catalog()?, "bootstrap.toml")?;
+let mut catalog = build_catalog()?;
+catalog.register(cordis_plugin_include::IncludeFactory)?;
+let plugin = LoaderPlugin::new(catalog, ExtensionsConfig {
+    version: CONFIG_VERSION,
+    extensions: vec![cordis_plugin_include::bootstrap_entry("include", "bootstrap.toml")?],
+})?;
 let _loader_fiber = host.root().plugin(Arc::new(plugin)).await?;
 let loader = host.root().get(LOADER)?;
 ```
@@ -14,7 +20,7 @@ let loader = host.root().get(LOADER)?;
 
 ## 配置树
 
-`bootstrap.toml` 与扩展清单都使用 v3：
+Include 读取 `bootstrap.toml`，将相对文件路径解析为绝对路径。启动文件与扩展清单都使用 v3：
 
 ```toml
 # bootstrap.toml
@@ -56,16 +62,16 @@ disabled = true
 
 普通条目使用 `id`、`name`、`config`、`disabled` 与可选 `inject` / `isolate`。Group 必须使用保留
 `name = "cordis:group"` 和 `group = true`，其 `config` 是子条目数组。路径以 `:` 拼接，以上
-示例的导出器路径为 `infrastructure:reports:exporter`。
+示例的导出器路径为 `include:infrastructure:reports:exporter`；文件内 ID 仍是原来的局部 ID。
 
 **Group vs Include：**
 
 | | Group | Include（`cordis-plugin-include`） |
 | --- | --- | --- |
-| 子项存放 | 内联在父条目 `config` 数组 | 独立 v3 `ExtensionsConfig` TOML 文件 |
+| 子项存放 | 内联在父条目 `config` 数组 | 独立 v3 TOML／JSON／YAML 文档 |
 | 注册 | Loader 内建 | Catalog 显式 `register(IncludeFactory)` |
-| 持久化 | 写回父树文件 | 只写回 Include 自己的文件 |
-| 重载 | 根 `Loader::reload()` | `loader.subtree("path")?.reload()` |
+| 持久化 | 由所属树来源决定；内存树不落盘 | 只写回 Include 自己的文件 |
+| 重载 | 重载所属来源树 | `loader.subtree("include:reports")?.reload()` |
 
 旧平面 v1 与 v2 不再被读取；需将配置显式迁移到 v3。
 
@@ -75,6 +81,7 @@ disabled = true
 `Loader::factories()` 返回业务 Factory 的 JSON Schema。
 
 所有包统一使用 `register()`，Factory 的 `prepare()` 返回普通或热配置预备结果。
+Include 使用专用的 `PreparedExtension::tree()` 来源树载体结果，不修改 Core 生命周期接口。
 完整输入 Schema 供管理界面使用；`ConfigRef`、revision 和写入端不进入 TOML 或 Schema。
 普通插件不声明空热配置；只有 `PreparedExtension::volatile()` 创建热绑定。
 所有根树和 Include 子树的 `update/reload` 都经过相同的预检与局部 reconcile。
@@ -154,9 +161,11 @@ Group **只**组织 EntryTree / 生命周期 / 父子 Context，**不再** `exte
 ## 管理 API 与可见性
 
 `Loader` 提供 `entries()`、`factories()`、`injections()`、`isolations()`、`subtree()`、
-`attach_file_subtree()`、`create()`、`update()`、`remove()`、`reload()` 和 `await_idle()`。
-根控制面的 `create` / `update` / `remove` / `reload` 只操作根树；Include 内部用
-`LoaderSubtree`（`loader.subtree("reports")`）。`create` / `update` 接收父 Group 路径与位置；
+`attach_subtree()`、`create()`、`update()`、`remove()`、`reload()` 和 `await_idle()`。
+`attach_subtree()` 接收通用 `EntryTreeSource`，不接收文件路径。根控制面的 CRUD 只操作内存根树，
+不写文件；内存根没有来源可 reload。Include 文件内部用 `LoaderSubtree`
+（`loader.subtree("include")` 或 `loader.subtree("include:reports")`），并传入该文件内的局部路径。
+`create` / `update` 接收父 Group 路径与位置；
 `update` 可以移动条目，移动按「旧路径后序释放 → 新路径前序挂载」处理（不做隐式原地迁移）。
 **跨树移动一律拒绝**（`CrossTreeMove`）。
 
@@ -172,7 +181,8 @@ Loader reconcile 是**局部**的：仅创建、删除、移动、启停或配�
 
 `Loader::describe_config(path).await` 返回 `EntryConfigView`：完整路径、Factory ID、
 管理 Schema、脱敏配置、秘密字段存在状态与 `ConfigRevision`。根控制面接受完整路径并自动
-定位 Include 的所属文件；`LoaderSubtree` 的同名方法接受子树局部路径。Group 仅是树结构，
+定位所属来源树；`LoaderSubtree` 的同名方法接受子树局部路径。文件写回由 Include 提供。
+返回配置是原始声明的脱敏值，不展开类型默认值或配置继承。Group 仅是树结构，
 不提供配置表单。Schema 来自静态 Catalog，因此禁用、Pending、Failed 条目都能描述；
 读取不会反序列化或构造插件，也不会要求缺失必填字段的禁用条目先启用。
 
@@ -186,7 +196,7 @@ Loader reconcile 是**局部**的：仅创建、删除、移动、启停或配�
 
 版本令牌包含随机树实例身份与协调代次，支持 `Display` / `FromStr`，不代表授权。
 应用负责自己的 HTTP DTO、身份验证和权限检查。版本检查失败返回
-`ConfigRevisionConflict`，外部文件改变返回 `ConfigConflict`。所属树的协调一旦启动，
+`ConfigRevisionConflict`，外部来源改变返回明确的来源冲突。所属树的协调一旦启动，
 即使生命周期失败或写回失败，也会让旧令牌失效；同树无关条目的修改也会导致保守冲突。
 重新读取描述后再编辑，不自动重试写操作。配置读取与写入使用同一操作锁，读取不会混合
 本轮提交前的配置与提交后的版本。Include 释放后保留的旧控制句柄不可使用。
@@ -213,7 +223,7 @@ Schema，不能原样发送到浏览器。新接口不会把反序列化、prepa
 错误文本作为表单校验错误返回；插件仍不得在生命周期错误、panic、日志或 Schema 文字
 说明中拼接秘密。Loader 无法替业务代码清洗任意日志或进程 panic hook 输出。
 
-可运行示例：`cargo run -p cordis-loader --example config_control`。示例使用临时文件，
+可运行示例：`cargo run -p cordis-plugin-include --example config_control`。示例使用临时文件，
 演示禁用实例先配置、Token 脱敏与应用层版本字符串往返，不启动 HTTP 服务。
 
 ## Include（可选 crate）
@@ -232,20 +242,23 @@ name = "cordis:include"
 path = "reports.toml"   # 相对父配置文件目录；或绝对路径
 ```
 
-`reports.toml` 必须是完整 v3 `ExtensionsConfig`。子条目完整路径形如 `reports:importer`。
-外部改动 Include 文件后必须 `loader.subtree("reports")?.reload()`；首版无文件监听、YAML/JSON、
-patches 或 HMR。重复附着同一规范化文件路径、Include 祖先循环引用会在挂载前失败。
+`reports.toml` 必须是完整 v3 `ExtensionsConfig`。若上述条目位于根 include 文件树，子条目完整路径为
+`include:reports:importer`。外部改动文件后使用 `loader.subtree("include:reports")?.reload()`。
+Include 支持 TOML／JSON／YAML、显式 initial 和 patches，不提供自动监听或代码 HMR。
+规范化路径确定来源身份，符号链接别名也视为同一文件；重复来源与祖先循环明确失败。
+文件路径、初始文件创建、0600 原子写回及完整迁移说明见 [Include 文件配置树](include.md)。
 
 应用读取某一条目视图上的服务时使用路径：
 
 ```rust
-let database = loader.entry_context("infrastructure:database")?.get(DATABASE)?;
+let database = loader.entry_context("include:infrastructure:database")?.get(DATABASE)?;
 ```
 
 同一服务域（或同一命名 isolate 槽）内的兄弟条目共享可见性，因此也可以从任一同域
 `entry_context` 解析到该域内已 `Active` 的 Provider。
 
-文件来源的变更先完成树预检与 reconcile，再原子写回完整 TOML。预检失败（未知 Factory、
+文件来源的变更先完成文件版本及写回往返检查、树预检与 reconcile，再委托 Include 原子写回。
+不把有效树反向拆成基础层，也不另存用户 patch。预检失败（未知 Factory、
 `FactoryChanged`、`PluginKeyChanged`、无效 inject/isolate、非 v3 等）零运行时变更。生命周期失败
 不回滚已触及节点、不提交 `desired`/revision、不由 Loader 发起写回；无关 Entry 继续运行。
 本轮继续尝试其他独立条目，逐项记录业务生命周期错误，控制调用返回首个错误；有失败时不提交待更新热值。
@@ -254,7 +267,7 @@ let database = loader.entry_context("infrastructure:database")?.get(DATABASE)?;
 配置、Factory 预检和内部协调错误仍明确报错；父挂载上下文无效时停止其后代挂载，不转挂到根节点。
 失败后的 `LoaderSnapshot` 仍包含实际已插入的 Failed/Pending 节点，即使该次 reconcile
 尚未来得及提交目标排序；对同一外部配置再次 `reload()` 会重试失败的启用 Entry。
-文件被外部修改时返回 `ConfigConflict`；写回失败返回带已生效 `LoaderSnapshot` 的 `Persist`。
+来源被外部修改时返回明确冲突；写回失败返回带已生效 `LoaderSnapshot` 的 `Persist`。
 `await_idle()` 等待 Loader 自己的本次 reconcile，以及 EntryTree 受管 Fiber 的 Loading / Unloading 收敛；不等待 Runtime 上与本 Loader 无关的工作，也不等待仍缺依赖的 Pending。
 它返回实际状态，包括 Failed/Pending；业务生命周期错误由发起变更的返回值、条目诊断及日志报告。
 Loader 关闭及内部协调错误仍返回错误。应用可另外检查自身必需条目的 Active 状态，决定是否继续启动。

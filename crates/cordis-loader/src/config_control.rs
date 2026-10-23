@@ -1,8 +1,7 @@
 //! 面向管理客户端的配置描述、乐观并发与字段操作。原始配置仍由 Loader 持有。
 use crate::{
     EntryId, EntryOptions, EntryUpdate, LoaderControlError, PreparedExtension,
-    bootstrap::write_extensions,
-    loader::{patch_entry, source_path_tree},
+    loader::{commit_tree_locked, patch_entry},
     tree::{RuntimeTree, ensure_tree_revision_control},
 };
 use std::{
@@ -129,8 +128,7 @@ async fn mutate_owned(
     if expected != tree.config_revision() {
         return Err(LoaderControlError::ConfigRevisionConflict);
     }
-    let path = source_path_tree(tree)?;
-    ensure_tree_revision_control(tree, &path)?;
+    ensure_tree_revision_control(tree)?;
     let mut target = tree.desired.lock().expect("desired").clone();
     let mut entry = find(&target.extensions, local)?;
     if entry.group {
@@ -156,28 +154,17 @@ async fn mutate_owned(
         },
     )?;
     let full = full_path(tree, local);
-    let snapshot = tree
-        .apply_prepared(target.clone(), None, Some((full, prepared)))
+    commit_tree_locked(tree, target, Some((full, prepared)))
         .await
         .map_err(|error| match error {
             // Factory 构造、比较及 PluginKey 预检也不能通过错误回显配置。
-            crate::LoaderError::FactoryPanic { .. }
-            | crate::LoaderError::PluginBuild { .. }
-            | crate::LoaderError::PluginPanic { .. } => LoaderControlError::ConfigValidation,
-            other => LoaderControlError::Loader(other),
+            LoaderControlError::Loader(
+                crate::LoaderError::FactoryPanic { .. }
+                | crate::LoaderError::PluginBuild { .. }
+                | crate::LoaderError::PluginPanic { .. },
+            ) => LoaderControlError::ConfigValidation,
+            other => other,
         })?;
-    // 沿用 Loader 的运行时优先语义：写回失败不回滚已生效的 Fiber 或热快照。
-    // 调用方必须按 Persist 处理并重新读取，不可将错误视为“从未执行”。
-    match write_extensions(&path, &target) {
-        Ok(revision) => *tree.revision.lock().expect("revision") = Some(revision),
-        Err(error) => {
-            return Err(LoaderControlError::Persist {
-                snapshot: Box::new(snapshot),
-                path,
-                message: error.to_string(),
-            });
-        }
-    }
     describe_locked(tree, local)
 }
 
@@ -230,7 +217,7 @@ fn ensure_available(tree: &Arc<RuntimeTree>, local: &str) -> Result<(), LoaderCo
         .expect("loader weak")
         .upgrade()
         .ok_or(LoaderControlError::LoaderUnavailable)?;
-    if !loader.alive.load(Ordering::Acquire) {
+    if !loader.alive.load(Ordering::Acquire) || tree.closing.load(Ordering::Acquire) {
         return Err(LoaderControlError::LoaderUnavailable);
     }
     if !tree.prefix.as_str().is_empty()

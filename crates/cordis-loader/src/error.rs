@@ -1,7 +1,7 @@
 //! [`LoaderError`]：配置、工厂目录与编排失败契约。
 
 use cordis_core::{CoreError, PluginKey};
-use std::{any::Any, io, path::PathBuf};
+use std::any::Any;
 
 /// 将扩展边界捕获到的 panic 转换为可诊断、但不泄漏非字符串载荷的错误文本。
 pub(crate) fn format_panic_message(boundary: &str, payload: Box<dyn Any + Send>) -> String {
@@ -21,10 +21,11 @@ pub(crate) fn format_panic_message(boundary: &str, payload: Box<dyn Any + Send>)
 pub enum LoaderError {
     #[error("无法生成配置控制面的树实例标识")]
     ConfigIdentityUnavailable,
-    #[error("读取配置失败 {path}: {message}", path = path.display())]
-    Io { path: PathBuf, message: String },
-    #[error("解析配置失败 {path}: {message}", path = path.display())]
-    Toml { path: PathBuf, message: String },
+    #[error("配置来源失败: {source}")]
+    Source {
+        #[from]
+        source: crate::SourceError,
+    },
     #[error("不支持的配置版本 {found}，当前仅支持 3")]
     UnsupportedVersion { found: u32 },
     #[error("条目 {path} 重复")]
@@ -96,7 +97,7 @@ pub enum LoaderError {
         #[source]
         source: CoreError,
     },
-    #[error("未配置文件配置源；只能对 bootstrap 启动的 Loader 调用 reload")]
+    #[error("内存树没有可重载的配置来源")]
     NoConfigSource,
     #[error("Loader reconcile 正在执行；同一时刻只允许一个编排操作")]
     ReconcileBusy,
@@ -104,12 +105,10 @@ pub enum LoaderError {
     HotConfigStale { instance: String },
     #[error("Loader reconcile 协调器异常终止: {reason}")]
     ReconcileAborted { reason: String },
-    #[error("配置文件已被其他树附着: {path}", path = path.display())]
-    DuplicateSubtreeSource { path: PathBuf },
-    #[error("Include 配置文件形成循环引用: {path}", path = path.display())]
-    IncludeCycle { path: PathBuf },
-    #[error("相对 Include 路径需要所属树具备文件配置源目录")]
-    RelativePathWithoutSource,
+    #[error("配置来源已被其他树附着: {source_id}")]
+    DuplicateSubtreeSource { source_id: String },
+    #[error("配置来源形成祖先循环引用: {source_id}")]
+    SourceCycle { source_id: String },
     #[error("当前 Context 缺少 Loader 条目位置元数据")]
     EntryLocationMissing,
 }
@@ -130,20 +129,6 @@ impl LoaderError {
     pub fn invalid_config(message: impl Into<String>) -> Self {
         Self::InvalidConfig {
             message: message.into(),
-        }
-    }
-
-    pub(crate) fn io(path: PathBuf, source: io::Error) -> Self {
-        Self::Io {
-            path,
-            message: source.to_string(),
-        }
-    }
-
-    pub(crate) fn toml(path: PathBuf, source: toml::de::Error) -> Self {
-        Self::Toml {
-            path,
-            message: source.to_string(),
         }
     }
 }

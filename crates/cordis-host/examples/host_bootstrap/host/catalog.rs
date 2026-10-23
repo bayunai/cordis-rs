@@ -8,7 +8,7 @@ use crate::plugins::greeting::GreetingFactory;
 pub fn build_catalog() -> Result<ExtensionCatalog, LoaderError> {
     let mut catalog = ExtensionCatalog::new();
     catalog.register(GreetingFactory)?;
-    // 可选：嵌套 TOML EntryTree（默认不启用）。
-    // catalog.register(cordis_plugin_include::IncludeFactory)?;
+    // 根文件与嵌套文件都由显式 Include 条目承载；Loader 根树本身只保存在内存。
+    catalog.register(cordis_plugin_include::IncludeFactory)?;
     Ok(catalog)
 }

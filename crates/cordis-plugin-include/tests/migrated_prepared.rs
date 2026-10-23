@@ -178,11 +178,14 @@ impl Harness {
         let counts = Arc::new(Counts::default());
         let mut catalog = ExtensionCatalog::new();
         catalog.register(Factory(counts.clone())).unwrap();
+        catalog
+            .register(cordis_plugin_include::IncludeFactory)
+            .unwrap();
         let runtime = Runtime::new().unwrap();
         let fiber = runtime
             .root()
             .plugin(Arc::new(
-                LoaderPlugin::bootstrap(catalog, directory.path().join("bootstrap.toml")).unwrap(),
+                file_plugin(catalog, directory.path().join("bootstrap.toml")).unwrap(),
             ))
             .await
             .unwrap();
@@ -197,6 +200,8 @@ impl Harness {
     }
     async fn update(&self, mode: Mode, value: u32) -> Result<(), LoaderControlError> {
         self.loader
+            .subtree("include")
+            .unwrap()
             .update(
                 "a",
                 EntryUpdate {
@@ -264,7 +269,14 @@ async fn initial_factory_precheck_failure_still_fails_loader_without_applying_en
 async fn capability_and_binding_types_replace_but_hot_values_do_not_construct() {
     let h = Harness::new(Mode::Ordinary, false).await;
     let original = h.view();
-    let fiber_id = h.loader.await_idle().await.unwrap().entries[0].fiber_id;
+    let fiber_id = h
+        .loader
+        .await_idle()
+        .await
+        .unwrap()
+        .entry("include:a")
+        .unwrap()
+        .fiber_id;
     h.update(Mode::Ordinary, 2).await.unwrap();
     assert!(!Arc::ptr_eq(&original, &h.view()));
     assert_eq!(h.counts.builds.load(Ordering::SeqCst), 2);
@@ -307,7 +319,13 @@ async fn capability_and_binding_types_replace_but_hot_values_do_not_construct() 
     assert_eq!(h.counts.applies.load(Ordering::SeqCst), 6);
     assert_eq!(
         fiber_id,
-        h.loader.await_idle().await.unwrap().entries[0].fiber_id
+        h.loader
+            .await_idle()
+            .await
+            .unwrap()
+            .entry("include:a")
+            .unwrap()
+            .fiber_id
     );
     h.runtime.shutdown().await.unwrap();
 }
@@ -346,7 +364,13 @@ async fn prepare_construct_and_key_failures_are_zero_runtime_change() {
         assert_eq!(h.counts.applies.load(Ordering::SeqCst), 1);
         assert_eq!(fs::read_to_string(&file).unwrap(), text);
         assert_eq!(
-            h.loader.await_idle().await.unwrap().entries[0].state,
+            h.loader
+                .await_idle()
+                .await
+                .unwrap()
+                .entry("include:a")
+                .unwrap()
+                .state,
             Some(FiberState::Active)
         );
     }
@@ -360,6 +384,8 @@ async fn disabled_entry_does_not_prepare_or_construct() {
     assert_eq!(h.counts.builds.load(Ordering::SeqCst), 0);
     assert!(h.runtime.root().get(VIEW).is_err());
     h.loader
+        .subtree("include")
+        .unwrap()
         .update(
             "a",
             EntryUpdate {
@@ -391,4 +417,19 @@ async fn comparison_panic_is_rejected_before_any_runtime_or_file_change() {
     assert_eq!(h.counts.applies.load(Ordering::SeqCst), 1);
     assert_eq!(fs::read_to_string(path).unwrap(), file);
     h.runtime.shutdown().await.unwrap();
+}
+
+fn file_plugin(
+    catalog: ExtensionCatalog,
+    bootstrap: impl AsRef<std::path::Path>,
+) -> Result<LoaderPlugin, LoaderError> {
+    let entry = cordis_plugin_include::bootstrap_entry("include", bootstrap)
+        .map_err(|error| LoaderError::invalid_config(error.to_string()))?;
+    LoaderPlugin::new(
+        catalog,
+        ExtensionsConfig {
+            version: 3,
+            extensions: vec![entry],
+        },
+    )
 }

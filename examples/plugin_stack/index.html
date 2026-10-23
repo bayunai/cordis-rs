@@ -275,7 +275,7 @@
     <main>
       <h1>Loader 子树差分 Reconcile</h1>
       <p class="sub">
-        EntryTree：根级 <code>side</code> + Group <code>app</code>（<code>db → log-store → http</code>）。
+        EntryTree：<code>include</code> Include → <code>include:side</code> + Group <code>include:app</code>（<code>db → log-store → http</code>）。
         Log Store 订阅 Runtime Logger 落库；不提供 ServiceKey。
         操作只触及受影响子树；看表格里的 <code>fiber_id</code> 是否保持。
       </p>
@@ -300,12 +300,12 @@
       <div class="grid">
         <section class="card">
           <h2>Group / 启停</h2>
-          <p class="hint">禁用 <code>app</code>：后代后序释放，Group Fiber/Context 保留。</p>
+          <p class="hint">禁用 <code>include:app</code>：后代后序释放，Group Fiber/Context 保留。</p>
           <div class="row">
-            <button data-disable="app" data-val="true">禁用 app</button>
-            <button data-disable="app" data-val="false">启用 app</button>
-            <button data-disable="app:db" data-val="true">禁用 db</button>
-            <button data-disable="app:db" data-val="false">启用 db</button>
+            <button data-disable="include:app" data-val="true">禁用 app</button>
+            <button data-disable="include:app" data-val="false">启用 app</button>
+            <button data-disable="include:app:db" data-val="true">禁用 db</button>
+            <button data-disable="include:app:db" data-val="false">启用 db</button>
           </div>
         </section>
         <section class="card">
@@ -318,7 +318,7 @@
         </section>
         <section class="card">
           <h2>叶子删建</h2>
-          <p class="hint">删除 / 重建 <code>app:http</code>；观察 <code>side</code> Fiber ID。</p>
+          <p class="hint">删除 / 重建 <code>include:app:http</code>；观察 <code>include:side</code> Fiber ID。</p>
           <div class="row">
             <button id="btn-remove-http">删除 http</button>
             <button id="btn-create-http">重建 http</button>
@@ -593,7 +593,7 @@
               state: f ? f.state : "off",
               badge: f ? f.state : "off",
               box: fiberBox,
-              tipHtml: tipLines("side（根级旁路）", [
+              tipHtml: tipLines("include:side（文件树旁路）", [
                 f ? `id=#${f.id}` : "未挂载",
                 "app 子树变更时此 Fiber ID 应保持",
               ]),
@@ -783,7 +783,7 @@
 
       document.getElementById("btn-remove-http").onclick = async () => {
         try {
-          await api("/api/remove", { path: "app:http" });
+          await api("/api/remove", { path: "include:app:http" });
           await refresh();
         } catch (e) {
           alert(e.message);

@@ -1,18 +1,20 @@
 # Cordis Runtime Core 架构
 
-## 三层边界
+## 运行时与可选能力边界
 
 | 层 | 职责 | 本仓库位置 |
 | --- | --- | --- |
 | **Runtime 内核** | Context、Service、inject、Isolation、Fiber、Effect、Event、诊断 | `crates/cordis-core` |
-| **Loader** | 静态 Catalog、严格配置、reconcile 与管理服务 | `crates/cordis-loader` |
+| **Loader** | 静态 Catalog、内存条目树、预检、reconcile、热提交与通用来源接口 | `crates/cordis-loader` |
 | **应用 Host** | 创建 Runtime、显式挂载 LoaderPlugin、运行应用事件循环并受控关闭 | `crates/cordis-host`；应用再接入网络/持久化 |
 | **生命周期能力** | Timer / Console Logger 等须由 Host 显式挂载；不属于 Loader builtin | `cordis-plugin-timer`、`cordis-plugin-logger-console` |
-| **嵌套配置树** | 可选 Include：独立 TOML 附着为 Loader 子树；须 Catalog 显式注册 | `crates/cordis-plugin-include` |
+| **文件配置树** | 可选 Include：bootstrap、路径、TOML／JSON／YAML、patches、文件检查与写回；须 Catalog 显式注册 | `crates/cordis-plugin-include` |
 | **扩展** | 实现 `Plugin`，`provide` / `inject` / `on`，不触碰宿主内部类型 | 插件 crate |
 
 `cordis-core` **不包含** HTTP、数据库、Redis、JSON 配置、Manifest、WASM、网关或计时器语义。
-`cordis-loader` 首版只做进程内编排与文件配置源，不加载动态库、不提供管理后台。
+`cordis-loader` 只做进程内编排，不直接读写文件或解析文件格式，不加载动态库、不提供管理后台。
+`EntryTreeSource` 让树来源自行完成读取、来源版本检查和写回；Loader 只在统一提交边界调用它。
+文件实现全部由 Include 提供，根文件与嵌套文件使用相同来源模型，没有 Loader 特殊文件根。
 计时器由独立的 `cordis-plugin-timer` 提供：Host 在 Root 显式 `plugin(TimerPlugin)` 并保留 Fiber；业务插件通过静态 `inject([TIMER.id()])` 依赖，并在 `EffectContext` 上使用 `TimerExt`。
 
 结构化日志由 Core 内置的 Runtime 全局 `LoggerService` 提供（`ctx.logger()?`），**不经** `ServiceKey` / `isolate`，且**不过滤**等级——全部记录进入环形缓冲并分发给 exporter。等级阈值由各 exporter 自行解释（可参考记录上的 `default_level`，来自 `LOGGER_CONFIG.level`）。控制台输出由独立的 `cordis-plugin-logger-console` 挂载；无 Console 时 Logger 仍缓冲。
@@ -26,7 +28,7 @@
 启动文件只能包含已实现的启动锚点，不得承载应用、路由、策略或任意插件业务配置，
 也不得保存凭证明文。
 
-当前 `cordis-loader` 实现的锚点只有文件配置源：
+当前 `cordis-plugin-include` 提供的启动锚点只有文件来源：
 
 ```toml
 version = 3
@@ -38,13 +40,17 @@ path = "extensions.toml"
 
 ```text
 bootstrap.toml
-  → 应用入口构造 LoaderPlugin
+  → Include.bootstrap_entry("include", path) 构造显式根 Include 声明
+  → 应用入口构造内存 LoaderPlugin
   → root.plugin(LoaderPlugin)
-  → LoaderPlugin 校验 EntryTree、经 ExtensionFactory 构造普通条目
-  → LoaderPlugin 后序释放旧树、前序挂载新树
+  → include Include 读取文件、提供来源上下文与文件版本
+  → Loader 预检文件条目并收敛为 include:* 子树
 ```
 
-- 相对 `path` 相对于 `bootstrap.toml` 所在目录解析；重新加载只能显式 `reload()`。
+- 启动文件的相对 `path` 相对于 `bootstrap.toml` 所在目录解析；嵌套 Include 相对于所属文件目录。
+  文件重载使用 `loader.subtree("include")?.reload()`，没有自动监听。
+- Loader 的内存根 CRUD 不写任何文件；Include 来源树的 CRUD 与配置编辑只写所属文件。
+  `EntryLocation` 只描述条目位置；文件目录与继承日志策略由 Include 的 `INCLUDE_LOCATION` 提供。
 - 扩展包目录、信任公钥、基础日志、SQLite/PostgreSQL 配置存储和文件热更新仍是未来
   宿主或扩展能力，不进入 `cordis-core`。首版 Host 遇到这些字段会因
   `deny_unknown_fields` 直接失败。
@@ -109,7 +115,9 @@ Factory 是静态 Loader 的必要构造边界：Catalog 根据条目 `name` 找
 `ExtensionFactory::prepare()` 是唯一预备入口，`register()` 是唯一登记入口。
 `PreparedExtension::ordinary()` 表达普通插件，`PreparedExtension::volatile()` 表达包含
 普通配置与热配置的插件；两者均延迟构造。普通插件无需空 Live 或划分方法，只有热配置
-结果创建配置引用。Loader 内部统一比较、构造与提交，插件作者不操作类型擦除或写入端。
+结果创建配置引用。`PreparedExtension::tree()` 表达 Include 等来源树载体，在同来源配置更新时
+等待子树局部协调，不用普通 volatile 订阅假装提交已经完成。Loader 内部统一比较、构造与提交，
+插件作者不操作类型擦除或写入端。
 
 普通/热配置能力切换或绑定类型变化会完整替换实例，重新校验 PluginKey 并关闭旧引用。
 该 API 为直接迁移，外部应用需同步更新；不保留双入口或旧构造接口。
@@ -119,7 +127,8 @@ Factory 是静态 Loader 的必要构造边界：Catalog 根据条目 `name` 找
 Loader 从 Catalog Schema 和已加载的 Entry 声明生成安全配置描述，不依赖 Active Fiber。
 `describe_config()` / `mutate_config()` 统一提供脱敏、树实例级版本检查与字段编辑；
 后续仍进入原有 prepare、reconcile、热提交与文件写回，不建立独立 Settings 存储。
-普通配置和热配置都可管理，禁用或失败实例也可修复。Schema 的 `writeOnly` 是秘密投影
+普通配置和热配置都可管理，禁用或失败实例也可修复。来源树通过 `EntryTreeSource` 写回，
+文件来源由 Include 实现；内存根编辑不假装已保存到磁盘。Schema 的 `writeOnly` 是秘密投影
 标记，不参与普通/热配置划分。HTTP、鉴权、表单组件与 DTO 属于应用 Host，Core 不感知。
 持久化失败和局部生命周期失败继续遵循现有不回滚语义。详见 [Host 文档](host.md#面向管理界面的配置控制面)。
 

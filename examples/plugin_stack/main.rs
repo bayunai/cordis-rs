@@ -6,8 +6,9 @@
 //! ```
 //!
 //! 初始树：
-//! - `side`：根级旁路，观察 `app` 子树变更时 Fiber ID 是否保持
-//! - `app` Group：`db` → `log-store` → `http`（组上显式 `isolate` db/http，组内共享）
+//! - `include` Include：独立文件树；Loader 根树仅保留这条内存声明
+//! - `include:side`：文件树旁路，观察 `include:app` 子树变更时 Fiber ID 是否保持
+//! - `include:app` Group：`db` → `log-store` → `http`（组上显式 `isolate` db/http，组内共享）
 
 #[path = "../log_stream.rs"]
 mod log_stream;
@@ -35,6 +36,7 @@ use cordis_loader::{
     IsolationDescriptor, LOADER, Loader, LoaderError, LoaderPlugin, LoaderSnapshot,
     PreparedExtension,
 };
+use cordis_plugin_include::{IncludeFactory, bootstrap_entry};
 use cordis_plugin_logger_console::ConsoleLoggerPlugin;
 use db::DbPlugin;
 use futures_util::stream::Stream;
@@ -355,7 +357,7 @@ async fn collect_state(app: &AppState) -> StateJson {
         .unwrap_or(LoaderSnapshot { entries: vec![] });
     let db_logs = app
         .loader
-        .entry_context("app:db")
+        .entry_context("include:app:db")
         .ok()
         .and_then(|ctx| ctx.get(DB).ok())
         .map(|db| db.recent(80))
@@ -395,7 +397,7 @@ async fn collect_state(app: &AppState) -> StateJson {
         db_logs,
         registry,
         graph: build_graph(&app.runtime),
-        note: "对比 side 与 app:* 的 fiber_id：子树操作不应改动无关 Entry。".into(),
+        note: "对比 include:side 与 include:app:* 的 fiber_id：子树操作不应改动无关 Entry。".into(),
     }
 }
 
@@ -405,6 +407,13 @@ fn err(status: StatusCode, msg: impl Into<String>) -> (StatusCode, Json<ErrJson>
 
 fn map_loader(e: impl std::fmt::Display) -> (StatusCode, Json<ErrJson>) {
     err(StatusCode::BAD_REQUEST, e.to_string())
+}
+
+/// UI 使用完整路径；文件树控制面使用局部路径，不能把文件编辑发往内存根树。
+fn main_local_path(path: &str) -> Result<&str, (StatusCode, Json<ErrJson>)> {
+    path.strip_prefix("include:")
+        .filter(|local| !local.is_empty())
+        .ok_or_else(|| err(StatusCode::BAD_REQUEST, "仅允许操作 include 文件树内的条目"))
 }
 
 async fn index() -> Html<&'static str> {
@@ -426,8 +435,10 @@ async fn api_disable(
     Json(body): Json<DisableBody>,
 ) -> Result<Json<StateJson>, (StatusCode, Json<ErrJson>)> {
     app.loader
+        .subtree("include")
+        .map_err(map_loader)?
         .update(
-            &body.path,
+            main_local_path(&body.path)?,
             EntryUpdate {
                 disabled: Some(body.disabled),
                 ..Default::default()
@@ -452,19 +463,26 @@ async fn api_reorder(
     let children: Vec<_> = snap
         .entries
         .iter()
-        .filter(|e| e.parent.as_ref().is_some_and(|p| p.as_str() == "app") && !e.group)
+        .filter(|e| {
+            e.parent
+                .as_ref()
+                .is_some_and(|p| p.as_str() == "include:app")
+                && !e.group
+        })
         .map(|e| e.path.as_str().to_string())
         .collect();
     let http_index = children
         .iter()
-        .position(|p| p == "app:http")
-        .ok_or_else(|| err(StatusCode::BAD_REQUEST, "app:http 不存在，请先重建"))?;
+        .position(|p| p == "include:app:http")
+        .ok_or_else(|| err(StatusCode::BAD_REQUEST, "include:app:http 不存在，请先重建"))?;
     let target = if http_index == 0 {
         children.len().saturating_sub(1)
     } else {
         0
     };
     app.loader
+        .subtree("include")
+        .map_err(map_loader)?
         .update(
             "app:http",
             EntryUpdate::default(),
@@ -475,7 +493,7 @@ async fn api_reorder(
         .map_err(map_loader)?;
     sys_log(
         &app.runtime,
-        format!("sys: reorder app:http → position {target} (pure sort)"),
+        format!("sys: reorder include:app:http → position {target} (pure sort)"),
     )
     .map_err(map_core)?;
     Ok(Json(collect_state(&app).await))
@@ -486,6 +504,8 @@ async fn api_replace_http_config(
 ) -> Result<Json<StateJson>, (StatusCode, Json<ErrJson>)> {
     let label = format!("v{}", stamp());
     app.loader
+        .subtree("include")
+        .map_err(map_loader)?
         .update(
             "app:http",
             EntryUpdate {
@@ -520,7 +540,12 @@ async fn api_remove(
     State(app): State<Arc<AppState>>,
     Json(body): Json<PathBody>,
 ) -> Result<Json<StateJson>, (StatusCode, Json<ErrJson>)> {
-    app.loader.remove(&body.path).await.map_err(map_loader)?;
+    app.loader
+        .subtree("include")
+        .map_err(map_loader)?
+        .remove(main_local_path(&body.path)?)
+        .await
+        .map_err(map_loader)?;
     sys_log(&app.runtime, format!("sys: removed {}", body.path)).map_err(map_core)?;
     Ok(Json(collect_state(&app).await))
 }
@@ -534,10 +559,12 @@ async fn api_create_http(
         toml::Value::Table(table)
     });
     app.loader
+        .subtree("include")
+        .map_err(map_loader)?
         .create(entry, Some("app"), None)
         .await
         .map_err(map_loader)?;
-    sys_log(&app.runtime, "sys: created app:http").map_err(map_core)?;
+    sys_log(&app.runtime, "sys: created include:app:http").map_err(map_core)?;
     Ok(Json(collect_state(&app).await))
 }
 
@@ -547,7 +574,7 @@ async fn api_request(
 ) -> Result<Json<RequestJson>, (StatusCode, Json<ErrJson>)> {
     let http = app
         .loader
-        .entry_context("app:http")
+        .entry_context("include:app:http")
         .map_err(|_| {
             err(
                 StatusCode::BAD_REQUEST,
@@ -582,7 +609,7 @@ async fn api_clear_db(
 ) -> Result<Json<StateJson>, (StatusCode, Json<ErrJson>)> {
     let ctx = app
         .loader
-        .entry_context("app:db")
+        .entry_context("include:app:db")
         .map_err(|_| err(StatusCode::BAD_REQUEST, "DB 未挂载"))?;
     let db = ctx
         .get(DB)
@@ -594,6 +621,7 @@ async fn api_clear_db(
 
 fn build_catalog() -> Result<ExtensionCatalog, LoaderError> {
     let mut catalog = ExtensionCatalog::new();
+    catalog.register(IncludeFactory)?;
     catalog.register(SimpleFactory {
         id: "demo.stack.side",
         build: || Arc::new(SidePlugin) as Arc<dyn Plugin>,
@@ -664,13 +692,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     runtime.root().register_log_exporter(sse.clone())?;
 
     let catalog = build_catalog()?;
-    let plugin = LoaderPlugin::bootstrap(catalog, &bootstrap)?;
+    let plugin = LoaderPlugin::new(
+        catalog,
+        ExtensionsConfig {
+            version: cordis_loader::CONFIG_VERSION,
+            extensions: vec![bootstrap_entry("include", &bootstrap)?],
+        },
+    )?;
     let loader_fiber = runtime.root().plugin(Arc::new(plugin)).await?;
     let loader = (*runtime.root().get(LOADER)?).clone();
     let _ = loader.await_idle().await?;
     sys_log(
         &runtime,
-        "sys: Loader EntryTree ready (side + app/{db,log-store,http})",
+        "sys: Loader EntryTree ready (include Include → side + app/{db,log-store,http})",
     )?;
 
     let app = Arc::new(AppState {

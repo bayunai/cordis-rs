@@ -10,7 +10,7 @@
 
 - 在一个进程内按服务依赖关系编排模块与插件。
 - 将后台任务、监听器、异步清理等资源绑定到插件生命周期。
-- 在应用宿主中根据明确工厂目录和 TOML 配置启停扩展实例。
+- 在应用宿主中根据明确工厂目录和配置声明启停扩展实例；文件来源由可选 Include 提供。
 
 不适用：需要跨进程 RPC、数据库/缓存连接管理、动态库发现或浏览器端插件加载的场景；这些不属于
 `cordis-core` 的职责边界。
@@ -20,11 +20,11 @@
 | Crate | 用途 |
 | --- | --- |
 | [`cordis-core`](crates/cordis-core) | Runtime 内核：`Context`、`Service`、`inject`、`Effect`、`Plugin`、`Event` 与诊断。 |
-| [`cordis-loader`](crates/cordis-loader) | 可挂载的静态 Catalog EntryTree LoaderPlugin：v3 TOML 树、多树 reconcile、管理服务与原子持久化。 |
+| [`cordis-loader`](crates/cordis-loader) | 可挂载的静态 Catalog EntryTree：内存条目树、多树 reconcile、类型化热更新与通用来源提交接口。 |
 | [`cordis-host`](crates/cordis-host) | 应用进程薄外壳：创建 Runtime、开放完整权限并受控关闭。 |
 | [`cordis-plugin-timer`](crates/cordis-plugin-timer) | Host 显式挂载的 Effect 作用域计时器能力（timeout / interval / throttle / debounce）。 |
 | [`cordis-plugin-logger-console`](crates/cordis-plugin-logger-console) | Host 显式挂载的控制台日志 exporter；不经 ServiceKey / isolate。 |
-| [`cordis-plugin-include`](crates/cordis-plugin-include) | 可选：TOML 文件驱动的嵌套 EntryTree（`cordis:include`）；须 Catalog 显式注册。 |
+| [`cordis-plugin-include`](crates/cordis-plugin-include) | 可选文件配置树（`cordis:include`）：TOML／JSON／YAML、initial、patches、文件版本检查与原子写回；须 Catalog 显式注册。 |
 | [`cordis-testkit`](crates/cordis-testkit) | 测试辅助；不应用于生产宿主。 |
 
 ## 快速开始
@@ -85,20 +85,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## 示例与文档
 
-Loader Factory 统一使用 `prepare()` 返回 `PreparedExtension::ordinary()` 或
-`PreparedExtension::volatile()`，均通过 `catalog.register()` 登记。外部应用需同步迁移
-Factory 实现；普通插件无需定义空热配置，配置文件格式保持不变。
+Loader Factory 统一使用 `prepare()` 返回预备结果，通过 `catalog.register()` 登记。
+普通插件使用 `PreparedExtension::ordinary()`，热配置使用 `volatile()`，Include 等来源树载体
+使用 `tree()`；普通插件无需定义空热配置。文件编解码和 bootstrap 由 Include 负责。
 
-- [`volatile_config`](crates/cordis-loader/examples/volatile_config.rs)：类型化热配置、Effect 托管订阅与普通配置替换。运行 `cargo run -p cordis-loader --example volatile_config`。
-- [`config_control`](crates/cordis-loader/examples/config_control.rs)：禁用实例配置表单、秘密字段脱敏、版本检查与统一写回。运行 `cargo run -p cordis-loader --example config_control`。
+- [`volatile_config`](crates/cordis-plugin-include/examples/volatile_config.rs)：类型化热配置、Effect 托管订阅与普通配置替换。运行 `cargo run -p cordis-plugin-include --example volatile_config`。
+- [`config_control`](crates/cordis-plugin-include/examples/config_control.rs)：禁用实例配置表单、秘密字段脱敏、版本检查与来源统一写回。运行 `cargo run -p cordis-plugin-include --example config_control`。
 
 - [`reactive`](examples/reactive.rs)：最小服务注入与响应式重算。
 - [`plugin_hotplug`](examples/plugin_hotplug.rs)：插件替换与卸载。
 - [`plugin_web`](examples/plugin_web.rs)：将运行时能力接入 HTTP 示例。
-- [`plugin_stack`](examples/plugin_stack/main.rs)：Loader EntryTree 子树差分 reconcile 网页 Demo（`side` + `app/{db,logger,http}`）。
+- [`plugin_stack`](examples/plugin_stack/main.rs)：Include 文件树局部 reconcile 网页 Demo（`include:side` + `include:app/{db,log-store,http}`）。
 - [`host_bootstrap`](crates/cordis-host/examples/host_bootstrap/main.rs)：可复制的 Host 模板，包含入口、静态 Catalog、插件目录与 TOML 扩展清单。
 - [架构与边界](docs/architecture.md)
 - [Host 编排](docs/host.md)
+- [Include 文件配置树与迁移](docs/include.md)
 - [扩展编写指南](docs/extension-authoring.md)
 
 运行示例：
@@ -109,10 +110,11 @@ cargo run -p cordis-core --example plugin_stack
 cargo run -p cordis-host --example host_bootstrap
 ```
 
-应用入口通过 `root.plugin(Arc::new(LoaderPlugin::bootstrap(...)?))` 显式挂载 LoaderPlugin；
-`bootstrap.toml` 当前仅支持 `file` 配置源。应用与受信任插件通过 `ctx.get(LOADER)` 取得管理
-服务；条目业务服务则通过 `loader.entry_context("父:子")` 读取。Loader 的 Factory 与可配置 inject
-均为静态、强类型目录，并公开 JSON Schema 供管理界面生成表单。详情见[Host 文档](docs/host.md)。
+应用入口用 Include 的 `bootstrap_entry("include", "bootstrap.toml")` 构造根文件条目，再通过
+`LoaderPlugin::new(catalog, config)` 显式挂载 LoaderPlugin。Loader 根树只保存在内存；文件编辑
+使用 `loader.subtree("include")` 的局部路径，服务读取使用 `loader.entry_context("include:父:子")`。
+应用与受信任插件通过 `ctx.get(LOADER)` 取得管理服务。Factory 与可配置 inject 均为静态、
+强类型目录，并公开 JSON Schema 供管理界面生成表单。详情见[Host 文档](docs/host.md)。
 
 ## 关键语义
 

@@ -1,37 +1,14 @@
-//! `extensions.toml` 的 v3 EntryTree 配置合同。
+//! 来源无关的 v3 EntryTree 配置合同；格式编解码由来源提供方负责。
 
 use crate::{catalog::ExtensionCatalog, error::LoaderError};
 use serde::{Deserialize, Serialize};
-use std::{
-    collections::{BTreeMap, HashSet},
-    path::Path,
-};
+use std::collections::{BTreeMap, HashSet};
 
 pub const CONFIG_VERSION: u32 = 3;
 pub const GROUP_NAME: &str = "cordis:group";
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct BootstrapConfig {
-    pub version: u32,
-    pub config: BootstrapConfigSource,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct BootstrapConfigSource {
-    pub driver: ConfigDriver,
-    pub path: std::path::PathBuf,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ConfigDriver {
-    File,
-}
-
 /// Loader 的完整持久化树。`extensions = []` 是唯一的空树写法。
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExtensionsConfig {
     pub version: u32,
@@ -58,7 +35,7 @@ pub enum IsolateValue {
 pub type IsolateConfig = BTreeMap<String, IsolateValue>;
 
 /// 一个普通插件或内建 Group 节点。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EntryOptions {
     pub id: String,
@@ -137,9 +114,6 @@ impl EntryOptions {
 }
 
 impl ExtensionsConfig {
-    pub fn from_toml_str(text: &str) -> Result<Self, LoaderError> {
-        parse_toml(text, Path::new("<extensions>"))
-    }
     pub fn validate(&self, catalog: &ExtensionCatalog) -> Result<(), LoaderError> {
         ensure_version(self.version)?;
         validate_entries(&self.extensions, catalog, None)
@@ -244,19 +218,6 @@ fn validate_isolate(
     Ok(())
 }
 
-pub(crate) fn parse_toml<T>(text: &str, path: &Path) -> Result<T, LoaderError>
-where
-    T: serde::de::DeserializeOwned,
-{
-    toml::from_str(text).map_err(|source| LoaderError::toml(path.to_path_buf(), source))
-}
-impl BootstrapConfig {
-    pub fn from_toml_str(text: &str) -> Result<Self, LoaderError> {
-        let config: Self = parse_toml(text, Path::new("<bootstrap>"))?;
-        ensure_version(config.version)?;
-        Ok(config)
-    }
-}
 pub(crate) fn ensure_version(version: u32) -> Result<(), LoaderError> {
     if version == CONFIG_VERSION {
         Ok(())

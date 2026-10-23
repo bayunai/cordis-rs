@@ -5,6 +5,7 @@ use cordis_loader::{
     ConfigOperation, EntryOptions, ExtensionCatalog, ExtensionFactory, ExtensionsConfig, LOADER,
     LoaderError, LoaderPlugin, PreparedExtension,
 };
+use cordis_plugin_include::{IncludeFactory, bootstrap_entry};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use std::{fs, sync::Arc};
@@ -65,21 +66,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     let mut catalog = ExtensionCatalog::new();
     catalog.register(Factory)?;
+    catalog.register(IncludeFactory)?;
     let runtime = Runtime::new()?;
     let _fiber = runtime
         .root()
-        .plugin(Arc::new(LoaderPlugin::bootstrap(
+        .plugin(Arc::new(LoaderPlugin::new(
             catalog,
-            directory.path().join("bootstrap.toml"),
+            ExtensionsConfig {
+                version: cordis_loader::CONFIG_VERSION,
+                extensions: vec![bootstrap_entry(
+                    "include",
+                    directory.path().join("bootstrap.toml"),
+                )?],
+            },
         )?))
         .await?;
     let loader = runtime.root().get(LOADER)?;
-    let before = loader.describe_config("ocr").await?;
+    let before = loader.describe_config("include:ocr").await?;
     // 应用可以用字符串 DTO 往返版本令牌；它不是访问凭据。
     let expected = before.revision.to_string().parse()?;
     let after = loader
         .mutate_config(
-            "ocr",
+            "include:ocr",
             expected,
             vec![
                 ConfigOperation::Set {

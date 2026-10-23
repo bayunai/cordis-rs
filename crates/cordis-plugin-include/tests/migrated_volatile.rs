@@ -230,9 +230,7 @@ impl Harness {
         )
         .unwrap();
         let runtime = Runtime::new().unwrap();
-        let plugin =
-            LoaderPlugin::bootstrap(catalog(state), directory.path().join("bootstrap.toml"))
-                .unwrap();
+        let plugin = file_plugin(catalog(state), directory.path().join("bootstrap.toml")).unwrap();
         let fiber = runtime.root().plugin(Arc::new(plugin)).await.unwrap();
         assert_eq!(fiber.state(), FiberState::Active);
         let loader = runtime.root().get(LOADER).unwrap();
@@ -255,6 +253,8 @@ impl Harness {
         value: toml::Value,
     ) -> Result<cordis_loader::LoaderSnapshot, LoaderControlError> {
         self.loader
+            .subtree("include")
+            .unwrap()
             .update(
                 id,
                 EntryUpdate {
@@ -283,8 +283,14 @@ async fn hot_changes_preserve_fiber_provider_effect_and_coherent_snapshots() {
     assert_eq!(current.revision, 1);
     assert_eq!((current.value.limit, current.value.timeout), (2, 20));
     assert_eq!(
-        before.entries[0].fiber_id,
-        h.loader.await_idle().await.unwrap().entries[0].fiber_id
+        before.entry("include:a").unwrap().fiber_id,
+        h.loader
+            .await_idle()
+            .await
+            .unwrap()
+            .entry("include:a")
+            .unwrap()
+            .fiber_id
     );
     assert!(Arc::ptr_eq(&service, &h.runtime.root().get(LIVE).unwrap()));
     assert_eq!(state.builds.load(Ordering::SeqCst), 1);
@@ -357,7 +363,13 @@ async fn invalid_candidates_and_panics_do_not_mutate_runtime_or_file() {
         assert_eq!(fs::read_to_string(h.file()).unwrap(), before);
         assert_eq!(state.refs.lock().unwrap()[0].get().revision, 0);
         assert_eq!(
-            h.loader.await_idle().await.unwrap().entries[0].state,
+            h.loader
+                .await_idle()
+                .await
+                .unwrap()
+                .entry("include:a")
+                .unwrap()
+                .state,
             Some(FiberState::Active)
         );
     }
@@ -371,15 +383,21 @@ async fn lifecycle_failure_defers_hot_commit_and_same_target_retries() {
     let first = state.refs.lock().unwrap()[0].clone();
     h.write(vec![entry("a", "db", 2), entry("b", "apply-error", 2)]);
     for _ in 0..2 {
-        assert!(h.loader.reload().await.is_err());
+        assert!(h.loader.subtree("include").unwrap().reload().await.is_err());
         assert_eq!(first.get().revision, 0);
         assert_eq!(
-            h.loader.entries().unwrap().extensions[0].config,
+            h.loader
+                .subtree("include")
+                .unwrap()
+                .entries()
+                .unwrap()
+                .extensions[0]
+                .config,
             entry("a", "db", 1).config
         );
     }
     h.write(vec![entry("a", "db", 2), entry("b", "fixed", 2)]);
-    h.loader.reload().await.unwrap();
+    h.loader.subtree("include").unwrap().reload().await.unwrap();
     assert_eq!(first.get().revision, 1);
     assert_eq!(first.get().value.limit, 2);
     h.runtime.shutdown().await.unwrap();
@@ -397,6 +415,8 @@ async fn multiple_instances_disable_restore_and_unmount_rebuild() {
     assert_eq!(refs[1].get().value.limit, 1);
     let mut sub = refs[0].subscribe();
     h.loader
+        .subtree("include")
+        .unwrap()
         .update(
             "a",
             EntryUpdate {
@@ -410,6 +430,8 @@ async fn multiple_instances_disable_restore_and_unmount_rebuild() {
         .unwrap();
     assert!(sub.changed().await.is_err());
     h.loader
+        .subtree("include")
+        .unwrap()
         .update(
             "a",
             EntryUpdate {
@@ -434,7 +456,7 @@ async fn multiple_instances_disable_restore_and_unmount_rebuild() {
             .unwrap()
             .is_err()
     );
-    h.loader.reload().await.unwrap();
+    h.loader.subtree("include").unwrap().reload().await.unwrap();
     assert!(
         h.loader
             .await_idle()
@@ -455,7 +477,13 @@ async fn pending_updates_build_new_config_but_dependency_reactivation_keeps_refe
     let old = state.refs.lock().unwrap()[0].clone();
     let mut sub = old.subscribe();
     assert_eq!(
-        h.loader.await_idle().await.unwrap().entries[0].state,
+        h.loader
+            .await_idle()
+            .await
+            .unwrap()
+            .entry("include:a")
+            .unwrap()
+            .state,
         Some(FiberState::Pending)
     );
     h.update("a", config("db", 2, 20, false, true))
@@ -491,7 +519,13 @@ async fn fiber_leaving_active_before_commit_rejects_and_retries_actual_binding()
     let provider = h.runtime.root().effect().unwrap();
     provider.provide(DEP, ()).unwrap();
     h.runtime.settle().await;
-    let id = h.loader.await_idle().await.unwrap().entries[0]
+    let id = h
+        .loader
+        .await_idle()
+        .await
+        .unwrap()
+        .entry("include:a")
+        .unwrap()
         .fiber_id
         .unwrap();
     state.waiting_fiber.store(id, Ordering::SeqCst);
@@ -501,9 +535,12 @@ async fn fiber_leaving_active_before_commit_rejects_and_retries_actual_binding()
         EntryOptions::new("a", "live").with_config(config("db", 2, 20, false, true)),
         entry("b", "drop-provider", 1),
     ]);
-    let result = tokio::time::timeout(std::time::Duration::from_secs(2), h.loader.reload())
-        .await
-        .unwrap();
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        h.loader.subtree("include").unwrap().reload(),
+    )
+    .await
+    .unwrap();
     assert!(matches!(
         result,
         Err(LoaderControlError::Loader(
@@ -511,11 +548,20 @@ async fn fiber_leaving_active_before_commit_rejects_and_retries_actual_binding()
         ))
     ));
     assert_eq!(first.get().revision, 0);
-    assert_eq!(h.loader.entries().unwrap().extensions[0].config, e.config);
+    assert_eq!(
+        h.loader
+            .subtree("include")
+            .unwrap()
+            .entries()
+            .unwrap()
+            .extensions[0]
+            .config,
+        e.config
+    );
     let provider = h.runtime.root().effect().unwrap();
     provider.provide(DEP, ()).unwrap();
     h.runtime.settle().await;
-    h.loader.reload().await.unwrap();
+    h.loader.subtree("include").unwrap().reload().await.unwrap();
     assert_eq!(first.get().revision, 1);
     h.runtime.shutdown().await.unwrap();
 }
@@ -531,22 +577,35 @@ async fn conflict_precedes_hot_commit_and_persist_error_retains_applied_snapshot
         Err(LoaderControlError::ConfigConflict { .. })
     ));
     assert_eq!(reference.get().revision, 0);
-    h.loader.reload().await.unwrap();
+    h.loader.subtree("include").unwrap().reload().await.unwrap();
     assert_eq!(reference.get().revision, 1);
     // 故障在 revision 检查之后注入：目标变为目录，原子 rename 必须失败。
     *state.persist_fault.lock().unwrap() = Some(h.file());
     let result = h.update("a", config("db", 3, 30, false, false)).await;
     match result {
-        Err(LoaderControlError::Persist { snapshot, path, .. }) => {
-            assert_eq!(path, h.file());
-            assert_eq!(snapshot.entries[0].state, Some(FiberState::Active));
+        Err(LoaderControlError::Persist {
+            snapshot,
+            source_id,
+            ..
+        }) => {
+            assert!(source_id.contains(h.file().to_str().unwrap()));
+            assert_eq!(
+                snapshot.entry("include:a").unwrap().state,
+                Some(FiberState::Active)
+            );
         }
         _ => panic!("expected Persist"),
     }
     assert_eq!(reference.get().revision, 2);
     assert_eq!(reference.get().value.limit, 3);
     assert_eq!(
-        h.loader.entries().unwrap().extensions[0].config,
+        h.loader
+            .subtree("include")
+            .unwrap()
+            .entries()
+            .unwrap()
+            .extensions[0]
+            .config,
         entry("a", "db", 3).config
     );
     h.runtime.shutdown().await.unwrap();
@@ -568,6 +627,8 @@ async fn move_and_group_rebuild_replace_only_affected_references() {
     let untouched = state.refs.lock().unwrap()[0].clone();
     let mut sub = old.subscribe();
     h.loader
+        .subtree("include")
+        .unwrap()
         .update("g:a", EntryUpdate::default(), Some(None), None)
         .await
         .unwrap();
@@ -578,12 +639,16 @@ async fn move_and_group_rebuild_replace_only_affected_references() {
         .unwrap();
     assert_eq!(old.get().value.limit, 1);
     h.loader
+        .subtree("include")
+        .unwrap()
         .create(entry("c", "db", 1), Some("g"), None)
         .await
         .unwrap();
     let child = state.refs.lock().unwrap().last().unwrap().clone();
     let mut child_updates = child.subscribe();
     h.loader
+        .subtree("include")
+        .unwrap()
         .update(
             "g",
             EntryUpdate {
@@ -604,6 +669,8 @@ async fn move_and_group_rebuild_replace_only_affected_references() {
     let restored_child = state.refs.lock().unwrap().last().unwrap().clone();
     let mut restored_changes = restored_child.subscribe();
     h.loader
+        .subtree("include")
+        .unwrap()
         .update(
             "g",
             EntryUpdate {
@@ -617,6 +684,8 @@ async fn move_and_group_rebuild_replace_only_affected_references() {
         .unwrap();
     assert!(restored_changes.changed().await.is_err());
     h.loader
+        .subtree("include")
+        .unwrap()
         .update(
             "g",
             EntryUpdate {
@@ -638,12 +707,12 @@ async fn failed_old_disposer_does_not_associate_candidate_binding_with_old_plugi
     let h = Harness::new(&state, vec![entry("a", "dispose-error", 1)]).await;
     let old = state.refs.lock().unwrap()[0].clone();
     h.write(vec![entry("a", "fixed", 2)]);
-    assert!(h.loader.reload().await.is_err());
+    assert!(h.loader.subtree("include").unwrap().reload().await.is_err());
     let abandoned = state.refs.lock().unwrap()[1].clone();
     assert_eq!(old.get().revision, 0);
     assert_eq!(old.get().value.limit, 1);
     assert!(abandoned.subscribe().changed().await.is_err());
-    h.loader.reload().await.unwrap();
+    h.loader.subtree("include").unwrap().reload().await.unwrap();
     assert!(old.subscribe().changed().await.is_err());
     let current = state.refs.lock().unwrap().last().unwrap().clone();
     h.update("a", config("fixed", 3, 30, false, false))
@@ -665,7 +734,7 @@ async fn include_subtree_uses_same_hot_update_and_persistence_path() {
         .with_config(toml::from_str("path = 'child.toml'").unwrap());
     let h = Harness::with_child(&state, vec![include], Some(vec![entry("a", "db", 1)])).await;
     let reference = state.refs.lock().unwrap()[0].clone();
-    let subtree = h.loader.subtree("reports").unwrap();
+    let subtree = h.loader.subtree("include:reports").unwrap();
     let before = h
         .loader
         .await_idle()
@@ -673,7 +742,7 @@ async fn include_subtree_uses_same_hot_update_and_persistence_path() {
         .unwrap()
         .entries
         .iter()
-        .find(|e| e.path.as_str() == "reports:a")
+        .find(|e| e.path.as_str() == "include:reports:a")
         .unwrap()
         .fiber_id;
     let root_text = fs::read_to_string(h.file()).unwrap();
@@ -706,12 +775,17 @@ async fn include_subtree_uses_same_hot_update_and_persistence_path() {
             .unwrap()
             .entries
             .iter()
-            .find(|e| e.path.as_str() == "reports:a")
+            .find(|e| e.path.as_str() == "include:reports:a")
             .unwrap()
             .fiber_id
     );
     let mut changes = reference.subscribe();
-    h.loader.remove("reports").await.unwrap();
+    h.loader
+        .subtree("include")
+        .unwrap()
+        .remove("reports")
+        .await
+        .unwrap();
     assert!(changes.changed().await.is_err());
     h.runtime.shutdown().await.unwrap();
 }
@@ -766,9 +840,10 @@ async fn partial_hot_commit_is_visible_and_retry_does_not_duplicate_revision() {
     provider.provide(DEP, ()).unwrap();
     h.runtime.settle().await;
     let before = h.loader.await_idle().await.unwrap();
-    state
-        .waiting_fiber
-        .store(before.entries[1].fiber_id.unwrap(), Ordering::SeqCst);
+    state.waiting_fiber.store(
+        before.entry("include:b").unwrap().fiber_id.unwrap(),
+        Ordering::SeqCst,
+    );
     *state.drop_provider.lock().unwrap() = Some(provider);
     let refs = state.refs.lock().unwrap().clone();
     h.write(vec![
@@ -776,9 +851,12 @@ async fn partial_hot_commit_is_visible_and_retry_does_not_duplicate_revision() {
         EntryOptions::new("b", "live").with_config(config("db", 2, 20, false, true)),
         entry("c", "drop-provider", 1),
     ]);
-    let result = tokio::time::timeout(std::time::Duration::from_secs(2), h.loader.reload())
-        .await
-        .unwrap();
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        h.loader.subtree("include").unwrap().reload(),
+    )
+    .await
+    .unwrap();
     assert!(matches!(
         result,
         Err(LoaderControlError::Loader(
@@ -788,14 +866,35 @@ async fn partial_hot_commit_is_visible_and_retry_does_not_duplicate_revision() {
     assert_eq!(refs[0].get().revision, 1);
     assert_eq!(refs[1].get().revision, 0);
     assert_eq!(
-        h.loader.entries().unwrap().extensions[0].config,
+        h.loader
+            .subtree("include")
+            .unwrap()
+            .entries()
+            .unwrap()
+            .extensions[0]
+            .config,
         entry("a", "db", 1).config
     );
     let provider = h.runtime.root().effect().unwrap();
     provider.provide(DEP, ()).unwrap();
     h.runtime.settle().await;
-    h.loader.reload().await.unwrap();
+    h.loader.subtree("include").unwrap().reload().await.unwrap();
     assert_eq!(refs[0].get().revision, 1);
     assert_eq!(refs[1].get().revision, 1);
     h.runtime.shutdown().await.unwrap();
+}
+
+fn file_plugin(
+    catalog: ExtensionCatalog,
+    bootstrap: impl AsRef<std::path::Path>,
+) -> Result<LoaderPlugin, LoaderError> {
+    let entry = cordis_plugin_include::bootstrap_entry("include", bootstrap)
+        .map_err(|error| LoaderError::invalid_config(error.to_string()))?;
+    LoaderPlugin::new(
+        catalog,
+        ExtensionsConfig {
+            version: 3,
+            extensions: vec![entry],
+        },
+    )
 }

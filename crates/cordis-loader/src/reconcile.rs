@@ -1,13 +1,15 @@
 //! Entry/子树差分 reconcile：目标索引、计划与生命周期执行。
 
 use crate::{
+    EntryTreeSource, SourceRevision,
     catalog::ExtensionCatalog,
     config::{EntryOptions, ExtensionsConfig},
+    config_control::ConfigRevision,
     error::{LoaderError, format_panic_message},
     plugin::RuntimeEntry,
-    prepared::{PreparedOutcome, VolatileBinding},
+    prepared::{ConfigBinding, PreparedOutcome},
     snapshot::{EntryId, LoaderSnapshot},
-    tree::RuntimeTree,
+    tree::{PreparedTreePlan, RuntimeTree},
 };
 use async_trait::async_trait;
 use cordis_core::{Context, CoreError, FiberState, Plugin, PluginKey, ServiceId};
@@ -27,10 +29,11 @@ pub(crate) struct DesiredNode {
     children: Vec<EntryId>,
     plugin: Option<Arc<dyn Plugin>>,
     plugin_key: Option<PluginKey>,
-    volatile: Option<Arc<dyn VolatileBinding>>,
+    binding: Option<Arc<dyn ConfigBinding>>,
 }
 
 pub(crate) struct ReconcilePlan {
+    tree_updates: BTreeMap<EntryId, TreeCommit>,
     /// 整节点删除（含子树根）；执行时后序释放并移出 map。
     remove: BTreeSet<EntryId>,
     /// 仅释放 Fiber，保留 map 槽位（禁用）。
@@ -46,9 +49,21 @@ pub(crate) struct ReconcilePlan {
     hot: BTreeMap<EntryId, HotCommit>,
 }
 
+struct TreeCommit {
+    state: Arc<crate::prepared::TreeState>,
+    fiber_id: u64,
+    binding: Arc<dyn ConfigBinding>,
+    tree: Arc<RuntimeTree>,
+    expected: ConfigRevision,
+    old_revision: SourceRevision,
+    source: Arc<dyn EntryTreeSource>,
+    prepared: PreparedTreePlan,
+    commit: Box<dyn FnOnce() + Send>,
+}
+
 struct HotCommit {
     fiber_id: u64,
-    binding: Arc<dyn VolatileBinding>,
+    binding: Arc<dyn ConfigBinding>,
     commit: Box<dyn FnOnce() + Send>,
 }
 
@@ -126,6 +141,65 @@ impl RuntimeTree {
             return Err(error);
         }
 
+        // 来源定义更新不是 watch 通知：必须等待子树协调完成，才能提交父树声明。
+        for (path, update) in plan.tree_updates {
+            let result = async {
+                {
+                    let entries = self.entries.lock().expect("entries");
+                    let valid = entries.get(&path).is_some_and(|entry| {
+                        entry.fiber.as_ref().is_some_and(|fiber| {
+                            fiber.id() == update.fiber_id && fiber.state() == FiberState::Active
+                        }) && entry
+                            .binding
+                            .as_ref()
+                            .is_some_and(|binding| Arc::ptr_eq(binding, &update.binding))
+                    });
+                    if !valid {
+                        return Err(LoaderError::HotConfigStale {
+                            instance: path.to_string(),
+                        });
+                    }
+                }
+                let _operation = update.tree.operations.lock().await;
+                update.tree.ensure_open()?;
+                if update.expected != update.tree.config_revision() {
+                    return Err(LoaderError::HotConfigStale {
+                        instance: path.to_string(),
+                    });
+                }
+                let old_source = update
+                    .tree
+                    .source
+                    .lock()
+                    .expect("source")
+                    .clone()
+                    .ok_or(LoaderError::NoConfigSource)?;
+                old_source.check_revision(&update.old_revision)?;
+                update.source.check_revision(
+                    &update
+                        .prepared
+                        .revision
+                        .clone()
+                        .ok_or(LoaderError::NoConfigSource)?,
+                )?;
+                // 失败可能已改变部分子实例。相同旧定义重试也必须重新协调，不能误报无变化。
+                update.state.dirty.store(true, Ordering::Release);
+                update.tree.apply_plan(update.prepared).await?;
+                // 只有成功协调后才激活来源自身的共享上下文策略，不提前发布候选元数据。
+                update.source.context(&update.tree.owner)?;
+                *update.tree.source.lock().expect("source") = Some(update.source);
+                (update.commit)();
+                update.state.dirty.store(false, Ordering::Release);
+                Ok(())
+            }
+            .await;
+            // 某个来源子树的业务失败仍须隔离，不能阻止其他独立来源定义更新。
+            record_lifecycle_result(result, &mut lifecycle_error, &logger)?;
+        }
+        if let Some(error) = lifecycle_error {
+            return Err(error);
+        }
+
         // 所有生命周期成功后才提交热值，不等待业务订阅者。
         for (path, hot) in plan.hot {
             let entries = self.entries.lock().expect("entries");
@@ -135,7 +209,7 @@ impl RuntimeTree {
                     entry.fiber.as_ref().is_some_and(|fiber| {
                         fiber.id() == hot.fiber_id && fiber.state() == FiberState::Active
                     }) && entry
-                        .volatile
+                        .binding
                         .as_ref()
                         .is_some_and(|binding| Arc::ptr_eq(binding, &hot.binding))
                 });
@@ -188,7 +262,7 @@ impl RuntimeTree {
             };
             entry.enabled = false;
             entry.plugin_key = None;
-            entry.volatile = None;
+            entry.binding = None;
             entry.fiber.take()
         };
         if let Some(mut fiber) = fiber.take() {
@@ -236,10 +310,10 @@ impl RuntimeTree {
             // Busy / 旧 disposer 失败时，Core 可能尚未安装候选插件。
             // 成功返回（包括 Pending）或已进入候选 apply 才切换绑定。
             if replace_result.is_ok() || replacement.applied.load(Ordering::Acquire) {
-                entry.volatile = node.volatile.clone();
+                entry.binding = node.binding.clone();
             }
             if fiber.is_disposed() {
-                entry.volatile = None;
+                entry.binding = None;
             }
             if replace_result.is_ok() && !failed {
                 entry.plugin_key = node.plugin_key;
@@ -299,7 +373,7 @@ impl RuntimeTree {
         let stale = {
             let mut entries = self.entries.lock().expect("entries");
             entries.get_mut(path).and_then(|entry| {
-                entry.volatile = None;
+                entry.binding = None;
                 entry.fiber.take()
             })
         };
@@ -378,7 +452,7 @@ impl RuntimeTree {
                 context,
                 factory: (!node.options.group).then(|| node.options.name.clone()),
                 options: node.options.clone(),
-                volatile: enabled.then(|| node.volatile.clone()).flatten(),
+                binding: enabled.then(|| node.binding.clone()).flatten(),
             },
         );
         drop(entries);
@@ -456,7 +530,7 @@ fn index_entries(
                 children,
                 plugin: None,
                 plugin_key: None,
-                volatile: None,
+                binding: None,
             },
         );
     }
@@ -608,6 +682,7 @@ pub(crate) fn plan_reconcile(
     // remove 与 mount 同 path：子树重建，先删后挂。
 
     Ok(ReconcilePlan {
+        tree_updates: BTreeMap::new(),
         remove,
         dispose_fiber,
         replace,
@@ -707,18 +782,43 @@ pub(crate) fn build_plan_plugins(
     mounted: &Mutex<BTreeMap<EntryId, RuntimeEntry>>,
     mut prepared: Option<(EntryId, crate::PreparedExtension)>,
 ) -> Result<(), LoaderError> {
-    let mounted = mounted.lock().expect("entries");
+    // 只复制预检元数据，不复制拥有释放语义的 Fiber。调用扩展时不持有条目锁。
+    struct BuildEntry {
+        binding: Option<Arc<dyn ConfigBinding>>,
+        active_fiber: Option<u64>,
+        group: bool,
+        factory: Option<String>,
+        plugin_key: Option<PluginKey>,
+    }
+    let mounted: BTreeMap<_, _> = mounted
+        .lock()
+        .expect("entries")
+        .iter()
+        .map(|(path, entry)| {
+            (
+                path.clone(),
+                BuildEntry {
+                    binding: entry.binding.clone(),
+                    active_fiber: entry
+                        .fiber
+                        .as_ref()
+                        .filter(|fiber| fiber.state() == FiberState::Active)
+                        .map(|fiber| fiber.id()),
+                    group: entry.group,
+                    factory: entry.factory.clone(),
+                    plugin_key: entry.plugin_key,
+                },
+            )
+        })
+        .collect();
     let mut candidates = plan.build.clone();
     for (path, entry) in mounted.iter() {
-        if entry.volatile.is_some()
+        if entry.binding.is_some()
             && desired.contains_key(path)
             && !plan.remove.contains(path)
             && !plan.mount.contains(path)
             && !plan.dispose_fiber.contains(path)
-            && entry
-                .fiber
-                .as_ref()
-                .is_some_and(|fiber| fiber.state() == FiberState::Active)
+            && entry.active_fiber.is_some()
         {
             candidates.insert(path.clone());
         }
@@ -730,10 +830,7 @@ pub(crate) fn build_plan_plugins(
             !plan.mount.contains(path)
                 && !plan.dispose_fiber.contains(path)
                 && !plan.remove.contains(path)
-                && entry
-                    .fiber
-                    .as_ref()
-                    .is_some_and(|fiber| fiber.state() == FiberState::Active)
+                && entry.active_fiber.is_some()
         });
         let result = catch_unwind(AssertUnwindSafe(|| {
             // 表单编辑已校验过目标配置；消费同一份预备结果，避免再次执行 prepare。
@@ -743,7 +840,7 @@ pub(crate) fn build_plan_plugins(
             } else {
                 factory.prepare(&node.options.config)?
             };
-            candidate.resolve(current.and_then(|entry| entry.volatile.as_ref()))
+            candidate.resolve(current.and_then(|entry| entry.binding.as_ref()))
         }))
         .map_err(|payload| LoaderError::FactoryPanic {
             message: format_panic_message("extension factory prepare/construct", payload),
@@ -754,11 +851,70 @@ pub(crate) fn build_plan_plugins(
             message: error.to_string(),
         })?;
         let (plugin, binding) = match result {
+            PreparedOutcome::TreeUpdate {
+                binding,
+                state,
+                open,
+                commit,
+            } => {
+                let (ctx, subtree) = state
+                    .mounted
+                    .lock()
+                    .expect("tree mounted")
+                    .clone()
+                    .ok_or_else(|| LoaderError::HotConfigStale {
+                        instance: path.to_string(),
+                    })?;
+                let tree = subtree.tree.clone();
+                tree.ensure_open()?;
+                let expected = tree.config_revision();
+                let old_revision = tree
+                    .revision
+                    .lock()
+                    .expect("revision")
+                    .clone()
+                    .ok_or(LoaderError::NoConfigSource)?;
+                let old_source = tree
+                    .source
+                    .lock()
+                    .expect("source")
+                    .clone()
+                    .ok_or(LoaderError::NoConfigSource)?;
+                old_source.check_revision(&old_revision)?;
+                let source = open(&ctx)?;
+                if Some(source.identity()) != tree.source_id {
+                    return Err(crate::SourceError::new(
+                        crate::SourceErrorKind::Conflict,
+                        "来源身份改变，必须重建树载体",
+                    )
+                    .into());
+                }
+                let document = source.read()?;
+                let prepared = tree.prepare_plan(document.config, Some(document.revision), None)?;
+                let fiber_id = current
+                    .and_then(|entry| entry.active_fiber)
+                    .expect("active tree fiber");
+                plan.replace.remove(path);
+                plan.tree_updates.insert(
+                    path.clone(),
+                    TreeCommit {
+                        state,
+                        fiber_id,
+                        binding,
+                        tree,
+                        expected,
+                        old_revision,
+                        source,
+                        prepared,
+                        commit,
+                    },
+                );
+                continue;
+            }
             PreparedOutcome::Hot { binding, commit } => {
                 let fiber_id = current
-                    .and_then(|entry| entry.fiber.as_ref())
-                    .expect("hot active fiber")
-                    .id();
+                    .and_then(|entry| entry.active_fiber)
+                    .expect("hot active fiber");
                 plan.replace.remove(path);
                 if let Some(commit) = commit {
                     plan.hot.insert(
@@ -797,7 +953,7 @@ pub(crate) fn build_plan_plugins(
         }
         node.plugin = Some(plugin);
         node.plugin_key = Some(plugin_key);
-        node.volatile = binding;
+        node.binding = binding;
     }
     Ok(())
 }
@@ -913,8 +1069,7 @@ mod tests {
     async fn missing_or_failed_parent_never_mounts_descendant_in_root_context() {
         let runtime = Runtime::new().unwrap();
         let parent = runtime.root().plugin(Arc::new(FailedParent)).await.unwrap();
-        let tree =
-            RuntimeTree::new_root(ExtensionCatalog::new(), runtime.root(), None, None).unwrap();
+        let tree = RuntimeTree::new_root(ExtensionCatalog::new(), runtime.root()).unwrap();
         tree.entries.lock().unwrap().insert(
             EntryId::from("blocked"),
             RuntimeEntry {
@@ -927,7 +1082,7 @@ mod tests {
                 context: runtime.root(),
                 factory: None,
                 options: EntryOptions::group("blocked", vec![]).unwrap(),
-                volatile: None,
+                binding: None,
             },
         );
         let path = EntryId::from("blocked:child");
@@ -939,7 +1094,7 @@ mod tests {
                 children: vec![],
                 plugin: None,
                 plugin_key: None,
-                volatile: None,
+                binding: None,
             },
         )]);
         for _ in 0..2 {

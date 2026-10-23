@@ -2,17 +2,14 @@
 
 use crate::loader::Loader;
 use cordis_core::ConfigKey;
-use std::path::PathBuf;
 
-/// 当前 Entry 在 Loader 中的位置与所属配置源目录。
+/// 当前 Entry 在 Loader 中的位置；来源专有元数据由来源提供方注入。
 #[derive(Clone)]
 pub struct EntryLocation {
     /// 完整条目路径（含 Include 前缀），例如 `reports:importer`。
     pub path: String,
     /// 所属树前缀；根树为空串。
     pub tree_prefix: String,
-    /// 所属树配置文件所在目录；内存源为 `None`。
-    pub source_dir: Option<PathBuf>,
     /// 当前 Loader 句柄（ConfigKey 注入，不依赖 Fiber Active）。
     pub loader: Loader,
 }

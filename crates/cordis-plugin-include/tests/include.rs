@@ -110,13 +110,59 @@ async fn mount(bootstrap: &std::path::Path) -> (Runtime, cordis_core::Fiber, Loa
     let runtime = Runtime::new().unwrap();
     let fiber = runtime
         .root()
-        .plugin(Arc::new(
-            LoaderPlugin::bootstrap(catalog(), bootstrap).unwrap(),
-        ))
+        .plugin(Arc::new(file_plugin(catalog(), bootstrap).unwrap()))
         .await
         .unwrap();
     let loader = (*runtime.root().get(LOADER).unwrap()).clone();
     (runtime, fiber, loader)
+}
+
+#[tokio::test]
+async fn root_include_id_is_application_owned_and_has_no_path_aliases() {
+    for root_id in ["include", "workspace-config"] {
+        let dir = tempfile::tempdir().unwrap();
+        let bootstrap = write_tree(
+            dir.path(),
+            &ExtensionsConfig {
+                version: 3,
+                extensions: vec![EntryOptions::new("worker", "demo.noop")],
+            },
+            &ExtensionsConfig {
+                version: 3,
+                extensions: vec![],
+            },
+        );
+        let runtime = Runtime::new().unwrap();
+        let plugin = LoaderPlugin::new(
+            catalog(),
+            ExtensionsConfig {
+                version: 3,
+                extensions: vec![
+                    cordis_plugin_include::bootstrap_entry(root_id, &bootstrap).unwrap(),
+                ],
+            },
+        )
+        .unwrap();
+        let _fiber = runtime.root().plugin(Arc::new(plugin)).await.unwrap();
+        let loader = runtime.root().get(LOADER).unwrap();
+        let snapshot = loader.await_idle().await.unwrap();
+        let full_path = format!("{root_id}:worker");
+        assert_eq!(
+            snapshot.entry(&full_path).unwrap().state,
+            Some(FiberState::Active)
+        );
+        assert!(loader.entry_context(&full_path).is_ok());
+        assert!(loader.describe_config(&full_path).await.is_ok());
+        assert!(loader.subtree(root_id).is_ok());
+        for alias in ["worker", "main:worker", "include:worker"] {
+            if alias != full_path {
+                assert!(snapshot.entry(alias).is_none());
+                assert!(loader.entry_context(alias).is_err());
+                assert!(loader.describe_config(alias).await.is_err());
+            }
+        }
+        runtime.shutdown().await.unwrap();
+    }
 }
 
 #[tokio::test]
@@ -137,28 +183,32 @@ async fn include_mounts_children_with_prefixed_paths() {
     let (runtime, _fiber, loader) = mount(&bootstrap).await;
     let snapshot = loader.await_idle().await.unwrap();
     assert_eq!(
-        snapshot.entry("reports:child").unwrap().state,
+        snapshot.entry("include:reports:child").unwrap().state,
         Some(FiberState::Active)
     );
     assert_eq!(
         snapshot
-            .entry("reports:child")
+            .entry("include:reports:child")
             .unwrap()
             .parent
             .as_ref()
             .map(cordis_loader::EntryId::as_str),
-        Some("reports")
+        Some("include:reports")
     );
     assert_eq!(
         &*loader
-            .entry_context("reports:child")
+            .entry_context("include:reports:child")
             .unwrap()
             .get(VALUE)
             .unwrap(),
         "from-include"
     );
     assert_eq!(
-        &*loader.entry_context("root").unwrap().get(VALUE).unwrap(),
+        &*loader
+            .entry_context("include:root")
+            .unwrap()
+            .get(VALUE)
+            .unwrap(),
         "from-root"
     );
     runtime.shutdown().await.unwrap();
@@ -178,9 +228,11 @@ async fn include_detach_on_disable_clears_children() {
     let bootstrap = write_tree(dir.path(), &root, &include);
     let (runtime, _fiber, loader) = mount(&bootstrap).await;
     loader.await_idle().await.unwrap();
-    assert!(loader.entry_context("reports:child").is_ok());
+    assert!(loader.entry_context("include:reports:child").is_ok());
 
     loader
+        .subtree("include")
+        .unwrap()
         .update(
             "reports",
             EntryUpdate {
@@ -194,7 +246,7 @@ async fn include_detach_on_disable_clears_children() {
         .unwrap();
     loader.await_idle().await.unwrap();
     assert!(matches!(
-        loader.entry_context("reports:child"),
+        loader.entry_context("include:reports:child"),
         Err(LoaderControlError::Loader(
             LoaderError::UnknownInstance { .. }
         ))
@@ -218,14 +270,14 @@ async fn subtree_create_writes_only_include_file() {
     let (runtime, _fiber, loader) = mount(&bootstrap).await;
     loader.await_idle().await.unwrap();
 
-    let subtree = loader.subtree("reports").unwrap();
+    let subtree = loader.subtree("include:reports").unwrap();
     subtree
         .create(EntryOptions::new("extra", "demo.noop"), None, None)
         .await
         .unwrap();
     let snapshot = loader.await_idle().await.unwrap();
     assert_eq!(
-        snapshot.entry("reports:extra").unwrap().state,
+        snapshot.entry("include:reports:extra").unwrap().state,
         Some(FiberState::Active)
     );
     assert_eq!(
@@ -252,7 +304,7 @@ async fn subtree_conflict_requires_reload() {
     let bootstrap = write_tree(dir.path(), &root, &include);
     let (runtime, _fiber, loader) = mount(&bootstrap).await;
     loader.await_idle().await.unwrap();
-    let subtree = loader.subtree("reports").unwrap();
+    let subtree = loader.subtree("include:reports").unwrap();
 
     fs::write(
         dir.path().join("nested.toml"),
@@ -272,12 +324,12 @@ async fn subtree_conflict_requires_reload() {
         .await
         .unwrap_err();
     assert!(matches!(err, LoaderControlError::ConfigConflict { .. }));
-    assert!(loader.entry_context("reports:external").is_err());
+    assert!(loader.entry_context("include:reports:external").is_err());
 
     subtree.reload().await.unwrap();
     let snapshot = loader.await_idle().await.unwrap();
     assert_eq!(
-        snapshot.entry("reports:external").unwrap().state,
+        snapshot.entry("include:reports:external").unwrap().state,
         Some(FiberState::Active)
     );
     runtime.shutdown().await.unwrap();
@@ -306,28 +358,26 @@ async fn invalid_include_fails_apply_without_residue() {
     let runtime = Runtime::new().unwrap();
     let fiber = runtime
         .root()
-        .plugin(Arc::new(
-            LoaderPlugin::bootstrap(catalog(), &bootstrap).unwrap(),
-        ))
+        .plugin(Arc::new(file_plugin(catalog(), &bootstrap).unwrap()))
         .await
         .expect("handle returned");
     assert_eq!(fiber.state(), FiberState::Active);
     let loader = runtime.root().get(LOADER).unwrap();
     let snapshot = loader.await_idle().await.unwrap();
     assert_eq!(
-        snapshot.entry("reports").unwrap().state,
+        snapshot.entry("include:reports").unwrap().state,
         Some(FiberState::Failed)
     );
     assert!(
         snapshot
-            .entry("reports")
+            .entry("include:reports")
             .unwrap()
             .last_error
             .as_deref()
             .unwrap()
             .contains("配置版本")
     );
-    assert!(loader.subtree("reports").is_err());
+    assert!(loader.subtree("include:reports").is_err());
     runtime.shutdown().await.unwrap();
 }
 
@@ -374,37 +424,35 @@ async fn failed_child_keeps_include_control_plane_and_independent_sibling() {
     let runtime = Runtime::new().unwrap();
     let mut fiber = runtime
         .root()
-        .plugin(Arc::new(
-            LoaderPlugin::bootstrap(catalog, bootstrap).unwrap(),
-        ))
+        .plugin(Arc::new(file_plugin(catalog, bootstrap).unwrap()))
         .await
         .unwrap();
     let loader = runtime.root().get(LOADER).unwrap();
     let snapshot = loader.await_idle().await.unwrap();
     assert_eq!(fiber.state(), FiberState::Active);
     assert_eq!(
-        snapshot.entry("reports").unwrap().state,
+        snapshot.entry("include:reports").unwrap().state,
         Some(FiberState::Active)
     );
     assert_eq!(
-        snapshot.entry("reports:broken").unwrap().state,
+        snapshot.entry("include:reports:broken").unwrap().state,
         Some(FiberState::Failed)
     );
-    let stable = snapshot.entry("reports:stable").unwrap();
+    let stable = snapshot.entry("include:reports:stable").unwrap();
     assert_eq!(stable.state, Some(FiberState::Active));
-    let subtree = loader.subtree("reports").unwrap();
+    let subtree = loader.subtree("include:reports").unwrap();
     assert_eq!(subtree.snapshot().unwrap().entries.len(), 2);
     assert!(subtree.reload().await.is_err());
     subtree.remove("broken").await.unwrap();
     let recovered = loader.await_idle().await.unwrap();
-    assert!(recovered.entry("reports:broken").is_none());
+    assert!(recovered.entry("include:reports:broken").is_none());
     assert_eq!(
-        recovered.entry("reports:stable").unwrap().fiber_id,
+        recovered.entry("include:reports:stable").unwrap().fiber_id,
         stable.fiber_id
     );
     fiber.dispose_wait().await.unwrap();
     assert!(runtime.diagnostics().plugin_fibers.is_empty());
-    assert!(loader.subtree("reports").is_err());
+    assert!(loader.subtree("include:reports").is_err());
     runtime.shutdown().await.unwrap();
 }
 
@@ -426,6 +474,8 @@ async fn cross_tree_move_is_rejected() {
     let (runtime, _fiber, loader) = mount(&bootstrap).await;
     loader.await_idle().await.unwrap();
     let err = loader
+        .subtree("include")
+        .unwrap()
         .update(
             "app:local",
             EntryUpdate::default(),
@@ -463,27 +513,31 @@ async fn duplicate_include_file_fails() {
     let runtime = Runtime::new().unwrap();
     let fiber = runtime
         .root()
-        .plugin(Arc::new(
-            LoaderPlugin::bootstrap(catalog(), &bootstrap).unwrap(),
-        ))
+        .plugin(Arc::new(file_plugin(catalog(), &bootstrap).unwrap()))
         .await
         .expect("handle");
     assert_eq!(fiber.state(), FiberState::Active);
     let loader = runtime.root().get(LOADER).unwrap();
     let snapshot = loader.await_idle().await.unwrap();
-    assert_eq!(snapshot.entry("a").unwrap().state, Some(FiberState::Active));
-    assert_eq!(snapshot.entry("b").unwrap().state, Some(FiberState::Failed));
+    assert_eq!(
+        snapshot.entry("include:a").unwrap().state,
+        Some(FiberState::Active)
+    );
+    assert_eq!(
+        snapshot.entry("include:b").unwrap().state,
+        Some(FiberState::Failed)
+    );
     assert!(
         snapshot
-            .entry("b")
+            .entry("include:b")
             .unwrap()
             .last_error
             .as_deref()
             .unwrap()
             .contains("其他树附着")
     );
-    assert!(loader.subtree("a").is_ok());
-    assert!(loader.subtree("b").is_err());
+    assert!(loader.subtree("include:a").is_ok());
+    assert!(loader.subtree("include:b").is_err());
     runtime.shutdown().await.unwrap();
 }
 
@@ -508,15 +562,13 @@ async fn include_cycle_fails_only_cyclic_entry_without_registering_another_tree(
     let runtime = Runtime::new().unwrap();
     let fiber = runtime
         .root()
-        .plugin(Arc::new(
-            LoaderPlugin::bootstrap(catalog(), &bootstrap).unwrap(),
-        ))
+        .plugin(Arc::new(file_plugin(catalog(), &bootstrap).unwrap()))
         .await
         .expect("handle returned");
     assert_eq!(fiber.state(), FiberState::Active);
     let loader = runtime.root().get(LOADER).unwrap();
     let snapshot = loader.await_idle().await.unwrap();
-    let cyclic = snapshot.entry("reports:back").unwrap();
+    let cyclic = snapshot.entry("include:reports:back").unwrap();
     assert_eq!(cyclic.state, Some(FiberState::Failed));
     assert!(
         cyclic
@@ -524,9 +576,9 @@ async fn include_cycle_fails_only_cyclic_entry_without_registering_another_tree(
             .as_deref()
             .is_some_and(|message| message.contains("循环引用"))
     );
-    assert_eq!(snapshot.entries.len(), 2);
-    assert!(loader.subtree("reports").is_ok());
-    assert!(loader.subtree("reports:back").is_err());
+    assert_eq!(snapshot.entries.len(), 3);
+    assert!(loader.subtree("include:reports").is_ok());
+    assert!(loader.subtree("include:reports:back").is_err());
     let mut fiber = fiber;
     fiber.dispose_wait().await.unwrap();
     assert!(runtime.root().get(LOADER).is_err());
@@ -550,8 +602,8 @@ async fn concurrent_attach_reserves_one_subtree_source() {
     };
     let bootstrap = write_tree(dir.path(), &root, &include);
     let (runtime, _fiber, loader) = mount(&bootstrap).await;
-    let left_context = loader.entry_context("a").unwrap();
-    let right_context = loader.entry_context("b").unwrap();
+    let left_context = loader.entry_context("include:a").unwrap();
+    let right_context = loader.entry_context("include:b").unwrap();
     let barrier = Arc::new(Barrier::new(2));
 
     let left_loader = loader.clone();
@@ -559,7 +611,14 @@ async fn concurrent_attach_reserves_one_subtree_source() {
     let left = tokio::spawn(async move {
         left_barrier.wait().await;
         left_loader
-            .attach_file_subtree(&left_context, "nested.toml")
+            .attach_subtree(
+                &left_context,
+                cordis_plugin_include::FileSource::from_config(
+                    cordis_plugin_include::IncludeConfig::new("nested.toml"),
+                    &left_context,
+                )
+                .unwrap(),
+            )
             .await
     });
     let right_loader = loader.clone();
@@ -567,7 +626,14 @@ async fn concurrent_attach_reserves_one_subtree_source() {
     let right = tokio::spawn(async move {
         right_barrier.wait().await;
         right_loader
-            .attach_file_subtree(&right_context, "nested.toml")
+            .attach_subtree(
+                &right_context,
+                cordis_plugin_include::FileSource::from_config(
+                    cordis_plugin_include::IncludeConfig::new("nested.toml"),
+                    &right_context,
+                )
+                .unwrap(),
+            )
             .await
     });
 
@@ -581,18 +647,18 @@ async fn concurrent_attach_reserves_one_subtree_source() {
     ));
     let snapshot = loader.await_idle().await.unwrap();
     assert_eq!(
-        usize::from(snapshot.entry("a:child").is_some())
-            + usize::from(snapshot.entry("b:child").is_some()),
+        usize::from(snapshot.entry("include:a:child").is_some())
+            + usize::from(snapshot.entry("include:b:child").is_some()),
         1
     );
 
     let subtree = ["a", "b"]
         .into_iter()
-        .find_map(|prefix| loader.subtree(prefix).ok())
+        .find_map(|prefix| loader.subtree(format!("include:{prefix}")).ok())
         .expect("one attached subtree");
     subtree.detach().await.unwrap();
-    assert!(loader.entry_context("a:child").is_err());
-    assert!(loader.entry_context("b:child").is_err());
+    assert!(loader.entry_context("include:a:child").is_err());
+    assert!(loader.entry_context("include:b:child").is_err());
     runtime.shutdown().await.unwrap();
 }
 
@@ -626,26 +692,41 @@ async fn nested_include_prefixes_paths() {
     let (runtime, _fiber, loader) = mount(&bootstrap).await;
     let snapshot = loader.await_idle().await.unwrap();
     assert_eq!(
-        snapshot.entry("reports:mid:leaf").unwrap().state,
+        snapshot.entry("include:reports:mid:leaf").unwrap().state,
         Some(FiberState::Active)
     );
     assert_eq!(
         snapshot
-            .entry("reports:mid")
+            .entry("include:reports:mid")
             .unwrap()
             .parent
             .as_ref()
             .map(cordis_loader::EntryId::as_str),
-        Some("reports")
+        Some("include:reports")
     );
     assert_eq!(
         snapshot
-            .entry("reports:mid:leaf")
+            .entry("include:reports:mid:leaf")
             .unwrap()
             .parent
             .as_ref()
             .map(cordis_loader::EntryId::as_str),
-        Some("reports:mid")
+        Some("include:reports:mid")
     );
     runtime.shutdown().await.unwrap();
+}
+
+fn file_plugin(
+    catalog: ExtensionCatalog,
+    bootstrap: impl AsRef<std::path::Path>,
+) -> Result<LoaderPlugin, LoaderError> {
+    let entry = cordis_plugin_include::bootstrap_entry("include", bootstrap)
+        .map_err(|error| LoaderError::invalid_config(error.to_string()))?;
+    LoaderPlugin::new(
+        catalog,
+        ExtensionsConfig {
+            version: 3,
+            extensions: vec![entry],
+        },
+    )
 }

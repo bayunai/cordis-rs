@@ -16,6 +16,7 @@ cordis-core.workspace = true
 [dev-dependencies]
 async-trait.workspace = true
 cordis-loader.workspace = true
+cordis-plugin-include.workspace = true
 cordis-plugin-logger-console.workspace = true
 cordis-plugin-timer.workspace = true
 schemars.workspace = true

@@ -1,7 +1,7 @@
 //! EntryTree 管理控制面（根树与可附着子树）。
 
 use crate::{
-    bootstrap::{load_extensions_source, write_extensions},
+    EntryTreeSource,
     catalog::{FactoryDescriptor, InjectionDescriptorInfo, IsolationDescriptorInfo},
     config::{EntryOptions, ExtensionsConfig, InjectConfig, IsolateConfig},
     error::LoaderError,
@@ -10,10 +10,7 @@ use crate::{
     tree::{RuntimeTree, ensure_tree_revision_control},
 };
 use cordis_core::{Context, ServiceKey};
-use std::{
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+use std::sync::Arc;
 use tokio::sync::broadcast;
 
 /// Loader 的运行时快照已失效。
@@ -65,14 +62,26 @@ pub enum LoaderControlError {
     InvalidMove { path: String },
     #[error("不支持跨树移动条目: {path}")]
     CrossTreeMove { path: String },
-    #[error("配置文件已在 Loader 外修改；请先 reload: {path}", path = path.display())]
-    ConfigConflict { path: PathBuf },
-    #[error("运行时已生效，但未能写回配置 {path}: {message}", path = path.display())]
+    #[error("配置来源已在 Loader 外修改；请先 reload: {source_id}")]
+    ConfigConflict { source_id: String },
+    #[error("配置来源失败: {source}")]
+    Source { source: crate::SourceError },
+    #[error("运行时已生效，但未能写回配置来源 {source_id}: {message}")]
     Persist {
         snapshot: Box<LoaderSnapshot>,
-        path: PathBuf,
+        source_id: String,
         message: String,
     },
+}
+
+impl LoaderControlError {
+    pub(crate) fn from_source(source_id: String, source: crate::SourceError) -> Self {
+        if source.kind == crate::SourceErrorKind::Conflict {
+            Self::ConfigConflict { source_id }
+        } else {
+            Self::Source { source }
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -157,14 +166,14 @@ impl Loader {
         Ok(self.inner()?.events.subscribe())
     }
 
-    /// 在 `owner` Context（须带 [`crate::ENTRY_LOCATION`]）上附着文件子树。
-    pub async fn attach_file_subtree(
+    /// 在条目 Context 上附着来源树。物理位置、编解码与写回均由来源实现。
+    pub async fn attach_subtree(
         &self,
         owner: &Context,
-        path: impl AsRef<Path>,
+        source: Arc<dyn EntryTreeSource>,
     ) -> Result<LoaderSubtree, LoaderControlError> {
         let inner = self.inner()?;
-        let tree = inner.attach_file_subtree(owner, path.as_ref()).await?;
+        let tree = inner.attach_subtree(owner, source).await?;
         Ok(LoaderSubtree {
             loader: inner,
             tree,
@@ -199,8 +208,9 @@ impl Loader {
     ) -> Result<LoaderSnapshot, LoaderControlError> {
         let inner = self.inner()?;
         reject_cross_tree(&inner, parent)?;
+        let parent = parent.map(str::to_owned);
         mutate_tree(&inner.root, move |config| {
-            insert_entry(&mut config.extensions, parent, position, entry)
+            insert_entry(&mut config.extensions, parent.as_deref(), position, entry)
         })
         .await
         .map(|_| inner.aggregate_snapshot())
@@ -221,8 +231,10 @@ impl Loader {
         if let Some(Some(parent)) = parent {
             reject_cross_tree(&inner, Some(parent))?;
         }
+        let parent = parent.map(|parent| parent.map(str::to_owned));
         mutate_tree(&inner.root, move |config| {
-            let destination = if let Some(parent) = parent {
+            let destination = if let Some(parent) = parent.as_ref() {
+                let parent = parent.as_deref();
                 if parent.is_some_and(|parent| {
                     parent == path || parent.starts_with(&(path.clone() + ":"))
                 }) {
@@ -259,10 +271,7 @@ impl Loader {
 
     pub async fn reload(&self) -> Result<LoaderSnapshot, LoaderControlError> {
         let inner = self.inner()?;
-        let _operation = inner.root.operations.lock().await;
-        let path = source_path_tree(&inner.root)?;
-        let (config, revision) = load_extensions_source(&path)?;
-        let _ = inner.root.apply(config, Some(revision)).await?;
+        inner.root.reload().await?;
         Ok(inner.aggregate_snapshot())
     }
 
@@ -279,10 +288,26 @@ impl Loader {
 #[derive(Clone)]
 pub struct LoaderSubtree {
     loader: Arc<LoaderInner>,
-    tree: Arc<RuntimeTree>,
+    pub(crate) tree: Arc<RuntimeTree>,
 }
 
 impl LoaderSubtree {
+    fn reject_nested_path(&self, local: &str) -> Result<(), LoaderControlError> {
+        let full = format!("{}:{local}", self.tree.prefix);
+        if self
+            .loader
+            .subtree_owning_path(&full)
+            .is_some_and(|tree| !Arc::ptr_eq(&tree, &self.tree))
+        {
+            return Err(LoaderControlError::CrossTreeMove { path: full });
+        }
+        Ok(())
+    }
+    /// 已加载的该来源树声明，不代表每个节点均已 Active。
+    pub fn entries(&self) -> Result<ExtensionsConfig, LoaderControlError> {
+        self.ensure_alive()?;
+        Ok(self.tree.desired.lock().expect("desired").clone())
+    }
     /// 子树局部路径对应的配置描述；返回值中的路径为全路径。
     pub async fn describe_config(
         &self,
@@ -328,8 +353,12 @@ impl LoaderSubtree {
         position: Option<usize>,
     ) -> Result<LoaderSnapshot, LoaderControlError> {
         self.ensure_alive()?;
+        if let Some(parent) = parent {
+            self.reject_nested_path(parent)?;
+        }
+        let parent = parent.map(str::to_owned);
         mutate_tree(&self.tree, move |config| {
-            insert_entry(&mut config.extensions, parent, position, entry)
+            insert_entry(&mut config.extensions, parent.as_deref(), position, entry)
         })
         .await
     }
@@ -343,8 +372,14 @@ impl LoaderSubtree {
     ) -> Result<LoaderSnapshot, LoaderControlError> {
         self.ensure_alive()?;
         let path = path.as_ref().to_owned();
+        self.reject_nested_path(&path)?;
+        if let Some(Some(parent)) = parent {
+            self.reject_nested_path(parent)?;
+        }
+        let parent = parent.map(|parent| parent.map(str::to_owned));
         mutate_tree(&self.tree, move |config| {
-            let destination = if let Some(parent) = parent {
+            let destination = if let Some(parent) = parent.as_ref() {
+                let parent = parent.as_deref();
                 if parent.is_some_and(|parent| {
                     parent == path || parent.starts_with(&(path.clone() + ":"))
                 }) {
@@ -368,6 +403,7 @@ impl LoaderSubtree {
     ) -> Result<LoaderSnapshot, LoaderControlError> {
         self.ensure_alive()?;
         let path = path.as_ref().to_owned();
+        self.reject_nested_path(&path)?;
         mutate_tree(&self.tree, move |config| {
             remove_entry(&mut config.extensions, &path).map(|_| ())
         })
@@ -384,7 +420,10 @@ impl LoaderSubtree {
     }
 
     fn ensure_alive(&self) -> Result<(), LoaderControlError> {
-        if self.loader.alive.load(std::sync::atomic::Ordering::Acquire) {
+        if self.loader.alive.load(std::sync::atomic::Ordering::Acquire)
+            && !self.tree.closing.load(std::sync::atomic::Ordering::Acquire)
+            && !self.tree.owner.is_disposed()
+        {
             Ok(())
         } else {
             Err(LoaderControlError::LoaderUnavailable)
@@ -416,31 +455,56 @@ async fn mutate_tree<F>(
     mutate: F,
 ) -> Result<LoaderSnapshot, LoaderControlError>
 where
-    F: FnOnce(&mut ExtensionsConfig) -> Result<(), LoaderControlError>,
+    F: FnOnce(&mut ExtensionsConfig) -> Result<(), LoaderControlError> + Send + 'static,
 {
-    let _operation = tree.operations.lock().await;
-    let path = source_path_tree(tree)?;
-    ensure_tree_revision_control(tree, &path)?;
-    let mut target = tree.desired.lock().expect("desired").clone();
-    mutate(&mut target)?;
-    let snapshot = tree.apply(target.clone(), None).await?;
-    match write_extensions(&path, &target) {
+    let tree = tree.clone();
+    tokio::spawn(async move {
+        let _operation = tree.operations.lock().await;
+        tree.ensure_open()?;
+        tree.await_idle().await?;
+        ensure_tree_revision_control(&tree)?;
+        let mut target = tree.desired.lock().expect("desired").clone();
+        mutate(&mut target)?;
+        commit_tree_locked(&tree, target, None).await
+    })
+    .await
+    .map_err(|_| LoaderControlError::ConfigOperationAborted)?
+}
+
+/// 唯一提交路径：来源检查与预检在生命周期前，来源写回在协调成功后。
+pub(crate) async fn commit_tree_locked(
+    tree: &Arc<RuntimeTree>,
+    target: ExtensionsConfig,
+    prepared: Option<(EntryId, crate::PreparedExtension)>,
+) -> Result<LoaderSnapshot, LoaderControlError> {
+    tree.ensure_open()?;
+    let source = tree.source.lock().expect("source").clone();
+    if let Some(source) = &source {
+        source
+            .validate_write(&target)
+            .map_err(|error| LoaderControlError::from_source(source.identity(), error))?;
+    }
+    let snapshot = tree.apply_prepared(target.clone(), None, prepared).await?;
+    let Some(source) = source else {
+        return Ok(snapshot);
+    };
+    let expected = tree
+        .revision
+        .lock()
+        .expect("revision")
+        .clone()
+        .ok_or(LoaderError::NoConfigSource)?;
+    match source.write(&target, &expected) {
         Ok(revision) => {
             *tree.revision.lock().expect("revision") = Some(revision);
             Ok(snapshot)
         }
         Err(error) => Err(LoaderControlError::Persist {
             snapshot: Box::new(snapshot),
-            path,
+            source_id: source.identity(),
             message: error.to_string(),
         }),
     }
-}
-
-pub(crate) fn source_path_tree(tree: &RuntimeTree) -> Result<PathBuf, LoaderControlError> {
-    tree.extensions_path
-        .clone()
-        .ok_or(LoaderError::NoConfigSource.into())
 }
 
 fn path_parts(path: &str) -> Result<Vec<&str>, LoaderControlError> {

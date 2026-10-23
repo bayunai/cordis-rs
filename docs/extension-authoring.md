@@ -29,10 +29,10 @@ Entry 释放后订阅返回 `ConfigClosed`，旧引用仍可读取最后快照�
 
 普通配置变化必须重建插件；混合变化将完整候选值交给新插件，不先修改旧插件热值。
 需要关闭连接、修改服务依赖或重建 Context 的参数应归普通配置，而不是 `Live`。
-完整示例见 [`volatile_config`](../crates/cordis-loader/examples/volatile_config.rs)：
+完整示例见 [`volatile_config`](../crates/cordis-plugin-include/examples/volatile_config.rs)：
 
 ```bash
-cargo run -p cordis-loader --example volatile_config
+cargo run -p cordis-plugin-include --example volatile_config
 ```
 
 ## 配置表单与秘密字段
@@ -61,6 +61,22 @@ struct UploadConfig {
 未修改的秘密不要从脱敏表单补为空字符串；只有用户明确替换或删除时才提交相应操作。
 管理端无需依赖插件自身的客户端入口，未启用或失败的实例同样能修复配置。
 详细并发、持久化及 Schema 边界见 [Host 配置控制面](host.md#面向管理界面的配置控制面)。
+
+## 文件来源与树载体
+
+文件读取、路径、编解码、patches 与文件写回属于可选 `cordis-plugin-include`，不是 Factory
+或 Core 的通用职责。Host 显式注册 IncludeFactory，并用 `bootstrap_entry("include", path)` 构造
+根文件条目；文件中的实例完整路径因此带 `include:` 前缀。原始文件内的局部 ID 不需要增加前缀。
+
+业务服务通过 `loader.entry_context("include:插件")` 读取；文件树 CRUD 使用
+`loader.subtree("include")` 的局部路径。`describe_config` / `mutate_config` 可以直接使用完整路径，
+由 Loader 定位来源。Loader 内存根 CRUD 不持久化，不能把文件修改发到根控制面。
+
+需要文件目录时读取 Include 提供的 `INCLUDE_LOCATION`，不要假定 `EntryLocation` 包含文件信息。
+该元数据只在 Include 来源的上下文中存在；内存根中的 Include 应使用绝对路径。
+`PreparedExtension::tree()` 为来源树载体保留局部更新语义，不应通过普通 volatile 订阅模拟
+来源更新完成。仅 patches、initial 或日志策略改变时，Include 的控制调用会等待子树协调。
+文件路径或父上下文改变则重新挂载来源树。详见 [Include 文档](include.md)。
 
 ## 最小 Plugin 示例
 
@@ -189,7 +205,7 @@ impl ExtensionFactory for GreeterFactory {
 ```
 
 ```text
-Loader 读取 EntryTree → 反序列化为 `Factory::Config` → factory.prepare(config) → 选择热提交或执行延迟构造 → 挂载到所属服务域 Context
+来源读取声明 → Loader 反序列化为 `Factory::Config` → factory.prepare(config) → 选择热提交、树载体更新或延迟构造 → 挂载到所属服务域 Context
 ```
 
 - `prepare` 与构造闭包必须无业务副作用；I/O 与任务只出现在 `Plugin::apply`。
@@ -205,8 +221,9 @@ Loader 读取 EntryTree → 反序列化为 `Factory::Config` → factory.prepar
   条目上的 `isolate`（Catalog 须先 `register_isolation`）：`true` 独占运行期标签，非空字符串
   按 `(ServiceId, 标签名)` 在 Loader 内复用。`inject = { ... }` 只覆盖 `ConfigKey`。未隔离的
   Key 与父同槽，可共享也可 `ServiceConflict`。
-- **Include**：`cordis-plugin-include` 的 `cordis:include` 将独立 v3 TOML 附着为 Loader 子树；
-  须 Catalog 显式注册；管理用 `loader.subtree(path)`；外部改文件后须显式 `reload()`。
+- **Include**：`cordis-plugin-include` 的 `cordis:include` 将独立 v3 TOML／JSON／YAML 文档附着为
+  Loader 来源树，并拥有文件读取、patches、版本检查与写回；须 Catalog 显式注册。
+  文件管理用 `loader.subtree(path)` 与局部路径，外部改文件后须显式 `reload()`。
 
 ## ServiceKey / Event Key
 

@@ -1,72 +1,41 @@
-//! 静态 Include：以独立 TOML 文件驱动的嵌套 EntryTree。
-//!
-//! Host 须显式 `catalog.register(IncludeFactory)`；首版仅 TOML + 显式
-//! [`LoaderSubtree::reload`](cordis_loader::LoaderSubtree::reload)，无文件监听。
-//!
-//! 管理子树请用 [`Loader::subtree`](cordis_loader::Loader::subtree)（路径为 Include 条目完整路径）。
-//! 子树业务插件挂载失败保留子树控制面与 Failed 条目；文件或预检失败则使对应 Include 条目失败。
+//! 独立文件配置树：读取、覆盖、来源目录、版本检查与原子写回由 Include 拥有。
+//! Loader 只认识 [`cordis_loader::EntryTreeSource`]，不解析格式或读取文件。
+//! 显式 reload 由子树控制面调用；本插件不安装文件监听器。
 
-use async_trait::async_trait;
-use cordis_core::{Context, CoreError, Plugin, PluginKey};
-use cordis_loader::{ENTRY_LOCATION, ExtensionFactory, LoaderError, PreparedExtension};
-use schemars::JsonSchema;
-use serde::Deserialize;
-use std::{path::PathBuf, sync::Arc};
+mod bootstrap;
+mod codec;
+mod config;
+mod patches;
+mod source;
 
-/// Include 工厂配置：指向完整 v3 `ExtensionsConfig` TOML。
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct IncludeConfig {
-    /// 相对路径相对于承载 Include Entry 的配置文件目录；绝对路径直接使用。
-    pub path: PathBuf,
-}
+pub use bootstrap::{
+    BootstrapConfig, BootstrapConfigSource, ConfigDriver, bootstrap_entry, load_bootstrap,
+    load_extensions,
+};
+pub use config::{EntryPatch, IncludeConfig};
+pub use patches::apply_patches;
+pub use source::{FileSource, INCLUDE_LOCATION, IncludeLocation};
 
-/// Catalog Factory ID：`cordis:include`。
+use cordis_core::PluginKey;
+use cordis_loader::{ExtensionFactory, LoaderError, PreparedExtension};
+
+/// 文件来源树的显式 Catalog Factory；不隐式安装到任意 Host。
 pub struct IncludeFactory;
 
 impl ExtensionFactory for IncludeFactory {
     type Config = IncludeConfig;
-
     fn id(&self) -> &'static str {
         "cordis:include"
     }
-
     fn prepare(&self, config: IncludeConfig) -> Result<PreparedExtension, LoaderError> {
-        Ok(PreparedExtension::ordinary(move || {
-            Ok(Arc::new(IncludePlugin { path: config.path }))
-        }))
-    }
-}
-
-struct IncludePlugin {
-    path: PathBuf,
-}
-
-#[async_trait]
-impl Plugin for IncludePlugin {
-    fn key(&self) -> PluginKey {
-        PluginKey::new("cordis.include")
-    }
-
-    async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
-        let location = ctx
-            .config(ENTRY_LOCATION)
-            .map_err(|error| CoreError::PluginApply(error.to_string()))?;
-        let subtree = location
-            .loader
-            .attach_file_subtree(ctx, &self.path)
-            .await
-            .map_err(|error| CoreError::PluginApply(error.to_string()))?;
-        ctx.effect_named("include-subtree")?
-            .on_dispose_async(move || {
-                let subtree = subtree.clone();
-                async move {
-                    subtree
-                        .detach()
-                        .await
-                        .map_err(|error| CoreError::PluginApply(error.to_string()))
-                }
-            })?;
-        Ok(())
+        config
+            .validate()
+            .map_err(|error| LoaderError::invalid_config(error.to_string()))?;
+        Ok(PreparedExtension::tree(
+            PluginKey::new("cordis.include"),
+            config.path.clone(),
+            config,
+            |_, config, ctx| FileSource::from_config(config, ctx),
+        ))
     }
 }

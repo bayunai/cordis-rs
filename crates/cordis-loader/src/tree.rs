@@ -1,8 +1,7 @@
 //! 单棵可附着的运行时 EntryTree（根树或 Include 子树）。
 
 use crate::{
-    PreparedExtension,
-    bootstrap::load_extensions_source,
+    EntryTreeSource, PreparedExtension, SourceRevision,
     catalog::{ExtensionCatalog, NamedIsolationLabels},
     config::{EntryOptions, ExtensionsConfig},
     config_control::ConfigRevision,
@@ -17,7 +16,6 @@ use crate::{
 use cordis_core::{Context, Fiber};
 use std::{
     collections::{BTreeMap, HashMap},
-    path::{Path, PathBuf},
     sync::{Arc, Mutex, Weak},
 };
 use tokio::sync::Notify;
@@ -63,7 +61,7 @@ impl ReconcileCompletion {
     }
 }
 
-/// 一棵文件（或内存）驱动的 EntryTree 运行时状态。
+/// 一棵内存条目树，可选来源对象提供读取、版本检查及持久化。
 pub(crate) struct RuntimeTree {
     pub(crate) config_identity: u128,
     pub(crate) config_generation: std::sync::atomic::AtomicU64,
@@ -72,15 +70,12 @@ pub(crate) struct RuntimeTree {
     pub(crate) loader: Mutex<Weak<super::plugin::LoaderInner>>,
     pub(crate) owner: Context,
     pub(crate) prefix: EntryId,
-    /// 规范化绝对路径；内存源为 `None`。
-    pub(crate) file_key: Option<PathBuf>,
-    /// 父树配置文件路径（用于循环检测）；根为 `None`。
-    pub(crate) parent_file: Option<PathBuf>,
-    pub(crate) source_dir: Option<PathBuf>,
-    /// 配置源路径在树创建时确定，后续不会变更。
-    pub(crate) extensions_path: Option<PathBuf>,
+    pub(crate) source: Mutex<Option<Arc<dyn EntryTreeSource>>>,
+    pub(crate) source_id: Option<String>,
+    pub(crate) parent_source: Option<String>,
+    pub(crate) closing: std::sync::atomic::AtomicBool,
     pub(crate) desired: Mutex<ExtensionsConfig>,
-    pub(crate) revision: Mutex<Option<String>>,
+    pub(crate) revision: Mutex<Option<SourceRevision>>,
     pub(crate) entries: Mutex<BTreeMap<EntryId, RuntimeEntry>>,
     pub(crate) order: Mutex<Vec<EntryId>>,
     pub(crate) named_labels: Mutex<NamedIsolationLabels>,
@@ -88,21 +83,19 @@ pub(crate) struct RuntimeTree {
     pub(crate) operations: tokio::sync::Mutex<()>,
 }
 
+/// 完整预检结果可跨提交边界保留，避免树载体更新在其他生命周期开始后才构造子插件。
+pub(crate) struct PreparedTreePlan {
+    desired: BTreeMap<EntryId, DesiredNode>,
+    plan: ReconcilePlan,
+    config: ExtensionsConfig,
+    pub(crate) revision: Option<SourceRevision>,
+}
+
 impl RuntimeTree {
     pub(crate) fn new_root(
         catalog: ExtensionCatalog,
         owner: Context,
-        extensions_path: Option<PathBuf>,
-        revision: Option<String>,
     ) -> Result<Arc<Self>, LoaderError> {
-        let (file_key, source_dir) = match &extensions_path {
-            Some(path) => {
-                let key = canonicalize_existing(path).ok();
-                let dir = path.parent().map(Path::to_path_buf);
-                (key.or_else(|| Some(path.clone())), dir)
-            }
-            None => (None, None),
-        };
         Ok(Arc::new(Self {
             config_identity: next_config_identity()?,
             config_generation: std::sync::atomic::AtomicU64::new(0),
@@ -110,15 +103,15 @@ impl RuntimeTree {
             loader: Mutex::new(Weak::new()),
             owner,
             prefix: EntryId::from(""),
-            file_key,
-            parent_file: None,
-            source_dir,
-            extensions_path,
+            source: Mutex::new(None),
+            source_id: None,
+            parent_source: None,
+            closing: std::sync::atomic::AtomicBool::new(false),
             desired: Mutex::new(ExtensionsConfig {
                 version: crate::config::CONFIG_VERSION,
                 extensions: Vec::new(),
             }),
-            revision: Mutex::new(revision),
+            revision: Mutex::new(None),
             entries: Mutex::new(BTreeMap::new()),
             order: Mutex::new(Vec::new()),
             named_labels: Mutex::new(NamedIsolationLabels::new()),
@@ -133,12 +126,12 @@ impl RuntimeTree {
         loader: Weak<super::plugin::LoaderInner>,
         owner: Context,
         prefix: EntryId,
-        file_path: PathBuf,
-        file_key: PathBuf,
-        parent_file: Option<PathBuf>,
-        revision: String,
+        source: Arc<dyn EntryTreeSource>,
+        parent_source: Option<String>,
+        revision: SourceRevision,
     ) -> Result<Arc<Self>, LoaderError> {
-        let source_dir = file_path.parent().map(Path::to_path_buf);
+        let source_id = source.identity();
+        let owner = source.context(&owner)?;
         Ok(Arc::new(Self {
             config_identity: next_config_identity()?,
             config_generation: std::sync::atomic::AtomicU64::new(0),
@@ -146,10 +139,10 @@ impl RuntimeTree {
             loader: Mutex::new(loader),
             owner,
             prefix,
-            file_key: Some(file_key),
-            parent_file,
-            source_dir,
-            extensions_path: Some(file_path),
+            source: Mutex::new(Some(source)),
+            source_id: Some(source_id),
+            parent_source,
+            closing: std::sync::atomic::AtomicBool::new(false),
             desired: Mutex::new(ExtensionsConfig {
                 version: crate::config::CONFIG_VERSION,
                 extensions: Vec::new(),
@@ -181,7 +174,7 @@ impl RuntimeTree {
     pub(crate) async fn apply(
         self: &Arc<Self>,
         config: ExtensionsConfig,
-        revision: Option<String>,
+        revision: Option<SourceRevision>,
     ) -> Result<LoaderSnapshot, LoaderError> {
         self.apply_prepared(config, revision, None).await
     }
@@ -197,9 +190,19 @@ impl RuntimeTree {
     pub(crate) async fn apply_prepared(
         self: &Arc<Self>,
         config: ExtensionsConfig,
-        revision: Option<String>,
+        revision: Option<SourceRevision>,
         prepared: Option<(EntryId, PreparedExtension)>,
     ) -> Result<LoaderSnapshot, LoaderError> {
+        let plan = self.prepare_plan(config, revision, prepared)?;
+        self.apply_plan(plan).await
+    }
+
+    pub(crate) fn prepare_plan(
+        &self,
+        config: ExtensionsConfig,
+        revision: Option<SourceRevision>,
+        prepared: Option<(EntryId, PreparedExtension)>,
+    ) -> Result<PreparedTreePlan, LoaderError> {
         let prefix = if self.prefix.as_str().is_empty() {
             None
         } else {
@@ -217,25 +220,50 @@ impl RuntimeTree {
             &self.entries,
             prepared,
         )?;
-        let completion = {
-            let mut slot = self.reconcile.lock().expect("reconcile slot");
-            if slot.is_some() {
-                return Err(LoaderError::ReconcileBusy);
+        Ok(PreparedTreePlan {
+            desired,
+            plan,
+            config,
+            revision,
+        })
+    }
+
+    // 显式装箱打断“树载体协调嵌套树”的异步类型递归；不另起不受等待的业务任务。
+    pub(crate) fn apply_plan(
+        self: &Arc<Self>,
+        prepared: PreparedTreePlan,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<LoaderSnapshot, LoaderError>> + Send + 'static>,
+    > {
+        let tree = self.clone();
+        Box::pin(async move {
+            tree.ensure_open()?;
+            let PreparedTreePlan {
+                desired,
+                plan,
+                config,
+                revision,
+            } = prepared;
+            let completion = {
+                let mut slot = tree.reconcile.lock().expect("reconcile slot");
+                if slot.is_some() {
+                    return Err(LoaderError::ReconcileBusy);
+                }
+                let completion = ReconcileCompletion::new();
+                // 生命周期失败可能已经替换或释放部分实例，因此在协调开始时失效令牌，
+                // 而不是仅在完整 desired 或配置文件成功提交后递增。
+                tree.config_generation
+                    .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                *slot = Some(completion.clone());
+                tree.spawn_reconcile(completion.clone(), desired, plan, config, revision);
+                completion
+            };
+            let result = completion.wait().await;
+            if let Some(loader) = tree.loader.lock().expect("loader weak").upgrade() {
+                loader.publish_snapshot_changed();
             }
-            let completion = ReconcileCompletion::new();
-            // 生命周期失败可能已经替换或释放部分实例，因此在协调开始时失效令牌，
-            // 而不是仅在完整 desired 或配置文件成功提交后递增。
-            self.config_generation
-                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-            *slot = Some(completion.clone());
-            self.spawn_reconcile(completion.clone(), desired, plan, config, revision);
-            completion
-        };
-        let result = completion.wait().await;
-        if let Some(loader) = self.loader.lock().expect("loader weak").upgrade() {
-            loader.publish_snapshot_changed();
-        }
-        result
+            result
+        })
     }
 
     pub(crate) async fn await_idle(self: &Arc<Self>) -> Result<LoaderSnapshot, LoaderError> {
@@ -256,7 +284,7 @@ impl RuntimeTree {
         desired: BTreeMap<EntryId, DesiredNode>,
         plan: ReconcilePlan,
         config: ExtensionsConfig,
-        revision: Option<String>,
+        revision: Option<SourceRevision>,
     ) {
         let tree = self.clone();
         let task_completion = completion.clone();
@@ -354,7 +382,6 @@ impl RuntimeTree {
                 EntryLocation {
                     path: path.to_string(),
                     tree_prefix: self.prefix.to_string(),
-                    source_dir: self.source_dir.clone(),
                     loader,
                 },
             )
@@ -363,6 +390,8 @@ impl RuntimeTree {
 
     /// 后序释放全部条目并清空运行时槽位（用于 detach）。
     pub(crate) async fn dispose_all(self: &Arc<Self>) -> Result<(), LoaderError> {
+        self.closing
+            .store(true, std::sync::atomic::Ordering::Release);
         let _operation = self.operations.lock().await;
         // 等待进行中的 reconcile
         let _ = self.await_idle().await;
@@ -393,12 +422,28 @@ impl RuntimeTree {
 
     pub(crate) async fn reload(self: &Arc<Self>) -> Result<LoaderSnapshot, LoaderError> {
         let _operation = self.operations.lock().await;
-        let path = self
-            .extensions_path
+        self.ensure_open()?;
+        let source = self
+            .source
+            .lock()
+            .expect("source")
             .clone()
             .ok_or(LoaderError::NoConfigSource)?;
-        let (config, revision) = load_extensions_source(&path)?;
-        self.apply(config, Some(revision)).await
+        let document = source.read()?;
+        self.apply(document.config, Some(document.revision)).await
+    }
+
+    pub(crate) fn ensure_open(&self) -> Result<(), LoaderError> {
+        if self.closing.load(std::sync::atomic::Ordering::Acquire) || self.owner.is_disposed() {
+            Err(LoaderError::Source {
+                source: crate::SourceError::new(
+                    crate::SourceErrorKind::Unavailable,
+                    "条目树已关闭",
+                ),
+            })
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -411,14 +456,19 @@ fn next_config_identity() -> Result<u128, LoaderError> {
 /// 供控制面把 revision 冲突转成 `ConfigConflict`。
 pub(crate) fn ensure_tree_revision_control(
     tree: &RuntimeTree,
-    path: &PathBuf,
 ) -> Result<(), crate::loader::LoaderControlError> {
-    let (_, current) = load_extensions_source(path)?;
-    if tree.revision.lock().expect("revision").as_deref() == Some(current.as_str()) {
-        Ok(())
-    } else {
-        Err(crate::loader::LoaderControlError::ConfigConflict { path: path.clone() })
+    if let Some(source) = tree.source.lock().expect("source").clone() {
+        let revision = tree
+            .revision
+            .lock()
+            .expect("revision")
+            .clone()
+            .ok_or(LoaderError::NoConfigSource)?;
+        source.check_revision(&revision).map_err(|error| {
+            crate::loader::LoaderControlError::from_source(source.identity(), error)
+        })?;
     }
+    Ok(())
 }
 
 fn collect_named_isolation_refs(
@@ -433,23 +483,6 @@ fn collect_named_isolation_refs(
         {
             collect_named_isolation_refs(catalog, &children, out);
         }
-    }
-}
-
-pub(crate) fn canonicalize_existing(path: &Path) -> Result<PathBuf, LoaderError> {
-    path.canonicalize()
-        .map_err(|source| LoaderError::io(path.to_path_buf(), source))
-}
-
-pub(crate) fn resolve_include_path(
-    source_dir: Option<&Path>,
-    configured: &Path,
-) -> Result<PathBuf, LoaderError> {
-    if configured.is_absolute() {
-        Ok(configured.to_path_buf())
-    } else {
-        let base = source_dir.ok_or(LoaderError::RelativePathWithoutSource)?;
-        Ok(base.join(configured))
     }
 }
 
@@ -492,8 +525,7 @@ mod tests {
     #[tokio::test]
     async fn idle_observer_waits_for_failed_reconcile_but_returns_actual_snapshot() {
         let runtime = Runtime::new().unwrap();
-        let tree =
-            RuntimeTree::new_root(ExtensionCatalog::new(), runtime.root(), None, None).unwrap();
+        let tree = RuntimeTree::new_root(ExtensionCatalog::new(), runtime.root()).unwrap();
         let completion = ReconcileCompletion::new();
         *tree.reconcile.lock().unwrap() = Some(completion.clone());
         let mut observer = Box::pin(tree.await_idle());
@@ -517,8 +549,7 @@ mod tests {
     #[tokio::test]
     async fn idle_observer_does_not_hide_lifecycle_coordinator_failure() {
         let runtime = Runtime::new().unwrap();
-        let tree =
-            RuntimeTree::new_root(ExtensionCatalog::new(), runtime.root(), None, None).unwrap();
+        let tree = RuntimeTree::new_root(ExtensionCatalog::new(), runtime.root()).unwrap();
         let completion = ReconcileCompletion::new();
         *tree.reconcile.lock().unwrap() = Some(completion.clone());
         completion.finish(Err(LoaderError::Lifecycle {

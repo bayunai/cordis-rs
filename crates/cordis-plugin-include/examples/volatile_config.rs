@@ -1,10 +1,11 @@
-//! cargo run -p cordis-loader --example volatile_config
+//! cargo run -p cordis-plugin-include --example volatile_config
 use async_trait::async_trait;
 use cordis_core::{Context, CoreError, Plugin, PluginKey, Runtime, ServiceKey};
 use cordis_loader::{
     ConfigRef, EntryOptions, EntryUpdate, ExtensionCatalog, ExtensionFactory, ExtensionsConfig,
     LOADER, LoaderError, LoaderPlugin, PreparedExtension,
 };
+use cordis_plugin_include::{IncludeFactory, bootstrap_entry};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use std::{error::Error, fs, sync::Arc};
@@ -96,15 +97,28 @@ async fn main() -> Result<(), Box<dyn Error>> {
     )?;
     let mut catalog = ExtensionCatalog::new();
     catalog.register(Factory)?;
+    catalog.register(IncludeFactory)?;
     let runtime = Runtime::new()?;
     let mut loader_fiber = runtime
         .root()
-        .plugin(Arc::new(LoaderPlugin::bootstrap(catalog, &bootstrap)?))
+        .plugin(Arc::new(LoaderPlugin::new(
+            catalog,
+            ExtensionsConfig {
+                version: cordis_loader::CONFIG_VERSION,
+                extensions: vec![bootstrap_entry("include", &bootstrap)?],
+            },
+        )?))
         .await?;
     let loader = runtime.root().get(LOADER)?;
-    let before = loader.await_idle().await?;
-    let reference = runtime.root().get(LIMITS)?;
-    loader
+    let before = loader
+        .await_idle()
+        .await?
+        .entry("include:gateway")
+        .expect("gateway entry")
+        .fiber_id;
+    let reference = loader.entry_context("include:gateway")?.get(LIMITS)?;
+    let file_tree = loader.subtree("include")?;
+    file_tree
         .update(
             "gateway",
             EntryUpdate {
@@ -116,13 +130,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
         )
         .await?;
     assert_eq!(
-        before.entries[0].fiber_id,
-        loader.await_idle().await?.entries[0].fiber_id
+        before,
+        loader
+            .await_idle()
+            .await?
+            .entry("include:gateway")
+            .expect("gateway entry")
+            .fiber_id
     );
     let snapshot = reference.get(); // 一次操作读取一次完整快照。
     assert_eq!(snapshot.revision, 1);
     assert_eq!(snapshot.value.rate_limit, 200);
-    loader
+    file_tree
         .update(
             "gateway",
             EntryUpdate {
@@ -133,7 +152,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             None,
         )
         .await?;
-    let replacement = runtime.root().get(LIMITS)?;
+    let replacement = loader.entry_context("include:gateway")?.get(LIMITS)?;
     assert_eq!(reference.get().value.rate_limit, 200);
     assert_eq!(replacement.get().revision, 0);
     assert_eq!(replacement.get().value.rate_limit, 300);
