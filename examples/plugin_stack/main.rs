@@ -536,10 +536,7 @@ async fn api_remove(
     Json(body): Json<PathBody>,
 ) -> Result<Json<StateJson>, (StatusCode, Json<ErrJson>)> {
     require_include_path(&body.path)?;
-    app.loader
-        .remove(&body.path)
-        .await
-        .map_err(map_loader)?;
+    app.loader.remove(&body.path).await.map_err(map_loader)?;
     sys_log(&app.runtime, format!("sys: removed {}", body.path)).map_err(map_core)?;
     Ok(Json(collect_state(&app).await))
 }

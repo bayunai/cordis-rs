@@ -8,29 +8,27 @@
 
 | 做 | 不做 |
 | --- | --- |
-| `list_plugins`：根 Include 下 Entry 库存 | Schema 表单、秘密脱敏 |
-| `set_plugin_enabled` → `CONFIG_EDITOR.set_enabled` | 写空根 / deploy / home |
-| `subscribe`：转发 Loader `SnapshotChanged` | HTTP、鉴权、pnpm、bundle 选层 |
+| `list_plugins`：根 Include 下 Entry 库存（投影自 `CONFIG_EDITOR.managed_entries`） | Schema 表单、秘密脱敏 |
+| `set_plugin_enabled` → `CONFIG_EDITOR.set_enabled` | 写空根 / deploy / home；另存 `include_root` |
+| `subscribe() -> watch::Receiver<u64>` | HTTP、鉴权、pnpm、bundle 选层 |
 
 ## 挂载
 
-须在 `ConfigEditorPlugin` 之后：
+须在 `ConfigEditorPlugin` 之后（`include_root` 只来自 ConfigEditor）：
 
 ```rust
-ctx.plugin(Arc::new(PluginManagerPlugin::new(PluginManagerConfig::default())))
+ctx.plugin(Arc::new(PluginManagerPlugin))
 ```
 
 PluginKey：`cordis.plugin-manager`。
 
 ## 生命周期与只读状态
 
-每个插件实例仅有一个 Effect 托管的 Loader 事件转发任务。`subscribe()` 只创建共享广播接收端，
-页面退出丢弃接收端即可；插件卸载后通道关闭，旧服务句柄不能重新订阅或发起启停。
-重新挂载建立独立通道，旧订阅不会收到新实例事件。
+每个插件实例仅有一个 Effect，将 Loader `SnapshotChanged` 或上游事件缺失转为本地失效代次并写入 `watch`。`subscribe()` 返回
+共享接收端；页面退出丢弃即可。插件卸载后 `subscribe` / `list_plugins` 失败。
+代次初值为零，与 Loader revision 和配置并发令牌无关；没有接收者时也保存最新值。
+页面首次加载应直接查询列表，随后 `changed().await` 后读取 `*borrow()` 并完整刷新；
+落后只保留最新代次，不按差值推算事件数量，无哨兵 revision。
+插件卸载后旧接收端关闭；重新挂载的新实例独立重新计数。
 
-`PluginManagerEvent::Changed { revision }` 携带 Loader 快照代次；`Resync` 表示订阅落后、
-中间事件已丢，revision 未知，须完整 `list_plugins`，勿把哨兵数字当成真实版本。
-
-列表与启停入口共同使用 ConfigEditor 的 `editability()`（`ConfigReadOnlyReason`）判断。
-Group、嵌套 Include 载体，以及不属于可编辑 deploy 层的条目均明确标为只读；
-嵌套 Include 内的业务条目不会被误报为可启停。
+列表与启停使用 ConfigEditor 的 `editability`（`ConfigReadOnlyReason`）。

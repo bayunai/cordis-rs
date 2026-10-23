@@ -195,29 +195,21 @@ ConfigEditor 的 `apply()` 只注册服务，不执行隐式同步或重试；�
 `settings.list().await` 返回可表单配置条目目录（根 Include 下非 Group）：路径、Factory、
 `editable` 与 `read_only_reason`。启停库存仍走 `PLUGIN_MANAGER.list_plugins`（含 Group）。
 
-`settings.describe(path).await` 返回 `EntryConfigView`：完整路径、Factory ID、管理 Schema、
-脱敏 `base` / `user` / `config` / `value`、秘密字段存在状态、`editable` /
-`read_only_reason` 与 `ConfigRevision`。能描述不代表允许修改；只读原因与
-`CONFIG_EDITOR.editability` 同源（`Group` / `NestedInclude` / `UnmanagedEntry`）。
-`base` 为去除 user 后的继承配置（deploy ∘ home），能解析时含 Serde 默认值（对齐 DSH）；
-`user` 为本机覆盖；`config` = deploy ∘ user ∘ home 的 raw 配置。
-`value: Option<serde_json::Value>` 来自 Active 实例实际接受的类型解析快照；非 Active 为 `None`。
-Factory 的 Config 需 `Serialize`。Settings 字段操作作用于 `config`，而不是把运行值整表写回。
-Group 仅是树结构，不进 Settings 目录。Schema 来自静态 Catalog，因此禁用、Pending、Failed
-条目都能描述。
+`settings.describe(path).await` 返回 `EntryConfigView`：完整路径、Factory、管理 Schema、
+脱敏 raw `base`、可选 `inherited`（类型投影）、`user` / `config` / `value`、secrets、
+`editable` / `read_only_reason`、`ConfigRevision`。能描述不代表允许修改。
+`base` = deploy ∘ home **raw**（输入 Schema 脱敏）；`inherited` = Catalog `project` 结果
+（含 Serde 默认，序列化 Schema 脱敏），失败为 `None`，绝不把 raw 冒充解析值。
+`value` 来自 Active 快照。Group 不进 Settings 目录。
 
-`settings.mutate(path, expected_revision, operations).await` 在 **user** 上拼装有序字段操作，
-委托 config-editor 写入本机 user patch 并 reconcile；**不** bake 空根或各插件 deploy。
-不可编辑路径在拼装前即返回 `ConfigNotEditable`。
-`Unset` 对齐 DSH：对象字段从 `base` 恢复继承（有则 set，无则删键）；数组下标删除元素。
-管理 UI 应标「恢复继承」，不能把 `Unset` 标成「删除字段」；不能经表单硬删下层已提供的值。
-若 home 盖住导致 effective ≠ 目标则拒绝。路径是配置表的字符串键序列；空路径、非法路径
-报 `InvalidConfigPath`。即使条目禁用，也执行反序列化与 `prepare()`，但不执行延迟构造。
+`settings.mutate` 只写 user；不可编辑路径返回 `ConfigNotEditable`。
+`Unset` 只查 raw `base`：有键则 set 该值，无键则删键——不 bake 展示默认。
+数组下标仍删除元素。管理 UI 标「恢复继承」。
 
-`settings.subscribe()` 转发 Loader 事件：`SnapshotChanged` → `SettingsEvent::Changed { revision }`；
-订阅落后 → `Resync`（revision 未知，须完整 `list` / `describe`，无哨兵数字）。
-`PLUGIN_MANAGER.subscribe()` 同构（`PluginManagerEvent::Changed` / `Resync` → 完整 `list_plugins`）。
-卸载后订阅与 `list` 返回 `LoaderUnavailable`。
+`settings.subscribe()` / `PLUGIN_MANAGER.subscribe()` 返回 `watch::Receiver<u64>`：
+`changed().await` 后 `*borrow()` 取最新代次再 `list` / `describe`；落后只保留最新，
+无公开 `Lagged` / 哨兵 revision。卸载后订阅与列表返回 `LoaderUnavailable`。
+编辑范围根路径只配置 `ConfigEditorConfig.include_root`。
 
 版本令牌包含随机树实例身份与协调代次，支持 `Display` / `FromStr`，不代表授权。
 应用负责自己的 HTTP DTO、身份验证和权限检查。版本检查失败返回

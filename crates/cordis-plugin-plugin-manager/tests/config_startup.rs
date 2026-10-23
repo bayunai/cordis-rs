@@ -112,12 +112,12 @@ async fn mount_controls(runtime: &Runtime, config: ConfigEditorConfig) -> Vec<Fi
             .unwrap(),
         runtime
             .root()
-            .plugin(Arc::new(SettingsPlugin::default()))
+            .plugin(Arc::new(SettingsPlugin))
             .await
             .unwrap(),
         runtime
             .root()
-            .plugin(Arc::new(PluginManagerPlugin::default()))
+            .plugin(Arc::new(PluginManagerPlugin))
             .await
             .unwrap(),
     ]

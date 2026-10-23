@@ -3,40 +3,15 @@
 use crate::form::{self, ConfigOperation, EntryConfigView};
 use async_trait::async_trait;
 use cordis_core::{Context, CoreError, Plugin, PluginKey, ServiceId, ServiceKey};
-use cordis_loader::{
-    ConfigRevision, LOADER, Loader, LoaderControlError, LoaderEvent,
-};
+use cordis_loader::{ConfigRevision, LOADER, LoaderControlError, LoaderEvent};
 use cordis_plugin_config_editor::{
     CONFIG_EDITOR, ConfigEditability, ConfigEditorService, ConfigReadOnlyReason,
 };
 use std::sync::{Arc, Mutex};
-use tokio::sync::broadcast;
+use tokio::sync::watch;
 
 /// Settings 服务 Key。
 pub static SETTINGS: ServiceKey<SettingsService> = ServiceKey::new("cordis.settings");
-
-/// Host 注入的设置服务配置。
-#[derive(Clone, Debug)]
-pub struct SettingsConfig {
-    /// 根 Include 条目完整路径，默认 `include`。
-    pub include_root: String,
-}
-
-impl Default for SettingsConfig {
-    fn default() -> Self {
-        Self {
-            include_root: "include".into(),
-        }
-    }
-}
-
-impl SettingsConfig {
-    pub fn new(include_root: impl Into<String>) -> Self {
-        Self {
-            include_root: include_root.into(),
-        }
-    }
-}
 
 /// 可表单配置的条目目录项（轻量；完整投影用 `describe`）。
 #[derive(Clone, Debug)]
@@ -47,54 +22,30 @@ pub struct SettingsCatalogEntry {
     pub read_only_reason: Option<ConfigReadOnlyReason>,
 }
 
-/// 表单目录或配置投影已失效；订阅者须重新 `list` / `describe`。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SettingsEvent {
-    /// Loader 快照已变；`revision` 来自 `LoaderEvent::SnapshotChanged`。
-    Changed { revision: u64 },
-    /// 订阅落后，中间事件已丢；revision 未知，须完整刷新（勿信任此前版本）。
-    Resync,
-}
-
-/// 将 Loader 订阅结果映射为 Settings 事件；`Closed` 返回 `None`（结束转发）。
-pub(crate) fn event_from_loader_recv(
-    result: Result<LoaderEvent, broadcast::error::RecvError>,
-) -> Option<SettingsEvent> {
-    match result {
-        Ok(LoaderEvent::SnapshotChanged { revision }) => Some(SettingsEvent::Changed { revision }),
-        Err(broadcast::error::RecvError::Lagged(_)) => Some(SettingsEvent::Resync),
-        Err(broadcast::error::RecvError::Closed) => None,
-    }
-}
-
 /// 管理界面表单投影；提交经 ConfigEditor user 层，不 bake Include path 源文件。
 #[derive(Clone)]
 pub struct SettingsService {
-    loader: Loader,
     editor: ConfigEditorService,
-    include_root: String,
-    events: Arc<Mutex<Option<broadcast::Sender<SettingsEvent>>>>,
+    /// `None` 表示插件已卸载。
+    revision: Arc<Mutex<Option<watch::Sender<u64>>>>,
 }
 
 impl SettingsService {
-    /// 根 Include 下可表单配置的条目目录（不含 Group）。
+    /// 根 Include 下可表单配置的条目目录（不含 Group）；来自 ConfigEditor 同事务库存。
     pub async fn list(&self) -> Result<Vec<SettingsCatalogEntry>, LoaderControlError> {
         self.ensure_alive()?;
-        let snapshot = self.loader.await_idle().await?;
-        let prefix = format!("{}:", self.include_root);
         let mut out = Vec::new();
-        for entry in &snapshot.entries {
-            let path = entry.path.as_str();
-            if path == self.include_root || !path.starts_with(&prefix) || entry.group {
+        for entry in self.editor.managed_entries().await? {
+            if entry.group {
                 continue;
             }
-            let (editable, read_only_reason) = match self.editor.editability(path).await? {
+            let (editable, read_only_reason) = match entry.editability {
                 ConfigEditability::Editable => (true, None),
                 ConfigEditability::ReadOnly(reason) => (false, Some(reason)),
             };
             out.push(SettingsCatalogEntry {
-                path: path.to_owned(),
-                factory: entry.name.clone(),
+                path: entry.path,
+                factory: entry.factory,
                 editable,
                 read_only_reason,
             });
@@ -108,10 +59,7 @@ impl SettingsService {
         path: impl AsRef<str>,
     ) -> Result<EntryConfigView, LoaderControlError> {
         self.ensure_alive()?;
-        let path = path.as_ref();
-        let layers = self.editor.layers(path).await?;
-        let editability = self.editor.editability(path).await?;
-        form::view_from_layers(&layers, editability)
+        form::view_from_layers(&self.editor.layers(path).await?)
     }
 
     /// 有序字段编辑；写在 user 覆盖上，`expected` 必须来自最近一次 `describe`。
@@ -123,55 +71,54 @@ impl SettingsService {
     ) -> Result<EntryConfigView, LoaderControlError> {
         self.ensure_alive()?;
         let path = path.as_ref();
-        if !matches!(
-            self.editor.editability(path).await?,
-            ConfigEditability::Editable
-        ) {
+        let layers = self.editor.layers(path).await?;
+        if !matches!(layers.editability, ConfigEditability::Editable) {
             return Err(LoaderControlError::ConfigNotEditable);
         }
-        let layers = self.editor.layers(path).await?;
         if expected != layers.revision {
             return Err(LoaderControlError::ConfigRevisionConflict);
         }
         let mut config = layers.effective;
         for operation in operations {
+            // Unset 只使用 raw `base`，不写入 Serde 默认。
             form::apply_operation(&mut config, &layers.base, operation)?;
         }
-        form::view_from_layers(
-            &cordis_plugin_config_editor::LayeredEntryConfig {
-                path: layers.path.clone(),
-                factory: layers.factory.clone(),
-                schema: layers.schema.clone(),
-                resolved_schema: layers.resolved_schema.clone(),
-                base: layers.base.clone(),
-                user: Some(config.clone()),
-                effective: config.clone(),
-                resolved: None,
-                revision: layers.revision,
-            },
-            ConfigEditability::Editable,
-        )?;
+        form::view_from_layers(&cordis_plugin_config_editor::LayeredEntryConfig {
+            path: layers.path.clone(),
+            factory: layers.factory.clone(),
+            schema: layers.schema.clone(),
+            resolved_schema: layers.resolved_schema.clone(),
+            base: layers.base.clone(),
+            inherited: layers.inherited.clone(),
+            user: Some(config.clone()),
+            effective: config.clone(),
+            resolved: None,
+            editability: ConfigEditability::Editable,
+            revision: layers.revision,
+        })?;
         let committed = self.editor.edit(path, expected, config).await?;
-        form::view_from_layers(&committed, ConfigEditability::Editable)
+        form::view_from_layers(&committed)
     }
 
-    /// 订阅本插件实例共享的失效事件；不创建任何订阅专属任务。
-    pub fn subscribe(&self) -> Result<broadcast::Receiver<SettingsEvent>, LoaderControlError> {
-        self.events
+    /// 订阅本服务实例的失效代次；不是 Loader revision，也不能用于配置写入。
+    /// 初值为零，每次收到变更或检测到上游事件缺失时推进；无订阅者也保留最新值。
+    /// 消费者只需比较是否变化并完整刷新，不依赖事件数量；重挂实例重新计数。
+    pub fn subscribe(&self) -> Result<watch::Receiver<u64>, LoaderControlError> {
+        self.revision
             .lock()
-            .expect("settings events")
+            .expect("settings revision")
             .as_ref()
-            .map(broadcast::Sender::subscribe)
+            .map(|tx| tx.subscribe())
             .ok_or(LoaderControlError::LoaderUnavailable)
     }
 
-    /// 根 Include 路径。
+    /// 编辑范围根路径（来自 ConfigEditor）。
     pub fn include_root(&self) -> &str {
-        &self.include_root
+        self.editor.include_root()
     }
 
     fn ensure_alive(&self) -> Result<(), LoaderControlError> {
-        if self.events.lock().expect("settings events").is_some() {
+        if self.revision.lock().expect("settings revision").is_some() {
             Ok(())
         } else {
             Err(LoaderControlError::LoaderUnavailable)
@@ -180,21 +127,8 @@ impl SettingsService {
 }
 
 /// Host 显式挂载的设置插件；须在 ConfigEditor 之后挂载。
-pub struct SettingsPlugin {
-    config: SettingsConfig,
-}
-
-impl SettingsPlugin {
-    pub fn new(config: SettingsConfig) -> Self {
-        Self { config }
-    }
-}
-
-impl Default for SettingsPlugin {
-    fn default() -> Self {
-        Self::new(SettingsConfig::default())
-    }
-}
+#[derive(Default)]
+pub struct SettingsPlugin;
 
 #[async_trait]
 impl Plugin for SettingsPlugin {
@@ -212,58 +146,30 @@ impl Plugin for SettingsPlugin {
         let mut loader_rx = loader
             .subscribe()
             .map_err(|error| CoreError::PluginApply(error.to_string()))?;
-        let (tx, _) = broadcast::channel(64);
-        let events = Arc::new(Mutex::new(Some(tx.clone())));
+        let (tx, _) = watch::channel(0u64);
+        let revision = Arc::new(Mutex::new(Some(tx.clone())));
         let effect = ctx.effect()?;
-        let released_events = events.clone();
+        let released = revision.clone();
         effect.on_dispose(move || {
-            released_events.lock().expect("settings events").take();
+            released.lock().expect("settings revision").take();
         });
         effect.spawn(move |cancel| async move {
             loop {
-                let event = tokio::select! {
+                tokio::select! {
                     biased;
                     _ = cancel.cancelled() => break,
-                    result = loader_rx.recv() => match event_from_loader_recv(result) {
-                        Some(event) => event,
-                        None => break,
+                    result = loader_rx.recv() => match result {
+                        Ok(LoaderEvent::SnapshotChanged { .. })
+                        | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            // 独立失效代次，不混用上游 revision；即使暂无页面也保存变更。
+                            tx.send_modify(|value| *value = value.wrapping_add(1));
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     },
                 };
-                if tx.send(event).is_err() {
-                    continue;
-                }
             }
         })?;
-        ctx.provide(
-            SETTINGS,
-            SettingsService {
-                loader,
-                editor,
-                include_root: self.config.include_root.clone(),
-                events,
-            },
-        )?;
+        ctx.provide(SETTINGS, SettingsService { editor, revision })?;
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn loader_recv_maps_changed_resync_and_closed() {
-        assert_eq!(
-            event_from_loader_recv(Ok(LoaderEvent::SnapshotChanged { revision: 7 })),
-            Some(SettingsEvent::Changed { revision: 7 })
-        );
-        assert_eq!(
-            event_from_loader_recv(Err(broadcast::error::RecvError::Lagged(3))),
-            Some(SettingsEvent::Resync)
-        );
-        assert_eq!(
-            event_from_loader_recv(Err(broadcast::error::RecvError::Closed)),
-            None
-        );
     }
 }

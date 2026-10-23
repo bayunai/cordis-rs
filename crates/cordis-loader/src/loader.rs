@@ -4,7 +4,7 @@ use crate::{
     EntryTreeSource,
     catalog::{FactoryDescriptor, InjectionDescriptorInfo, IsolationDescriptorInfo},
     config::{EntryOptions, ExtensionsConfig, InjectConfig, IsolateConfig},
-    error::LoaderError,
+    error::{ConfigProjectionError, LoaderError},
     plugin::LoaderInner,
     snapshot::{EntryId, LoaderSnapshot},
     tree::{RuntimeTree, ensure_tree_revision_control},
@@ -167,37 +167,29 @@ impl Loader {
     }
 
     /// 受信任：对 Factory 执行 `prepare` 校验，不修改条目树。
-    ///
-    /// 表单路径在写入 user / reconcile 前调用，使禁用条目也会校验。
+    /// 表单路径在写入 user / reconcile 前调用，使禁用条目也会校验（执行业务 `prepare`）。
     pub fn prepare_entry_config(
         &self,
         factory: &str,
         config: &toml::Value,
     ) -> Result<(), LoaderControlError> {
-        self.resolve_entry_config(factory, config).map(|_| ())
+        self.inner()?
+            .catalog
+            .prepare(factory, config)
+            .map(|_| ())
+            .map_err(map_config_type_error)
     }
 
-    /// 反序列化并序列化 Factory Config，得到含 Serde 默认值的投影；失败表示无法解析。
-    ///
-    /// 对齐 DSH `resolveConfig`：供 settings 的 `base` 继承投影使用，不修改条目树。
-    pub fn resolve_entry_config(
+    /// 类型投影（含 Serde 默认）；不调用业务 `prepare`，不修改条目树。
+    pub fn project_entry_config(
         &self,
         factory: &str,
         config: &toml::Value,
-    ) -> Result<serde_json::Value, LoaderControlError> {
-        let prepared = self.inner()?.catalog.prepare(factory, config).map_err(
-            |error| match error {
-                LoaderError::InvalidConfig { .. }
-                | LoaderError::FactoryPanic { .. }
-                | LoaderError::PluginBuild { .. }
-                | LoaderError::PluginPanic { .. }
-                | LoaderError::UnknownFactory { .. } => LoaderControlError::ConfigValidation,
-                other => LoaderControlError::Loader(other),
-            },
-        )?;
-        prepared
-            .resolved()
-            .ok_or(LoaderControlError::ConfigValidation)
+    ) -> Result<serde_json::Value, ConfigProjectionError> {
+        self.inner()
+            .map_err(|_| ConfigProjectionError::LoaderUnavailable)?
+            .catalog
+            .project(factory, config)
     }
 
     pub fn injections(&self) -> Result<Vec<InjectionDescriptorInfo>, LoaderControlError> {
@@ -311,9 +303,7 @@ impl Loader {
                 if parent.is_some_and(|parent| {
                     parent == local_path || parent.starts_with(&(local_path.clone() + ":"))
                 }) {
-                    return Err(LoaderControlError::InvalidMove {
-                        path: path.clone(),
-                    });
+                    return Err(LoaderControlError::InvalidMove { path: path.clone() });
                 }
                 let entry = remove_entry(&mut config.extensions, &local_path)?;
                 let next_path = join_path(parent, &entry.id);
@@ -737,6 +727,17 @@ fn remove_nested(
     let result = remove_nested(&mut children, &parts[1..], full_path)?;
     group.set_children(children)?;
     Ok(result)
+}
+
+fn map_config_type_error(error: LoaderError) -> LoaderControlError {
+    match error {
+        LoaderError::InvalidConfig { .. }
+        | LoaderError::FactoryPanic { .. }
+        | LoaderError::PluginBuild { .. }
+        | LoaderError::PluginPanic { .. }
+        | LoaderError::UnknownFactory { .. } => LoaderControlError::ConfigValidation,
+        other => LoaderControlError::Loader(other),
+    }
 }
 
 pub(crate) fn patch_entry(

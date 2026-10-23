@@ -1,7 +1,9 @@
 //! ConfigEditor：user 层持久化与受信任整表读写。
 
 use crate::{
-    layers::{ConfigEditability, ConfigEditorConfig, LayerEngine, LayeredEntryConfig},
+    layers::{
+        ConfigEditability, ConfigEditorConfig, LayerEngine, LayeredEntryConfig, ManagedEntry,
+    },
     user_patch::UserPatchStore,
 };
 use async_trait::async_trait;
@@ -29,19 +31,30 @@ impl ConfigEditorService {
         self.engine.can_edit(path.as_ref()).await
     }
 
-    /// 可编辑性及只读原因；与 `can_edit` 同源。
+    /// 可编辑性及只读原因；与同路径 `layers().editability` 同源。
     pub async fn editability(
         &self,
         path: impl AsRef<str>,
     ) -> Result<ConfigEditability, LoaderControlError> {
         self.engine.editability(path.as_ref()).await
     }
-    /// 分层读取（base=deploy∘home 可含解析默认 / user / effective=deploy∘user∘home）；可含明文秘密。
+
+    /// 根 Include 下托管条目目录（一次事务，deploy 只 compose 一次）。
+    pub async fn managed_entries(&self) -> Result<Vec<ManagedEntry>, LoaderControlError> {
+        self.engine.managed_entries().await
+    }
+
+    /// 分层读取：`base`=deploy∘home raw；`inherited`=可选类型投影；含 `editability`。
     pub async fn layers(
         &self,
         path: impl AsRef<str>,
     ) -> Result<LayeredEntryConfig, LoaderControlError> {
         self.engine.layers(path.as_ref()).await
+    }
+
+    /// 编辑范围根路径（唯一权威；Settings / PluginManager 不得另存）。
+    pub fn include_root(&self) -> &str {
+        &self.engine.include_root
     }
 
     /// 受信任读取当前有效配置（含 user/home）；可含明文秘密。

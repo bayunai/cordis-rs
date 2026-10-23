@@ -20,9 +20,8 @@ pub fn include_root_entry(
     let path = path.as_ref();
     Format::for_path(path)?;
     let absolute = resolve_include_path(path)?;
-    let config = toml::Value::try_from(IncludeConfig::new(absolute)).map_err(|_| {
-        SourceError::new(SourceErrorKind::InvalidData, "无法表示 Include 启动配置")
-    })?;
+    let config = toml::Value::try_from(IncludeConfig::new(absolute))
+        .map_err(|_| SourceError::new(SourceErrorKind::InvalidData, "无法表示 Include 启动配置"))?;
     Ok(EntryOptions::new(id.into(), "cordis:include").with_config(config))
 }
 

@@ -2,9 +2,7 @@
 
 use crate::secrets;
 use cordis_loader::{ConfigRevision, EntryId, LoaderControlError};
-use cordis_plugin_config_editor::{
-    ConfigEditability, ConfigReadOnlyReason, LayeredEntryConfig,
-};
+use cordis_plugin_config_editor::{ConfigEditability, ConfigReadOnlyReason, LayeredEntryConfig};
 
 /// 表字段操作。空路径不合法。刻意不实现 Debug，避免泄露输入。
 ///
@@ -38,8 +36,10 @@ pub struct EntryConfigView {
     pub factory: String,
     /// 用于表单展示的安全投影；最终校验仍由 Rust 类型和 prepare 完成。
     pub schema: serde_json::Value,
-    /// 去除 user 后的继承配置（可含解析默认值，已脱敏）。
+    /// 去除 user 后的继承 **raw**（输入 Schema 脱敏）；Unset 恢复源。
     pub base: toml::Value,
+    /// 对 raw 继承的类型投影（含 Serde 默认，序列化 Schema 脱敏）；解析失败为 `None`。
+    pub inherited: Option<serde_json::Value>,
     /// 本机 user 整表覆盖（已脱敏）；无覆盖时为 `None`。
     pub user: Option<toml::Value>,
     /// deploy ∘ user ∘ home 的原始合成配置，字段编辑以此为基础。
@@ -56,12 +56,17 @@ pub struct EntryConfigView {
 
 pub(crate) fn view_from_layers(
     layers: &LayeredEntryConfig,
-    editability: ConfigEditability,
 ) -> Result<EntryConfigView, LoaderControlError> {
     let (schema, config, secrets) = secrets::redact(&layers.schema, &layers.effective)
         .map_err(|message| LoaderControlError::SecretSchema { message })?;
-    // base 常为序列化投影（含 rename 后的秘密字段），按 resolved_schema 脱敏。
-    let (_, base, _) = secrets::redact(&layers.resolved_schema, &layers.base)
+    // base 始终是输入空间 raw，按 input schema 脱敏（与 mutate 路径键一致）。
+    let (_, base, _) = secrets::redact(&layers.schema, &layers.base)
+        .map_err(|message| LoaderControlError::SecretSchema { message })?;
+    let inherited = layers
+        .inherited
+        .as_ref()
+        .map(|value| secrets::redact_json(&layers.resolved_schema, value))
+        .transpose()
         .map_err(|message| LoaderControlError::SecretSchema { message })?;
     let user = match &layers.user {
         Some(raw) => {
@@ -77,7 +82,7 @@ pub(crate) fn view_from_layers(
         .map(|resolved| secrets::redact_json(&layers.resolved_schema, resolved))
         .transpose()
         .map_err(|message| LoaderControlError::SecretSchema { message })?;
-    let (editable, read_only_reason) = match editability {
+    let (editable, read_only_reason) = match layers.editability {
         ConfigEditability::Editable => (true, None),
         ConfigEditability::ReadOnly(reason) => (false, Some(reason)),
     };
@@ -86,6 +91,7 @@ pub(crate) fn view_from_layers(
         factory: layers.factory.clone(),
         schema,
         base,
+        inherited,
         user,
         config,
         value,

@@ -107,7 +107,7 @@ async fn harness() -> (Runtime, tempfile::TempDir, Vec<cordis_core::Fiber>) {
         .unwrap();
     let manager_fiber = runtime
         .root()
-        .plugin(Arc::new(PluginManagerPlugin::default()))
+        .plugin(Arc::new(PluginManagerPlugin))
         .await
         .unwrap();
     (
@@ -230,19 +230,45 @@ async fn nested_source_children_and_non_deploy_entries_are_read_only() {
 }
 
 #[tokio::test]
+async fn changes_are_retained_without_subscribers() {
+    let (runtime, _dir, _fibers) = harness().await;
+    let manager = runtime.root().get(PLUGIN_MANAGER).unwrap();
+    // 只读取初值后立即丢弃接收端；实际变更期间没有页面订阅。
+    let before = *manager.subscribe().unwrap().borrow();
+    manager
+        .set_plugin_enabled("include:one", false)
+        .await
+        .unwrap();
+    let after = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let generation = *manager.subscribe().unwrap().borrow();
+            if generation != before {
+                break generation;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("a later subscriber must observe changes recorded without receivers");
+    assert!(after > before);
+    runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn subscriptions_are_shared_and_close_on_unload_without_affecting_new_instance() {
     let (runtime, _dir, mut fibers) = harness().await;
     let old_manager = (*runtime.root().get(PLUGIN_MANAGER).unwrap()).clone();
-    // 反复进入/退出页面仅增删广播接收端，不创建独立转发任务。
+    // 反复进入/退出页面仅增删 watch 接收端，不创建独立转发任务。
     for _ in 0..1000 {
         drop(old_manager.subscribe().unwrap());
     }
     let mut old_rx = old_manager.subscribe().unwrap();
+    old_rx.borrow_and_update();
     old_manager
         .set_plugin_enabled("include:one", false)
         .await
         .unwrap();
-    tokio::time::timeout(std::time::Duration::from_secs(2), old_rx.recv())
+    tokio::time::timeout(std::time::Duration::from_secs(2), old_rx.changed())
         .await
         .expect("old instance must forward events")
         .unwrap();
@@ -251,32 +277,28 @@ async fn subscriptions_are_shared_and_close_on_unload_without_affecting_new_inst
         old_manager.subscribe(),
         Err(LoaderControlError::LoaderUnavailable)
     ));
-    // 卸载前积压可以消费，但此后通道必须关闭，不等待 Loader 本身关闭。
-    tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        while old_rx.recv().await.is_ok() {}
-    })
-    .await
-    .expect("unloaded instance must close its channel");
+    // 卸载后 sender 关闭；changed 返回错误。
+    tokio::time::timeout(std::time::Duration::from_secs(2), old_rx.changed())
+        .await
+        .expect("unloaded instance must close its channel")
+        .expect_err("watch closed");
     assert!(runtime.root().get(LOADER).is_ok());
     let mut new_fiber = runtime
         .root()
-        .plugin(Arc::new(PluginManagerPlugin::default()))
+        .plugin(Arc::new(PluginManagerPlugin))
         .await
         .unwrap();
     let new_manager = runtime.root().get(PLUGIN_MANAGER).unwrap();
     let mut new_rx = new_manager.subscribe().unwrap();
+    new_rx.borrow_and_update();
     new_manager
         .set_plugin_enabled("include:one", true)
         .await
         .unwrap();
-    tokio::time::timeout(std::time::Duration::from_secs(2), new_rx.recv())
+    tokio::time::timeout(std::time::Duration::from_secs(2), new_rx.changed())
         .await
         .expect("new instance must forward independently")
         .unwrap();
-    assert!(matches!(
-        old_rx.try_recv(),
-        Err(tokio::sync::broadcast::error::TryRecvError::Closed)
-    ));
     assert!(matches!(
         old_manager.list_plugins().await,
         Err(LoaderControlError::LoaderUnavailable)

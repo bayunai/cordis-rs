@@ -3,7 +3,7 @@
 use crate::{
     PreparedExtension,
     config::{IsolateConfig, IsolateValue},
-    error::{LoaderError, format_panic_message},
+    error::{ConfigProjectionError, LoaderError, format_panic_message},
 };
 use cordis_core::{ConfigKey, Context, CoreError, IsolationLabel, ServiceId, ServiceKey};
 use schemars::JsonSchema;
@@ -59,24 +59,35 @@ pub trait ExtensionFactory: Send + Sync + 'static {
 
 pub(crate) trait ErasedExtensionFactory: Send + Sync {
     fn prepare(&self, config: &toml::Value) -> Result<PreparedExtension, LoaderError>;
+    /// 反序列化并序列化为 JSON 投影（含 Serde 默认）；不调用业务 `prepare`。
+    fn project(&self, config: &toml::Value) -> Result<JsonValue, ConfigProjectionError>;
     fn descriptor(&self, id: &'static str) -> Result<FactoryDescriptor, LoaderError>;
 }
 struct FactoryAdapter<F> {
     factory: F,
 }
+
+fn serialize_resolved<C: Serialize>(config: &C) -> Result<JsonValue, LoaderError> {
+    // 自定义 Serialize 的错误与 panic 都不能将秘密值带出 Factory 边界。
+    catch_unwind(AssertUnwindSafe(|| serde_json::to_value(config)))
+        .map_err(|_| LoaderError::invalid_config("factory resolved config serialization panicked"))?
+        .map_err(|_| LoaderError::invalid_config("factory resolved config serialization failed"))
+}
+
 impl<F: ExtensionFactory> ErasedExtensionFactory for FactoryAdapter<F> {
     fn prepare(&self, config: &toml::Value) -> Result<PreparedExtension, LoaderError> {
         let config = parse_config::<F::Config>(config, self.factory.id())?;
         // 保存本次实际解析的值，不能在查询时重新运行可能有状态的 Serde 默认函数。
-        // 自定义 Serialize 的错误与 panic 都不能将秘密值带出 Factory 边界。
-        let resolved = catch_unwind(AssertUnwindSafe(|| serde_json::to_value(&config)))
-            .map_err(|_| {
-                LoaderError::invalid_config("factory resolved config serialization panicked")
-            })?
-            .map_err(|_| {
-                LoaderError::invalid_config("factory resolved config serialization failed")
-            })?;
+        let resolved = serialize_resolved(&config)?;
         Ok(self.factory.prepare(config)?.with_resolved(resolved))
+    }
+    fn project(&self, config: &toml::Value) -> Result<JsonValue, ConfigProjectionError> {
+        // 不携带 Serde 错误文本：自定义 Deserialize 可能将秘密输入拼入错误。
+        let config: F::Config = config
+            .clone()
+            .try_into()
+            .map_err(|_| ConfigProjectionError::InputInvalid)?;
+        serialize_resolved(&config).map_err(ConfigProjectionError::Loader)
     }
     fn descriptor(&self, id: &'static str) -> Result<FactoryDescriptor, LoaderError> {
         schema_descriptor::<F::Config>(id)
@@ -284,6 +295,25 @@ impl ExtensionCatalog {
         catch_unwind(AssertUnwindSafe(|| factory.prepare(config))).map_err(|payload| {
             LoaderError::FactoryPanic {
                 message: format_panic_message("extension factory prepare", payload),
+            }
+        })?
+    }
+
+    /// 类型投影（含 Serde 默认）；不调用业务 `prepare`，不修改树。
+    pub fn project(
+        &self,
+        factory: &str,
+        config: &toml::Value,
+    ) -> Result<JsonValue, ConfigProjectionError> {
+        let factory = self
+            .get(factory)
+            .ok_or_else(|| LoaderError::UnknownFactory {
+                instance: String::new(),
+                factory: factory.into(),
+            })?;
+        catch_unwind(AssertUnwindSafe(|| factory.project(config))).map_err(|_| {
+            LoaderError::FactoryPanic {
+                message: "extension factory project panicked".into(),
             }
         })?
     }

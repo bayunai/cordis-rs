@@ -1,6 +1,6 @@
 //! 本机 user 覆盖文档：权威在独立文件，不写进 Include path 源文件。
 
-use crate::patch_file::file_task;
+use crate::patch_file::{file_task, parse_patch_document};
 use cordis_plugin_include::EntryPatch;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -57,20 +57,22 @@ impl UserPatchDocument {
             .collect()
     }
 
+    /// 按字段读取最后一份显式覆盖；后续只改 disabled 的行不会清除 config。
     pub fn config_for(&self, local_id: &str) -> Option<&toml::Value> {
         self.patches
             .iter()
             .rev()
-            .find(|patch| patch.id == local_id)
-            .and_then(|patch| patch.config.as_ref())
+            .filter(|patch| patch.id == local_id)
+            .find_map(|patch| patch.config.as_ref())
     }
 
+    /// 按字段读取最后一份显式覆盖；Some(false) 同样是有效覆盖。
     pub fn disabled_for(&self, local_id: &str) -> Option<bool> {
         self.patches
             .iter()
             .rev()
-            .find(|patch| patch.id == local_id)
-            .and_then(|patch| patch.disabled)
+            .filter(|patch| patch.id == local_id)
+            .find_map(|patch| patch.disabled)
     }
 
     /// 更新或清除 config 覆盖；保留同条目的 `disabled`。
@@ -261,8 +263,7 @@ fn load_document(path: &Path) -> Result<UserPatchDocument, String> {
     match fs::read_to_string(path) {
         Ok(text) if text.trim().is_empty() => Ok(UserPatchDocument::empty()),
         Ok(text) => {
-            let document: UserPatchDocument =
-                toml::from_str(&text).map_err(|error| format!("无法解析 user patch：{error}"))?;
+            let document: UserPatchDocument = parse_patch_document(path, &text)?;
             if document.version != USER_PATCH_VERSION {
                 return Err(format!(
                     "不支持的 user patch 版本 {}；当前要求 {USER_PATCH_VERSION}",
@@ -346,6 +347,101 @@ fn cleanup_user_temporary(temporary: &Path, original: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn public_load_parse_errors_redact_syntax_and_type_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("user.toml");
+        let store = UserPatchStore::new(&path);
+        for text in [
+            "version=1\n[[patches]]\nid='one'\n[patches.config]\ntoken=\"AUDIT-PRIVATE-SECRET\n",
+            "version=1\n[[patches]]\nid='one'\ndisabled='AUDIT-PRIVATE-SECRET'\n",
+        ] {
+            fs::write(&path, text).unwrap();
+            let error = store.load().await.unwrap_err();
+            assert!(error.contains(path.to_str().unwrap()));
+            assert!(error.contains("TOML 语法或类型错误"));
+            assert!(error.contains("行，第"));
+            assert!(!error.contains("AUDIT-PRIVATE-SECRET"));
+            assert!(!error.contains("token="));
+            assert_eq!(fs::read_to_string(&path).unwrap(), text);
+        }
+    }
+
+    #[tokio::test]
+    async fn repeated_rows_keep_last_override_per_field_when_updating() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("user.toml");
+        fs::write(
+            &path,
+            r#"
+version = 1
+[[patches]]
+id = "demo"
+config = { timeout = 30 }
+[[patches]]
+id = "other"
+config = { timeout = 99 }
+[[patches]]
+id = "demo"
+disabled = true
+[[patches]]
+id = "demo"
+config = { timeout = 40 }
+[[patches]]
+id = "demo"
+disabled = false
+[[patches]]
+id = "demo"
+"#,
+        )
+        .unwrap();
+        let store = UserPatchStore::new(&path);
+        let mut doc = store.load().await.unwrap();
+        assert_eq!(
+            doc.config_for("demo").unwrap()["timeout"].as_integer(),
+            Some(40)
+        );
+        assert_eq!(doc.disabled_for("demo"), Some(false));
+        assert!(doc.config_for("missing").is_none());
+        assert!(doc.disabled_for("missing").is_none());
+
+        doc.upsert_disabled("demo", "example", Some(true));
+        assert_eq!(
+            doc.config_for("demo").unwrap()["timeout"].as_integer(),
+            Some(40)
+        );
+        assert_eq!(doc.disabled_for("demo"), Some(true));
+        assert_eq!(
+            doc.patches
+                .iter()
+                .filter(|patch| patch.id == "demo")
+                .count(),
+            1
+        );
+        doc.upsert_config("demo", "example", Some(toml::toml! { timeout = 50 }.into()));
+        assert_eq!(doc.disabled_for("demo"), Some(true));
+        assert_eq!(
+            doc.config_for("demo").unwrap()["timeout"].as_integer(),
+            Some(50)
+        );
+        store.store(&doc).await.unwrap();
+        let mut doc = store.load().await.unwrap();
+        assert_eq!(doc.disabled_for("demo"), Some(true));
+        doc.upsert_disabled("demo", "example", None);
+        assert_eq!(
+            doc.config_for("demo").unwrap()["timeout"].as_integer(),
+            Some(50)
+        );
+        assert_eq!(doc.disabled_for("demo"), None);
+        doc.upsert_config("demo", "example", None);
+        assert!(doc.config_for("demo").is_none());
+        assert_eq!(doc.patches.len(), 1);
+        assert_eq!(
+            doc.config_for("other").unwrap()["timeout"].as_integer(),
+            Some(99)
+        );
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn cancelled_waiter_keeps_store_locked_until_blocking_work_settles() {

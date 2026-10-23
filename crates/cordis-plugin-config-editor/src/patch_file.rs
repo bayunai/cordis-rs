@@ -2,7 +2,7 @@
 
 use cordis_loader::{CONFIG_VERSION, ExtensionsConfig};
 use cordis_plugin_include::{EntryPatch, apply_patches};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{fs, path::Path};
 
 /// 文件事务作为完整单元执行；JoinError 不回显可能包含配置的 panic 载荷。
@@ -15,6 +15,35 @@ pub(crate) async fn file_task<T: Send + 'static>(
 }
 
 pub const PATCH_FILE_VERSION: u32 = 1;
+
+/// 解析诊断只保留文件位置与安全分类，绝不格式化可能含源文本/秘密值的 Serde 错误。
+pub(crate) fn parse_patch_document<T: DeserializeOwned>(
+    path: &Path,
+    text: &str,
+) -> Result<T, String> {
+    toml::from_str(text).map_err(|error| {
+        let location = match error.span() {
+            Some(span) => {
+                let (line, column) = text
+                    .char_indices()
+                    .take_while(|(offset, _)| *offset < span.start)
+                    .fold((1, 1), |(line, column), (_, ch)| {
+                        if ch == '\n' {
+                            (line + 1, 1)
+                        } else {
+                            (line, column + 1)
+                        }
+                    });
+                format!("第 {line} 行，第 {column} 列")
+            }
+            None => "无位置信息".to_owned(),
+        };
+        format!(
+            "无法解析配置文件 {}：TOML 语法或类型错误（{location}）",
+            path.display()
+        )
+    })
+}
 
 /// 有序 patch 文件（deploy 包文件、home 覆盖等）。
 #[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -41,8 +70,7 @@ impl PatchFileDocument {
         match fs::read_to_string(path) {
             Ok(text) if text.trim().is_empty() => Ok(Self::empty()),
             Ok(text) => {
-                let document: Self = toml::from_str(&text)
-                    .map_err(|error| format!("无法解析 patch {}: {error}", path.display()))?;
+                let document: Self = parse_patch_document(path, &text)?;
                 if document.version != PATCH_FILE_VERSION {
                     return Err(format!(
                         "不支持的 patch 版本 {}（{}）；当前要求 {PATCH_FILE_VERSION}",
@@ -85,6 +113,57 @@ mod tests {
     use super::*;
     use cordis_loader::EntryOptions;
     use std::io::Write;
+
+    #[tokio::test]
+    async fn public_load_errors_keep_locations_without_source_or_secret_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("deploy.toml");
+        for text in [
+            "version=1\n[[patches]]\nid='one'\n[patches.config]\ntoken=\"AUDIT-PRIVATE-SECRET\n",
+            "version='AUDIT-PRIVATE-SECRET'\n",
+        ] {
+            fs::write(&path, text).unwrap();
+            let error = PatchFileDocument::load(&path).await.err().unwrap();
+            assert!(error.contains(path.to_str().unwrap()));
+            assert!(error.contains("TOML 语法或类型错误"));
+            assert!(error.contains("行，第"));
+            assert!(!error.contains("AUDIT-PRIVATE-SECRET"));
+            assert!(!error.contains("token="));
+            let error = load_ordered_patches(std::slice::from_ref(&path))
+                .await
+                .err()
+                .unwrap();
+            assert!(!error.contains("AUDIT-PRIVATE-SECRET"));
+        }
+    }
+
+    #[test]
+    fn custom_deserializer_diagnostics_never_enter_public_errors() {
+        struct Reject;
+        impl<'de> Deserialize<'de> for Reject {
+            fn deserialize<D: serde::Deserializer<'de>>(_: D) -> Result<Self, D::Error> {
+                Err(serde::de::Error::custom("private-custom-serde-error"))
+            }
+        }
+        let error = parse_patch_document::<Reject>(Path::new("custom.toml"), "value=1")
+            .err()
+            .unwrap();
+        assert!(error.contains("custom.toml"));
+        assert!(error.contains("TOML 语法或类型错误"));
+        assert!(!error.contains("private-custom-serde-error"));
+    }
+
+    #[test]
+    fn safe_parse_locations_use_one_based_character_columns() {
+        let error = parse_patch_document::<PatchFileDocument>(
+            Path::new("unicode.toml"),
+            "# 中文注释\nversion = 'private-invalid-version'\n",
+        )
+        .err()
+        .unwrap();
+        assert!(error.contains("第 2 行，第 11 列"));
+        assert!(!error.contains("private-invalid-version"));
+    }
 
     #[tokio::test]
     async fn compose_deploy_user_home_order() {

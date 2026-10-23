@@ -634,11 +634,7 @@ async fn ordered_operations_and_secret_replacement_do_not_restore_deleted_fields
     // 非法值仍走校验失败路径。
     assert!(matches!(
         h.settings
-            .mutate(
-                "include:one",
-                restored.revision,
-                vec![set("limit", 0)],
-            )
+            .mutate("include:one", restored.revision, vec![set("limit", 0)],)
             .await,
         Err(LoaderControlError::ConfigValidation)
     ));
@@ -828,7 +824,7 @@ async fn mount_file(
         .unwrap();
     let settings_fiber = runtime
         .root()
-        .plugin(Arc::new(SettingsPlugin::default()))
+        .plugin(Arc::new(SettingsPlugin))
         .await
         .unwrap();
     let settings = (*runtime.root().get(SETTINGS).unwrap()).clone();

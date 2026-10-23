@@ -6,8 +6,7 @@
 mod service;
 
 pub use service::{
-    PLUGIN_MANAGER, PluginInfo, PluginManagerConfig, PluginManagerEvent, PluginManagerPlugin,
-    PluginManagerService, ReadOnlyReason,
+    PLUGIN_MANAGER, PluginInfo, PluginManagerPlugin, PluginManagerService, ReadOnlyReason,
 };
 
 pub use cordis_loader::LoaderControlError;

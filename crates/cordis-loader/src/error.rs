@@ -3,6 +3,21 @@
 use cordis_core::{CoreError, PluginKey};
 use std::any::Any;
 
+/// 类型投影的输入不完整与执行故障必须分开处理。
+///
+/// 继承层可以缺少用户层补齐的必填字段，此时没有独立投影。序列化故障、
+/// 用户实现的 panic、未知 Factory 和 Loader 关闭则不是“缺少投影”，必须报告。
+/// 错误不携带配置值或用户自定义 Serde 错误文本。
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum ConfigProjectionError {
+    #[error("配置无法独立解析为 Factory 输入类型")]
+    InputInvalid,
+    #[error(transparent)]
+    Loader(#[from] LoaderError),
+    #[error("Loader 已关闭，无法投影配置")]
+    LoaderUnavailable,
+}
+
 /// 将扩展边界捕获到的 panic 转换为可诊断、但不泄漏非字符串载荷的错误文本。
 pub(crate) fn format_panic_message(boundary: &str, payload: Box<dyn Any + Send>) -> String {
     if let Some(message) = payload.downcast_ref::<&str>() {

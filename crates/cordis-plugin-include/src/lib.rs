@@ -2,16 +2,16 @@
 //! Loader 只认识 [`cordis_loader::EntryTreeSource`]，不解析格式或读取文件。
 //! 显式 reload 由子树控制面调用；本插件不安装文件监听器。
 
-mod root;
 mod codec;
 mod config;
 mod patches;
+mod root;
 mod source;
 
-pub use root::{include_root_entry, load_extensions};
 pub use codec::read_extensions_file;
 pub use config::{EntryPatch, IncludeConfig};
 pub use patches::apply_patches;
+pub use root::{include_root_entry, load_extensions};
 pub use source::{FileSource, INCLUDE_LOCATION, IncludeLocation};
 
 use cordis_core::PluginKey;

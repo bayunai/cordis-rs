@@ -1,13 +1,14 @@
 //! 空根 ∘ deploy ∘ user ∘ home；运行时经根 Include.patches 全量同步。
 
 use crate::{
-    composition::{layer_error as user_layer_error, read_layer_patches},
+    composition::{LayerPatches, layer_error as user_layer_error, read_layer_patches},
     patch_file::{compose_entries, load_ordered_patches},
     user_patch::{UserPatchDocument, UserPatchEdit, UserPatchStore},
 };
+use cordis_core::FiberState;
 use cordis_loader::{
-    ConfigRevision, ConfigTransaction, EntryId, EntryOptions, Loader, LoaderControlError,
-    LoaderError, SourceError, SourceErrorKind,
+    ConfigProjectionError, ConfigRevision, ConfigTransaction, EntryId, EntryOptions, Loader,
+    LoaderControlError, LoaderError, SourceError, SourceErrorKind,
 };
 use cordis_plugin_include::{EntryPatch, IncludeConfig};
 use std::path::PathBuf;
@@ -59,6 +60,18 @@ pub enum ConfigEditability {
     ReadOnly(ConfigReadOnlyReason),
 }
 
+/// 根 Include 下一条由 ConfigEditor 管理的 Entry（含编辑能力与运行快照字段）。
+#[derive(Clone, Debug)]
+pub struct ManagedEntry {
+    pub path: String,
+    pub factory: String,
+    pub group: bool,
+    pub enabled: bool,
+    pub state: Option<FiberState>,
+    pub last_error: Option<String>,
+    pub editability: ConfigEditability,
+}
+
 /// 分层配置快照；各层可含明文秘密。
 #[derive(Clone, Debug)]
 pub struct LayeredEntryConfig {
@@ -66,14 +79,19 @@ pub struct LayeredEntryConfig {
     pub factory: String,
     pub schema: serde_json::Value,
     pub resolved_schema: serde_json::Value,
-    /// 去除 user 后的继承声明（deploy ∘ home）；能解析时已填入 Serde 默认值。
+    /// 去除 user 后的继承声明（deploy ∘ home）**raw TOML**；Unset 恢复源。
     pub base: toml::Value,
+    /// 对 `base` 的类型投影（含 Serde 默认）；输入无法独立解析时为 `None`。
+    /// 投影执行故障仍明确返回错误，不与不完整的继承输入混淆。
+    pub inherited: Option<serde_json::Value>,
     /// user patch 中的整表覆盖；无覆盖时为 `None`。
     pub user: Option<toml::Value>,
     /// deploy ∘ user ∘ home。
     pub effective: toml::Value,
     /// Active 实例实际接收的类型解析快照（含 Serde 默认值），并非重新解析声明。
     pub resolved: Option<serde_json::Value>,
+    /// 与分层快照同一事务算出的可编辑性。
+    pub editability: ConfigEditability,
     pub revision: ConfigRevision,
 }
 
@@ -105,43 +123,50 @@ impl LayerEngine {
                 ConfigReadOnlyReason::UnmanagedEntry,
             ));
         }
+        // 能力属于条目元数据，不能依赖配置快照：Group 没有可读取的 Factory Schema。
+        self.managed_entries()
+            .await?
+            .into_iter()
+            .find(|entry| entry.path == full_path)
+            .map(|entry| entry.editability)
+            .ok_or_else(|| LoaderControlError::EntryNotFound {
+                path: full_path.into(),
+            })
+    }
+
+    /// 根 Include 下全部托管条目；同事务一次 compose deploy，批量算 editability。
+    pub async fn managed_entries(&self) -> Result<Vec<ManagedEntry>, LoaderControlError> {
         let engine = self.clone();
-        let path = full_path.to_owned();
         self.loader
             .config_transaction(move |tx| {
                 Box::pin(async move {
-                    let local = engine.local_id(&path)?;
-                    // Group 可能无法 snapshot 配置；先查 deploy 所有权再分类。
-                    if let Ok(entry) = engine.read_deploy_entry(&local).await {
-                        if entry.group {
-                            return Ok(ConfigEditability::ReadOnly(ConfigReadOnlyReason::Group));
+                    let snapshot = tx.await_idle().await?;
+                    let deploy = engine.compose_deploy().await?;
+                    let ownership = ownership_index(&deploy.extensions)?;
+                    let prefix = format!("{}:", engine.include_root);
+                    let mut out = Vec::new();
+                    for entry in &snapshot.entries {
+                        let path = entry.path.as_str();
+                        if path == engine.include_root || !path.starts_with(&prefix) {
+                            continue;
                         }
+                        let local = path
+                            .strip_prefix(&prefix)
+                            .expect("prefix checked")
+                            .to_owned();
+                        let editability =
+                            classify_editability(entry.group, &entry.name, ownership.get(&local));
+                        out.push(ManagedEntry {
+                            path: path.to_owned(),
+                            factory: entry.name.clone(),
+                            group: entry.group,
+                            enabled: entry.enabled,
+                            state: entry.state,
+                            last_error: entry.last_error.clone(),
+                            editability,
+                        });
                     }
-                    let current = match tx.snapshot_entry_config(&path).await {
-                        Ok(current) => current,
-                        Err(LoaderControlError::ConfigNotEditable) => {
-                            return Ok(ConfigEditability::ReadOnly(
-                                ConfigReadOnlyReason::NestedInclude,
-                            ));
-                        }
-                        Err(error) => return Err(error),
-                    };
-                    if current.factory == "cordis:include" {
-                        return Ok(ConfigEditability::ReadOnly(
-                            ConfigReadOnlyReason::NestedInclude,
-                        ));
-                    }
-                    match engine.read_deploy_entry(&local).await {
-                        Ok(entry) if entry.name == current.factory => {
-                            Ok(ConfigEditability::Editable)
-                        }
-                        Ok(_) | Err(LoaderControlError::EntryNotFound { .. }) => {
-                            Ok(ConfigEditability::ReadOnly(
-                                ConfigReadOnlyReason::UnmanagedEntry,
-                            ))
-                        }
-                        Err(error) => Err(error),
-                    }
+                    Ok(out)
                 })
             })
             .await
@@ -172,61 +197,96 @@ impl LayerEngine {
         edit: &UserPatchEdit,
         full_path: &str,
     ) -> Result<LayeredEntryConfig, LoaderControlError> {
-        let snapshot = tx.snapshot_entry_config(full_path).await?;
-        // 根 Include 载体本身：无产品 user 层，仅投影当前声明。
-        if full_path == self.include_root {
+        let uneditable = ConfigEditability::ReadOnly(ConfigReadOnlyReason::UnmanagedEntry);
+
+        if full_path == self.include_root
+            || !full_path.starts_with(&format!("{}:", self.include_root))
+        {
+            let snapshot = tx.snapshot_entry_config(full_path).await?;
             return Ok(LayeredEntryConfig {
                 path: snapshot.path,
                 factory: snapshot.factory,
                 schema: snapshot.schema,
                 resolved_schema: snapshot.resolved_schema,
                 base: snapshot.config.clone(),
+                inherited: None,
                 user: None,
                 effective: snapshot.config,
                 resolved: snapshot.resolved,
+                editability: uneditable,
                 revision: snapshot.revision,
             });
         }
+
         let local = self.local_id(full_path)?;
+        let snapshot = tx.snapshot_entry_config(full_path).await?;
         let document = edit.load().await.map_err(user_layer_error)?;
+        let captured = LayerPatches::read(&self.deploy_patch_paths, &self.home_patch_path).await?;
+        let patches = captured.with_user(&document);
+        // 在使用磁盘配置之前检查所属 Include 已加载声明；后续只使用 captured，
+        // 禁止在校验后再次读取 deploy/home 并套用旧 Factory 的 Schema。
+        self.ensure_captured_layers_current(tx, &patches).await?;
+        let deploy = compose_entries(&captured.deploy).map_err(user_layer_error)?;
+        let ownership = ownership_index(&deploy.extensions)?;
+        let editability = classify_editability(
+            ownership.get(&local).is_some_and(|o| o.group),
+            &snapshot.factory,
+            ownership.get(&local),
+        );
+
         let user = document.config_for(&local).cloned();
-        let inherited_entry = match self.read_inherited_entry(&local).await {
-            Ok(entry) => entry,
-            Err(LoaderControlError::EntryNotFound { .. }) => {
-                // 嵌套 Include 等：首版不提供独立继承 base。
+        let inherited_tree = compose_entries(&captured.with_user(&UserPatchDocument::empty()))
+            .map_err(user_layer_error)?;
+        let inherited_entry = match find_entry(&inherited_tree.extensions, &local) {
+            Some(entry) => entry,
+            None => {
                 return Ok(LayeredEntryConfig {
                     path: snapshot.path,
                     factory: snapshot.factory,
                     schema: snapshot.schema,
                     resolved_schema: snapshot.resolved_schema,
                     base: snapshot.config.clone(),
+                    inherited: None,
                     user,
                     effective: snapshot.config,
                     resolved: snapshot.resolved,
+                    editability,
                     revision: snapshot.revision,
                 });
             }
-            Err(error) => return Err(error),
         };
-        let effective_entry = self.compose_full(&document).await.and_then(|tree| {
-            find_entry(&tree.extensions, &local).ok_or_else(|| LoaderControlError::EntryNotFound {
-                path: format!("{}:{local}", self.include_root),
-            })
-        })?;
-        let base = resolve_inherited_base(
-            &self.loader,
-            &inherited_entry.name,
-            &inherited_entry.config,
-        );
+        let effective_entry = compose_entries(&patches)
+            .map_err(user_layer_error)
+            .and_then(|tree| {
+                find_entry(&tree.extensions, &local).ok_or_else(|| {
+                    LoaderControlError::EntryNotFound {
+                        path: format!("{}:{local}", self.include_root),
+                    }
+                })
+            })?;
+        if inherited_entry.name != snapshot.factory || effective_entry.name != snapshot.factory {
+            return Err(self.layer_conflict());
+        }
+        let base = inherited_entry.config.clone();
+        let inherited = match self.loader.project_entry_config(&snapshot.factory, &base) {
+            Ok(value) => Some(value),
+            Err(ConfigProjectionError::InputInvalid) => None,
+            Err(ConfigProjectionError::Loader(error)) => return Err(error.into()),
+            Err(ConfigProjectionError::LoaderUnavailable) => {
+                return Err(LoaderControlError::LoaderUnavailable);
+            }
+        };
         Ok(LayeredEntryConfig {
             path: snapshot.path,
             factory: snapshot.factory,
             schema: snapshot.schema,
             resolved_schema: snapshot.resolved_schema,
             base,
+            inherited,
             user,
             effective: effective_entry.config,
             resolved: snapshot.resolved,
+            editability,
             revision: snapshot.revision,
         })
     }
@@ -406,12 +466,25 @@ impl LayerEngine {
         tx: &ConfigTransaction,
         user: &UserPatchDocument,
     ) -> Result<(), LoaderControlError> {
-        if self.include_config(tx).await?.0.patches != self.runtime_patches(user).await? {
-            return Err(LoaderControlError::ConfigConflict {
-                source_id: self.store.path().display().to_string(),
-            });
+        self.ensure_captured_layers_current(tx, &self.runtime_patches(user).await?)
+            .await
+    }
+
+    async fn ensure_captured_layers_current(
+        &self,
+        tx: &ConfigTransaction,
+        patches: &[EntryPatch],
+    ) -> Result<(), LoaderControlError> {
+        if self.include_config(tx).await?.0.patches != patches {
+            return Err(self.layer_conflict());
         }
         Ok(())
+    }
+
+    fn layer_conflict(&self) -> LoaderControlError {
+        LoaderControlError::ConfigConflict {
+            source_id: self.store.path().display().to_string(),
+        }
     }
 
     pub async fn reload(&self) -> Result<(), LoaderControlError> {
@@ -448,19 +521,6 @@ impl LayerEngine {
         })
     }
 
-    /// deploy ∘ home（跳过 user），对齐 DSH 去掉 profile 覆盖后的继承层。
-    async fn read_inherited_entry(&self, local: &str) -> Result<EntryOptions, LoaderControlError> {
-        let tree = self.compose_inherited().await?;
-        find_entry(&tree.extensions, local).ok_or_else(|| LoaderControlError::EntryNotFound {
-            path: format!("{}:{local}", self.include_root),
-        })
-    }
-
-    async fn compose_inherited(&self) -> Result<cordis_loader::ExtensionsConfig, LoaderControlError> {
-        let empty = UserPatchDocument::empty();
-        compose_entries(&self.runtime_patches(&empty).await?).map_err(user_layer_error)
-    }
-
     fn local_id(&self, full_path: &str) -> Result<String, LoaderControlError> {
         let prefix = format!("{}:", self.include_root);
         full_path
@@ -472,43 +532,57 @@ impl LayerEngine {
     }
 }
 
-/// 对齐 DSH `inheritedConfig`：能 resolve 则用含默认值的投影，否则退回 raw。
-fn resolve_inherited_base(loader: &Loader, factory: &str, raw: &toml::Value) -> toml::Value {
-    match loader.resolve_entry_config(factory, raw) {
-        Ok(resolved) => json_to_toml(resolved).unwrap_or_else(|| raw.clone()),
-        Err(_) => raw.clone(),
-    }
+struct DeployOwner {
+    name: String,
+    group: bool,
 }
 
-fn json_to_toml(value: serde_json::Value) -> Option<toml::Value> {
-    match value {
-        // TOML 无 null；跳过 Option::None 等字段，保留其余默认值。
-        serde_json::Value::Null => None,
-        serde_json::Value::Bool(value) => Some(toml::Value::Boolean(value)),
-        serde_json::Value::Number(value) => {
-            if let Some(value) = value.as_i64() {
-                Some(toml::Value::Integer(value))
+fn ownership_index(
+    entries: &[EntryOptions],
+) -> Result<std::collections::HashMap<String, DeployOwner>, LoaderControlError> {
+    let mut map = std::collections::HashMap::new();
+    fn walk(
+        prefix: &str,
+        entries: &[EntryOptions],
+        map: &mut std::collections::HashMap<String, DeployOwner>,
+    ) -> Result<(), LoaderControlError> {
+        for entry in entries {
+            let path = if prefix.is_empty() {
+                entry.id.clone()
             } else {
-                value.as_f64().map(toml::Value::Float)
+                format!("{prefix}:{}", entry.id)
+            };
+            map.insert(
+                path.clone(),
+                DeployOwner {
+                    name: entry.name.clone(),
+                    group: entry.group,
+                },
+            );
+            if entry.group {
+                walk(&path, &entry.children()?, map)?;
             }
         }
-        serde_json::Value::String(value) => Some(toml::Value::String(value)),
-        serde_json::Value::Array(items) => {
-            let mut out = Vec::with_capacity(items.len());
-            for item in items {
-                out.push(json_to_toml(item)?);
-            }
-            Some(toml::Value::Array(out))
-        }
-        serde_json::Value::Object(map) => {
-            let mut table = toml::Table::new();
-            for (key, item) in map {
-                if let Some(converted) = json_to_toml(item) {
-                    table.insert(key, converted);
-                }
-            }
-            Some(toml::Value::Table(table))
-        }
+        Ok(())
+    }
+    walk("", entries, &mut map)?;
+    Ok(map)
+}
+
+fn classify_editability(
+    group: bool,
+    factory: &str,
+    owned: Option<&DeployOwner>,
+) -> ConfigEditability {
+    if group || owned.is_some_and(|owner| owner.group) {
+        return ConfigEditability::ReadOnly(ConfigReadOnlyReason::Group);
+    }
+    if factory == "cordis:include" {
+        return ConfigEditability::ReadOnly(ConfigReadOnlyReason::NestedInclude);
+    }
+    match owned {
+        Some(owner) if owner.name == factory => ConfigEditability::Editable,
+        _ => ConfigEditability::ReadOnly(ConfigReadOnlyReason::UnmanagedEntry),
     }
 }
 

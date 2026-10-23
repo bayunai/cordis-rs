@@ -50,15 +50,33 @@ pub(crate) async fn read_layer_patches(
     user: &UserPatchDocument,
     home: &Path,
 ) -> Result<Vec<EntryPatch>, LoaderControlError> {
-    let mut patches = load_ordered_patches(deploy).await.map_err(layer_error)?;
-    patches.extend(user.to_entry_patches());
-    patches.extend(
-        PatchFileDocument::load(home)
-            .await
-            .map_err(layer_error)?
-            .patches,
-    );
-    Ok(patches)
+    Ok(LayerPatches::read(deploy, home).await?.with_user(user))
+}
+
+/// 一次读取的不可变层数据。版本检查、继承和有效配置必须从同一份数据派生，
+/// 不得检查后重新读文件，否则外部修改可能让配置与 Schema 属于不同版本。
+pub(crate) struct LayerPatches {
+    pub deploy: Vec<EntryPatch>,
+    home: Vec<EntryPatch>,
+}
+
+impl LayerPatches {
+    pub async fn read(deploy: &[PathBuf], home: &Path) -> Result<Self, LoaderControlError> {
+        Ok(Self {
+            deploy: load_ordered_patches(deploy).await.map_err(layer_error)?,
+            home: PatchFileDocument::load(home)
+                .await
+                .map_err(layer_error)?
+                .patches,
+        })
+    }
+
+    pub fn with_user(&self, user: &UserPatchDocument) -> Vec<EntryPatch> {
+        let mut patches = self.deploy.clone();
+        patches.extend(user.to_entry_patches());
+        patches.extend(self.home.iter().cloned());
+        patches
+    }
 }
 
 pub(crate) fn layer_error(message: String) -> LoaderControlError {
@@ -73,6 +91,35 @@ mod tests {
     use crate::{PATCH_FILE_VERSION, PatchFileDocument};
     use cordis_loader::ExtensionsConfig;
     use cordis_plugin_include::apply_patches;
+
+    #[tokio::test]
+    async fn captured_layers_do_not_reread_files_when_composing_views() {
+        let dir = tempfile::tempdir().unwrap();
+        let deploy = dir.path().join("deploy.toml");
+        let home = dir.path().join("home.toml");
+        let document = PatchFileDocument {
+            version: PATCH_FILE_VERSION,
+            patches: vec![EntryPatch {
+                insert: Some(vec![
+                    EntryOptions::new("one", "public")
+                        .with_config(toml::toml! { message = "old" }.into()),
+                ]),
+                ..Default::default()
+            }],
+        };
+        std::fs::write(&deploy, toml::to_string(&document).unwrap()).unwrap();
+        let captured = LayerPatches::read(std::slice::from_ref(&deploy), &home)
+            .await
+            .unwrap();
+        let expected = captured.with_user(&UserPatchDocument::empty());
+        // 检查与投影之间即便文件被外部改写，也只能使用已经捕获的那份数据。
+        std::fs::write(&deploy, "broken = [").unwrap();
+        std::fs::write(&home, "broken = [").unwrap();
+        assert!(captured.with_user(&UserPatchDocument::empty()) == expected);
+        let tree = crate::compose_entries(&expected).unwrap();
+        assert_eq!(tree.extensions[0].name, "public");
+        assert_eq!(tree.extensions[0].config["message"].as_str(), Some("old"));
+    }
 
     #[tokio::test]
     async fn preparation_composes_layers_in_order_without_creating_the_root_file() {

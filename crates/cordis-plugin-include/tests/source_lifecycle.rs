@@ -130,7 +130,7 @@ impl Harness {
             .unwrap();
         let settings_fiber = runtime
             .root()
-            .plugin(Arc::new(SettingsPlugin::default()))
+            .plugin(Arc::new(SettingsPlugin))
             .await
             .unwrap();
         let settings = (*runtime.root().get(SETTINGS).unwrap()).clone();

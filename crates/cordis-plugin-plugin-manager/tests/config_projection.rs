@@ -129,7 +129,7 @@ async fn mount(config: ConfigEditorConfig, root: &std::path::Path) -> Harness {
     fibers.push(
         runtime
             .root()
-            .plugin(Arc::new(SettingsPlugin::default()))
+            .plugin(Arc::new(SettingsPlugin))
             .await
             .unwrap(),
     );
@@ -182,9 +182,11 @@ async fn applied_value_is_cached_and_set_does_not_bake_defaults_into_user() {
         .unwrap();
     let expected_limit = actual.get().value.limit;
     let before = settings.describe("include:one").await.unwrap();
-    // base 对齐 DSH：去除 user 后解析，可含 Serde 默认；config/raw 仍无显式 limit。
-    assert!(before.base.get("limit").is_some());
-    assert_ne!(before.base["limit"].as_integer().unwrap() as u32, schema_default());
+    // base 是 raw 继承；默认值只在 inherited / value 投影中。
+    assert!(before.base.get("limit").is_none());
+    let inherited = before.inherited.as_ref().unwrap();
+    assert!(inherited.get("limit").is_some());
+    assert_ne!(inherited["limit"], schema_default());
     assert!(before.config.get("limit").is_none());
     for _ in 0..3 {
         let view = settings.describe("include:one").await.unwrap();
@@ -236,9 +238,8 @@ async fn unset_restores_inherited_base_value() {
         .await
         .unwrap();
     assert_eq!(overridden.config["limit"].as_integer(), Some(42));
-    // base 仍是无 user 的继承层，不被 user 覆盖污染。
-    assert_ne!(overridden.base["limit"].as_integer(), Some(42));
-    assert!(overridden.base.get("limit").is_some());
+    // raw base 无 limit；Unset 应删键，不把 Serde 默认写入 user。
+    assert!(overridden.base.get("limit").is_none());
     let restored = settings
         .mutate(
             "include:one",
@@ -249,13 +250,84 @@ async fn unset_restores_inherited_base_value() {
         )
         .await
         .unwrap();
-    // Unset 从 mutate 时的 base 恢复；本夹具 limit 的 serde default 有状态，
-    // 故不与前一次 describe 的 base 做数值相等，只断言离开 user 覆盖。
-    assert_ne!(restored.config["limit"].as_integer(), Some(42));
-    assert_eq!(
-        restored.user.as_ref().and_then(|user| user.get("limit")),
-        restored.config.get("limit"),
-        "恢复继承写入的值应出现在 user / effective"
+    assert!(restored.config.get("limit").is_none());
+    assert!(
+        restored
+            .user
+            .as_ref()
+            .is_none_or(|user| user.get("limit").is_none())
+    );
+    h.runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn unset_token_restores_deploy_input_key_not_serde_default() {
+    let _serial = TEST_LOCK.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("cordis.toml"),
+        "version = 3\nextensions = []\n",
+    )
+    .unwrap();
+    let entry = EntryOptions::new("one", "projection").with_config(
+        toml::toml! {
+            address = "ok"
+            token = "deploy-token-secret"
+        }
+        .into(),
+    );
+    let deploy = PatchFileDocument {
+        version: PATCH_FILE_VERSION,
+        patches: vec![EntryPatch {
+            insert: Some(vec![entry]),
+            ..Default::default()
+        }],
+    };
+    std::fs::write(
+        dir.path().join("deploy.toml"),
+        toml::to_string(&deploy).unwrap(),
+    )
+    .unwrap();
+    let config = ConfigEditorConfig::new(
+        vec![dir.path().join("deploy.toml")],
+        dir.path().join("user.toml"),
+        dir.path().join("home.toml"),
+    );
+    let h = mount(config.clone(), &dir.path().join("cordis.toml")).await;
+    let settings = h.runtime.root().get(SETTINGS).unwrap();
+    let before = settings.describe("include:one").await.unwrap();
+    assert!(!format!("{before:?}").contains("deploy-token-secret"));
+    assert!(before.base.get("token").is_none());
+    let overridden = settings
+        .mutate(
+            "include:one",
+            before.revision,
+            vec![ConfigOperation::Set {
+                path: vec!["token".into()],
+                value: "user-token-secret".into(),
+            }],
+        )
+        .await
+        .unwrap();
+    let restored = settings
+        .mutate(
+            "include:one",
+            overridden.revision,
+            vec![ConfigOperation::Unset {
+                path: vec!["token".into()],
+            }],
+        )
+        .await
+        .unwrap();
+    assert!(!format!("{restored:?}").contains("user-token-secret"));
+    assert!(!format!("{restored:?}").contains("deploy-token-secret"));
+    assert!(!format!("{restored:?}").contains("server-default-secret"));
+    // 恢复的是输入键 token（is_set），不是序列化名 / Serde 默认。
+    assert!(
+        restored
+            .secrets
+            .iter()
+            .any(|secret| secret.path == ["token"] && secret.is_set)
     );
     h.runtime.shutdown().await.unwrap();
 }

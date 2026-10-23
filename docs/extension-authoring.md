@@ -61,7 +61,7 @@ struct UploadConfig {
 该快照不会在查询时重新计算默认值；自定义 Serialize 的错误或 panic 会在生命周期执行前明确拒绝。
 Settings 的 `config` 为原始字段编辑源，`value` 是仅 Active 存在的解析快照；不能把展示默认值回填到用户覆盖。
 
-应用挂载 `SettingsPlugin` 后使用 `settings.list()` / `describe()` 展示表单，再通过
+应用挂载 `SettingsPlugin`（在 ConfigEditor 之后）后使用 `settings.list()` / `describe()` 展示表单，再通过
 `settings.mutate()` 提交有序字段操作和版本（写回经 config-editor）。
 未修改的秘密不要从脱敏表单补为空字符串；只有用户明确替换或删除时才提交相应操作。
 管理端无需依赖插件自身的客户端入口，未启用或失败的实例同样能修复配置。

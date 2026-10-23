@@ -9,9 +9,10 @@
 
 | 做 | 不做 |
 | --- | --- |
-| `layers`：base=deploy∘home（可含解析默认）/ user / effective=deploy∘user∘home | Schema 表单投影、秘密脱敏 |
+| `layers`：raw `base`=deploy∘home / 可选 `inherited` 投影 / user / effective；含 `editability` | Schema 表单投影、秘密脱敏 |
+| `managed_entries`：同事务目录 + 编辑能力（deploy 只 compose 一次） | |
 | `edit` / `set_enabled`：只写 user patch 并全量 reconcile | 写空根、deploy、home |
-| home 盖住时拒绝 `edit` | 页面组件、HTTP、鉴权 |
+| **唯一** `include_root`（Settings / PluginManager 读取，不另存） | 页面组件、HTTP、鉴权 |
 | `read` / `commit_source`：受信任整表（运维） | 用户偏好文档（非 Entry Config） |
 
 ## API
@@ -35,12 +36,21 @@ ctx.plugin(Arc::new(ConfigEditorPlugin::new(config))).await?;
 - `layers(path) -> LayeredEntryConfig`（raw `effective` 与 Active 的可选 `resolved` 分开）
 - `edit(path, expected, effective) -> LayeredEntryConfig`
 - `set_enabled(path, enabled)`
-- `can_edit(path)` / `editability(path)`：按 deploy 所有权判断是否支持编辑，并给出
-  `ConfigReadOnlyReason`（`Group` / `NestedInclude` / `UnmanagedEntry`）；嵌套 Include 后代不冒充可编辑。
+- `can_edit(path)` / `editability(path)` / `managed_entries()`：按 deploy 所有权判断是否支持编辑，
+  并给出 `ConfigReadOnlyReason`（`Group` / `NestedInclude` / `UnmanagedEntry`）。
+  单项能力查询与目录共用条目元数据分类；Group 返回 `ReadOnly(Group)` / `can_edit=false`，不要求读取不存在的表单 Schema。
+- `include_root()`：编辑范围根路径。
 - `read` / `commit_source` — 后者可能 bake Include path；表单不得使用
 - `reload()` — 显式重读各层并协调，外部修改冲突后由调用方刷新，不自动重试编辑
 
 ## 失败与文件安全
+
+deploy / home 与 user 的 TOML 解析错误共用安全诊断：仅返回文件路径、可用的行列位置
+和语法／类型错误分类，不包含源文本片段或自定义 Serde 错误正文。
+
+同一 ID 可以有多行有序 user patch；`config` 与 `disabled` 各自使用最后一次显式覆盖。
+只修改启停不会清除此前的配置，只修改配置也不会清除此前的启停覆盖；写回该 ID 时
+合并为一行，同时保留另一字段的有效覆盖，其他 ID 不变。
 
 `edit` / `set_enabled` 必须报告本次生命周期失败，不将 Failed 条目视为编辑成功。
 失败后恢复此前 user 文档；恢复失败会同时报告，不能宣称持久化已恢复。
@@ -63,7 +73,8 @@ Unix 文件创建权限为 `0600`，新建目录为 `0700`，不修改已有父�
 OS 自动释放锁。锁等待也在阻塞任务内，不阻塞异步工作线程，不用 PID 猜测清理“陈旧锁”。
 `UserPatchStore::begin_edit()` 返回 `UserPatchEdit`，多步读改写必须使用同一 guard；
 单独 `load()` / `store()` 仅保证各自操作受锁保护。
-检测到磁盘层与本 Loader 已加载 patches 不一致时拒绝写入并返回 `ConfigConflict`；
+分层描述先捕获一份 deploy / user / home，再与本 Loader 已加载 patches 核对；继承、有效值和
+所有权只从这份数据派生，校验后不重新读取文件。检测到不一致时拒绝描述或写入并返回 `ConfigConflict`；
 先显式 `reload()`、重新读取描述再编辑，不能覆盖另一进程提交的值。
 所有协作写入者必须遵守锁协议；直接编辑文件的工具不受 OS 咨询锁强制约束。
 读取 user 层可能创建私有目录和锁锚点，但不创建缺失的 user 配置文件。

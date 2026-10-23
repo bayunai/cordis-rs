@@ -16,13 +16,13 @@
 ```text
 浏览器 / 管理 UI
         │  HTTP · 鉴权 · DTO（应用 Host）
-        ├─► cordis-plugin-plugin-manager  ← list_plugins / set_plugin_enabled / subscribe
+        ├─► cordis-plugin-plugin-manager  ← list_plugins / set_plugin_enabled / watch
         │         │ 启停委托
         ▼         ▼
-cordis-plugin-settings          ← list / describe / mutate / subscribe（脱敏分层 + 可编辑性）
+cordis-plugin-settings          ← list / describe / mutate / watch（raw base · inherited · value）
         │  委托 user 层提交
         ▼
-cordis-plugin-config-editor     ← deploy ∘ user ∘ home → Include.patches；editability
+cordis-plugin-config-editor     ← 唯一 include_root · managed_entries · raw 继承 · 写回
         │
         ├─► 各插件 deploy patch（只读于 UI）
         ├─► 本机 user patch（唯一产品写目标）
@@ -33,10 +33,10 @@ cordis-plugin-config-editor     ← deploy ∘ user ∘ home → Include.patches
 
 | 层 | 拥有 | 不拥有 |
 | --- | --- | --- |
-| **plugin-manager** | 根 Include 下 Entry 库存（含 Group）、`set_plugin_enabled`、快照失效订阅 | 表单字段、HTTP、pnpm、bundle 安装/选层 |
-| **settings** | 可配置条目 `list`、安全 Schema、脱敏分层、`editable` / `read_only_reason`、Set/Unset、`subscribe` | 文件 I/O、直接明文 `update`、启停 |
-| **config-editor** | 有序 deploy 路径、user/home 文档、组成与 reconcile、`editability`；运维用整表 `commit_source` | 表单投影、HTTP |
-| **Loader** | Catalog、EntryTree、reconcile、`EntryTreeSource`、snapshot/commit 原语 | 表单 DTO、文件格式、产品 user 语义 |
+| **plugin-manager** | 根 Include 下 Entry 库存（投影 `managed_entries`）、`set_plugin_enabled`、`watch` | 表单字段、HTTP、pnpm、另存 `include_root` |
+| **settings** | `list` / 安全投影 / Set/Unset（只用 raw 恢复）/ `watch` | 文件 I/O、启停、另存 `include_root`、读投影走 `prepare` |
+| **config-editor** | **唯一** `include_root`、`managed_entries`、raw 继承、`editability`、user 写回 | 表单投影、HTTP |
+| **Loader / Catalog** | snapshot/commit；`project` 类型投影；`prepare` 仅变更预检 | 表单 DTO、产品 user 语义 |
 | **Include** | 路径、编解码、文件事务；`patches` 为组成载体 | 管理界面语义、本机 user 权威 |
 | **应用 Host** | HTTP、鉴权、页面；注入 deploy 路径列表与 user/home 绝对路径 | 不得把偏好文档冒充 Entry Config |
 
@@ -48,14 +48,15 @@ cordis-plugin-config-editor     ← deploy ∘ user ∘ home → Include.patches
 | **deploy** | 各插件有序 `cordis.patch.toml`（通常根 `insert`） | 包内文件；UI 不写 |
 | **user** | 本机覆盖：Entry `config` 与启停 `disabled` | Host 注入（如 `user.patches.toml`） |
 | **home** | 更高优先本机覆盖 | Host 注入（如 `home.patches.toml`）；UI 不写 |
-| **base / inherited** | deploy ∘ home（无 user）；能解析时含 Serde 默认值 | 不单独落盘；供 describe / Unset 恢复继承 |
+| **base（raw）** | deploy ∘ home 原始 TOML | 不落盘；Unset 恢复源；输入 Schema 脱敏 |
+| **inherited（投影）** | 对 raw base 的 Catalog 类型投影（含 Serde 默认）；仅输入无法独立解析时为 None | 执行故障明确报错；仅展示，不退回 raw 混用 |
 | **config / effective** | deploy ∘ user ∘ home 的 raw 配置 | 不单独落盘；经 Include `patches` 同步 |
-| **value / resolved** | Active 实例的类型解析快照（含真实 Serde 默认值）；其他状态为 None | 仅展示；Unset 恢复继承时可写入 user |
+| **value / resolved** | Active 实例的类型解析快照；其他状态为 None | 仅展示 |
 
 产品 **user ≠** Include 配置里的 `patches` 字段语义：后者是调和载体；权威在独立文档与各插件 deploy 文件。  
 **user ≠** 应用偏好（例如工作台 `settings.toml` / `workbench-settings`）：那是第三命名空间。
 
-表单 `mutate` / 启停：**只写 user 文档**，再 reconcile；禁止 bake 空根或 deploy。`Unset` 为恢复继承（对象）或删数组元素，对齐 DSH，不是硬删字段。`edit` 若被 home 盖住导致 effective ≠ 目标则拒绝。**能 `describe` ≠ 允许 `mutate`**：`list` / `describe` 带 `editable` 与 `read_only_reason`（与 `CONFIG_EDITOR.editability` 同源）；只读条目仍可描述，`mutate` 预检拒绝。产品启停经 `PLUGIN_MANAGER.set_plugin_enabled`（内部仍调 config-editor）。
+表单 `mutate` / 启停：**只写 user 文档**，再 reconcile；禁止 bake 空根或 deploy。`Unset` 只对 **raw base** 有键则 set、无键则删（不把 Serde 默认写入 user）。`edit` 若被 home 盖住则拒绝。**能 `describe` ≠ 允许 `mutate`**。目录与能力经 `managed_entries` 同事务。产品启停经 `PLUGIN_MANAGER`。
 
 Host 在代码中挂根 Include（空根 `cordis.toml`），不使用独立 bootstrap 配方文件，也不把空根拆进业务插件。
 

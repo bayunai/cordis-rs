@@ -33,7 +33,7 @@ pub use config::{
     IsolateValue,
 };
 pub use config_control::{ConfigRevision, EntryConfigSnapshot};
-pub use error::LoaderError;
+pub use error::{ConfigProjectionError, LoaderError};
 pub use loader::{
     ConfigTransaction, EntryUpdate, LOADER, Loader, LoaderControlError, LoaderEvent, LoaderSubtree,
 };
