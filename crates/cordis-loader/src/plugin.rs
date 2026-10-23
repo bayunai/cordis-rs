@@ -57,6 +57,7 @@ impl LoaderPlugin {
             events,
             change_revision: AtomicU64::new(0),
             state_progress: Notify::new(),
+            config_operations: tokio::sync::Mutex::new(()),
         });
         *root.loader.lock().expect("loader weak") = Arc::downgrade(&inner);
         Ok(inner)
@@ -98,6 +99,8 @@ impl Plugin for LoaderPlugin {
 }
 
 pub(crate) struct LoaderInner {
+    /// 跨来源配置事务与直接控制操作共用的准入锁；内部递归协调不重复获取。
+    pub(crate) config_operations: tokio::sync::Mutex<()>,
     pub(crate) catalog: ExtensionCatalog,
     pub(crate) root: Arc<RuntimeTree>,
     pub(crate) subtrees: Mutex<SubtreeRegistry>,

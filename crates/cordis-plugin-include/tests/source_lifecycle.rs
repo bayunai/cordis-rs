@@ -125,7 +125,6 @@ impl Harness {
                 Vec::new(),
                 dir.path().join("user.patches.toml"),
                 dir.path().join("home.patches.toml"),
-                dir.path(),
             ))))
             .await
             .unwrap();

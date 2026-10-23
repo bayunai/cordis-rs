@@ -267,6 +267,103 @@ async fn memory_root_mutation_does_not_persist_and_source_tree_uses_its_backend(
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn config_transaction_serializes_direct_commit_and_rejects_its_stale_revision() {
+    let (runtime, _fiber, loader, _source) = mount().await;
+    let before = loader.snapshot_entry_config("tree:leaf").await.unwrap();
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let transaction = tokio::spawn({
+        let loader = loader.clone();
+        async move {
+            loader
+                .config_transaction(move |tx| {
+                    Box::pin(async move {
+                        let snapshot = tx.snapshot_entry_config("tree:leaf").await?;
+                        entered_tx.send(()).unwrap();
+                        release_rx.await.unwrap();
+                        tx.commit_entry_config(
+                            "tree:leaf",
+                            snapshot.revision,
+                            toml::toml! { value = 2 }.into(),
+                        )
+                        .await
+                    })
+                })
+                .await
+        }
+    });
+    entered_rx.await.unwrap();
+    let direct = tokio::spawn({
+        let loader = loader.clone();
+        async move {
+            loader
+                .commit_entry_config(
+                    "tree:leaf",
+                    before.revision,
+                    toml::toml! { value = 3 }.into(),
+                )
+                .await
+        }
+    });
+    release_tx.send(()).unwrap();
+    transaction.await.unwrap().unwrap();
+    assert!(matches!(
+        direct.await.unwrap(),
+        Err(LoaderControlError::ConfigRevisionConflict)
+    ));
+    assert_eq!(
+        loader
+            .snapshot_entry_config("tree:leaf")
+            .await
+            .unwrap()
+            .config["value"]
+            .as_integer(),
+        Some(2)
+    );
+    runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn cancelled_config_transaction_still_settles_before_direct_crud_and_reload() {
+    let (runtime, _fiber, loader, source) = mount().await;
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let caller = tokio::spawn({
+        let loader = loader.clone();
+        async move {
+            loader
+                .config_transaction(move |tx| {
+                    Box::pin(async move {
+                        let before = tx.snapshot_entry_config("tree:leaf").await?;
+                        entered_tx.send(()).unwrap();
+                        release_rx.await.unwrap();
+                        tx.commit_entry_config(
+                            "tree:leaf",
+                            before.revision,
+                            toml::toml! { value = 2 }.into(),
+                        )
+                        .await
+                    })
+                })
+                .await
+        }
+    });
+    entered_rx.await.unwrap();
+    caller.abort();
+    let direct = tokio::spawn({
+        let tree = loader.subtree("tree").unwrap();
+        async move { tree.create(entry("other", 9), None, None).await }
+    });
+    release_tx.send(()).unwrap();
+    direct.await.unwrap().unwrap();
+    loader.subtree("tree").unwrap().reload().await.unwrap();
+    let data = source.data.lock().unwrap().clone();
+    assert_eq!(data.extensions[0].config["value"].as_integer(), Some(2));
+    assert_eq!(data.extensions.len(), 2);
+    runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn unchanged_reload_reads_source_but_does_not_prepare_revise_or_publish() {
     let (runtime, _fiber, loader, source) = mount().await;
     loader.await_idle().await.unwrap();

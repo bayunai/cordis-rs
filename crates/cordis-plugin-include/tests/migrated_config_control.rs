@@ -3,16 +3,14 @@ use cordis_core::{
     Context, CoreError, Fiber, FiberState, Plugin, PluginKey, Runtime, ServiceId, ServiceKey,
 };
 use cordis_loader::{
-    ConfigRef, EntryOptions, ExtensionCatalog, ExtensionFactory, ExtensionsConfig,
-    LOADER, Loader, LoaderControlError, LoaderError, LoaderPlugin, PreparedExtension,
+    ConfigRef, EntryOptions, ExtensionCatalog, ExtensionFactory, ExtensionsConfig, LOADER, Loader,
+    LoaderControlError, LoaderError, LoaderPlugin, PreparedExtension,
 };
 use cordis_plugin_config_editor::{
     CONFIG_EDITOR, ConfigEditorConfig, ConfigEditorPlugin, PATCH_FILE_VERSION, PatchFileDocument,
 };
 use cordis_plugin_include::EntryPatch;
-use cordis_plugin_settings::{
-    ConfigOperation, SETTINGS, SettingsPlugin, SettingsService,
-};
+use cordis_plugin_settings::{ConfigOperation, SETTINGS, SettingsPlugin, SettingsService};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use std::sync::{
@@ -148,7 +146,6 @@ impl Harness {
             dir.path().join("deploy.patches.toml"),
             dir.path().join("user.patches.toml"),
             dir.path().join("home.patches.toml"),
-            dir.path(),
         )
         .await;
         let loader = (*runtime.root().get(LOADER).unwrap()).clone();
@@ -191,7 +188,9 @@ async fn disabled_edit_validates_once_without_constructing_and_preserves_secrets
     assert!(before.secrets[0].is_set);
     assert!(!format!("{before:?}").contains("secret-value"));
     let base_before = h.file();
-    let after = h.settings.mutate("include:one", before.revision, vec![set("limit", 2)])
+    let after = h
+        .settings
+        .mutate("include:one", before.revision, vec![set("limit", 2)])
         .await
         .unwrap();
     assert_ne!(before.revision, after.revision);
@@ -201,11 +200,14 @@ async fn disabled_edit_validates_once_without_constructing_and_preserves_secrets
     assert_eq!(h.file(), base_before, "表单不得 bake 进 Include path");
     assert!(h.user_file().contains("secret-value"));
     assert!(matches!(
-        h.settings.mutate("include:one", before.revision, vec![set("limit", 3)])
+        h.settings
+            .mutate("include:one", before.revision, vec![set("limit", 3)])
             .await,
         Err(LoaderControlError::ConfigRevisionConflict)
     ));
-    let after = h.settings.mutate(
+    let after = h
+        .settings
+        .mutate(
             "include:one",
             after.revision,
             vec![ConfigOperation::Unset {
@@ -233,7 +235,9 @@ async fn active_hot_and_static_changes_use_existing_reconcile_and_one_prepare() 
         .fiber_id;
     let form = h.settings.describe("include:one").await.unwrap();
     let prepares = h.counts.prepares.load(Ordering::SeqCst);
-    let form = h.settings.mutate("include:one", form.revision, vec![set("limit", 2)])
+    let form = h
+        .settings
+        .mutate("include:one", form.revision, vec![set("limit", 2)])
         .await
         .unwrap();
     assert_eq!(h.counts.prepares.load(Ordering::SeqCst), prepares + 1);
@@ -249,7 +253,8 @@ async fn active_hot_and_static_changes_use_existing_reconcile_and_one_prepare() 
             .fiber_id,
         before
     );
-    h.settings.mutate(
+    h.settings
+        .mutate(
             "include:one",
             form.revision,
             vec![set("address", "changed")],
@@ -272,7 +277,9 @@ async fn invalid_input_does_not_change_file_or_revision_and_does_not_echo_values
         set("limit", 0),
         set("address", "panic"),
     ] {
-        let error = h.settings.mutate("include:one", before.revision, vec![operation])
+        let error = h
+            .settings
+            .mutate("include:one", before.revision, vec![operation])
             .await
             .unwrap_err();
         assert!(matches!(error, LoaderControlError::ConfigValidation));
@@ -281,14 +288,13 @@ async fn invalid_input_does_not_change_file_or_revision_and_does_not_echo_values
         assert_eq!(h.file(), file);
         assert_eq!(h.user_file(), user);
         assert_eq!(
-            h.settings.describe("include:one")
-                .await
-                .unwrap()
-                .revision,
+            h.settings.describe("include:one").await.unwrap().revision,
             before.revision
         );
     }
-    let error = h.settings.mutate(
+    let error = h
+        .settings
+        .mutate(
             "include:one",
             before.revision,
             vec![ConfigOperation::Set {
@@ -307,7 +313,9 @@ async fn failed_and_pending_instances_can_be_fixed_and_failure_invalidates_revis
     for address in ["fail", "pending"] {
         let h = Harness::new(address, false).await;
         let before = h.settings.describe("include:one").await.unwrap();
-        let after = h.settings.mutate("include:one", before.revision, vec![set("address", "ok")])
+        let after = h
+            .settings
+            .mutate("include:one", before.revision, vec![set("address", "ok")])
             .await
             .unwrap();
         assert_eq!(
@@ -321,13 +329,16 @@ async fn failed_and_pending_instances_can_be_fixed_and_failure_invalidates_revis
             Some(FiberState::Active)
         );
         let file = h.file();
-        // 生命周期失败不回滚 desired；与 deploy 相同时可清除 user；编辑器保持可用。
-        let failed = h
+        let user_before = h.user_file();
+        // 生命周期失败返回错误，保留已提交声明和 user 文件；编辑器仍可用于修复。
+        let error = h
             .settings
             .mutate("include:one", after.revision, vec![set("address", "fail")])
             .await
-            .unwrap();
+            .unwrap_err();
+        assert!(error.is_entry_lifecycle_failure());
         assert_eq!(h.file(), file);
+        assert_eq!(h.user_file(), user_before);
         assert_eq!(
             h.loader
                 .await_idle()
@@ -338,6 +349,8 @@ async fn failed_and_pending_instances_can_be_fixed_and_failure_invalidates_revis
                 .state,
             Some(FiberState::Failed)
         );
+        let failed = h.settings.describe("include:one").await.unwrap();
+        assert_eq!(failed.value["address"].as_str(), Some("ok"));
         assert_ne!(failed.revision, after.revision);
         h.settings
             .mutate("include:one", failed.revision, vec![set("address", "ok")])
@@ -348,12 +361,55 @@ async fn failed_and_pending_instances_can_be_fixed_and_failure_invalidates_revis
 }
 
 #[tokio::test]
+async fn enabling_a_failing_plugin_reports_error_and_preserves_user_and_declaration() {
+    let h = Harness::new("fail", true).await;
+    let before = h.settings.describe("include:one").await.unwrap();
+    let user_before = h.user_file();
+    let editor = h.runtime.root().get(CONFIG_EDITOR).unwrap();
+    let error = editor.set_enabled("include:one", true).await.unwrap_err();
+    assert!(error.is_entry_lifecycle_failure());
+    assert_eq!(h.user_file(), user_before);
+    assert_eq!(
+        h.loader
+            .await_idle()
+            .await
+            .unwrap()
+            .entry("include:one")
+            .unwrap()
+            .state,
+        Some(FiberState::Failed)
+    );
+    let tree = h.loader.subtree("include").unwrap();
+    assert!(tree.entries().unwrap().extensions[0].disabled);
+    let after = h.settings.describe("include:one").await.unwrap();
+    assert_ne!(after.revision, before.revision);
+    h.settings
+        .mutate("include:one", after.revision, vec![set("address", "ok")])
+        .await
+        .unwrap();
+    editor.set_enabled("include:one", true).await.unwrap();
+    assert_eq!(
+        h.loader
+            .await_idle()
+            .await
+            .unwrap()
+            .entry("include:one")
+            .unwrap()
+            .state,
+        Some(FiberState::Active)
+    );
+    h.runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn concurrent_edits_conflict_and_external_base_edit_is_explicit() {
     let h = Harness::new("ok", false).await;
     let form = h.settings.describe("include:one").await.unwrap();
     let (a, b) = tokio::join!(
-        h.settings.mutate("include:one", form.revision, vec![set("limit", 2)]),
-        h.settings.mutate("include:one", form.revision, vec![set("limit", 3)])
+        h.settings
+            .mutate("include:one", form.revision, vec![set("limit", 2)]),
+        h.settings
+            .mutate("include:one", form.revision, vec![set("limit", 3)])
     );
     assert_ne!(a.is_ok(), b.is_ok());
     assert!(matches!(
@@ -425,7 +481,11 @@ async fn nested_include_is_readable_but_not_editable_via_root_user_layer() {
     let mut one = EntryOptions::new("one", "editable")
         .with_config(toml::toml! { address = "ok" limit = 1 token = "secret-value" }.into());
     one.disabled = false;
-    std::fs::write(dir.path().join("cordis.toml"), "version = 3\n\nextensions = []\n").unwrap();
+    std::fs::write(
+        dir.path().join("cordis.toml"),
+        "version = 3\n\nextensions = []\n",
+    )
+    .unwrap();
     let deploy = PatchFileDocument {
         version: PATCH_FILE_VERSION,
         patches: vec![EntryPatch {
@@ -453,7 +513,6 @@ async fn nested_include_is_readable_but_not_editable_via_root_user_layer() {
         dir.path().join("deploy.patches.toml"),
         dir.path().join("user.patches.toml"),
         dir.path().join("home.patches.toml"),
-        dir.path(),
     )
     .await;
     let loader = (*runtime.root().get(LOADER).unwrap()).clone();
@@ -538,7 +597,9 @@ async fn form_mutate_writes_user_and_leaves_base_file_unchanged() {
 async fn ordered_operations_and_secret_replacement_do_not_restore_deleted_fields() {
     let h = Harness::new("ok", true).await;
     let form = h.settings.describe("include:one").await.unwrap();
-    let form = h.settings.mutate(
+    let form = h
+        .settings
+        .mutate(
             "include:one",
             form.revision,
             vec![set("limit", 2), set("limit", 3), set("token", "new-secret")],
@@ -553,7 +614,8 @@ async fn ordered_operations_and_secret_replacement_do_not_restore_deleted_fields
     let before = h.file();
     let user_before = h.user_file();
     assert!(matches!(
-        h.settings.mutate(
+        h.settings
+            .mutate(
                 "include:one",
                 form.revision,
                 vec![ConfigOperation::Unset {
@@ -602,7 +664,11 @@ async fn instance_edits_preserve_other_instance_config_and_fiber() {
         .with_config(toml::toml! { address = "ok" limit = 1 token = "secret-value" }.into());
     let two = EntryOptions::new("two", "editable")
         .with_config(toml::toml! { address = "second" limit = 7 }.into());
-    std::fs::write(dir.path().join("cordis.toml"), "version = 3\n\nextensions = []\n").unwrap();
+    std::fs::write(
+        dir.path().join("cordis.toml"),
+        "version = 3\n\nextensions = []\n",
+    )
+    .unwrap();
     let deploy = PatchFileDocument {
         version: PATCH_FILE_VERSION,
         patches: vec![EntryPatch {
@@ -630,7 +696,6 @@ async fn instance_edits_preserve_other_instance_config_and_fiber() {
         dir.path().join("deploy.patches.toml"),
         dir.path().join("user.patches.toml"),
         dir.path().join("home.patches.toml"),
-        dir.path(),
     )
     .await;
     let loader = (*runtime.root().get(LOADER).unwrap()).clone();
@@ -666,10 +731,7 @@ async fn instance_edits_preserve_other_instance_config_and_fiber() {
 #[tokio::test]
 async fn revision_roundtrips_as_an_opaque_transport_token() {
     let h = Harness::new("ok", true).await;
-    let revision = h.settings.describe("include:one")
-        .await
-        .unwrap()
-        .revision;
+    let revision = h.settings.describe("include:one").await.unwrap().revision;
     assert_eq!(
         revision
             .to_string()
@@ -722,9 +784,28 @@ async fn mount_file(
     deploy_patch: impl AsRef<std::path::Path>,
     user_patch: impl AsRef<std::path::Path>,
     home_patch: impl AsRef<std::path::Path>,
-    config_dir: impl AsRef<std::path::Path>,
 ) -> (Vec<Fiber>, SettingsService) {
-    let entry = cordis_plugin_include::include_root_entry("include", cordis).unwrap();
+    let mut entry = cordis_plugin_include::include_root_entry("include", cordis).unwrap();
+    // 初次声明属于 Include 初始化：业务失败也保留声明供 Settings 修复。
+    // ConfigEditor 后续 edit 则必须向调用方返回生命周期错误。
+    let mut include: cordis_plugin_include::IncludeConfig = entry.config.try_into().unwrap();
+    include.patches = cordis_plugin_config_editor::load_ordered_patches(&[deploy_patch.as_ref()])
+        .await
+        .unwrap();
+    include.patches.extend(
+        cordis_plugin_config_editor::UserPatchStore::new(user_patch.as_ref())
+            .load()
+            .await
+            .unwrap()
+            .to_entry_patches(),
+    );
+    include.patches.extend(
+        PatchFileDocument::load(home_patch.as_ref())
+            .await
+            .unwrap()
+            .patches,
+    );
+    entry.config = toml::Value::try_from(include).unwrap();
     let loader_fiber = runtime
         .root()
         .plugin(Arc::new(LoaderPlugin::new(catalog)))
@@ -743,7 +824,6 @@ async fn mount_file(
             vec![deploy_patch.as_ref().to_path_buf()],
             user_patch.as_ref(),
             home_patch.as_ref(),
-            config_dir.as_ref(),
         ))))
         .await
         .unwrap();
@@ -753,8 +833,5 @@ async fn mount_file(
         .await
         .unwrap();
     let settings = (*runtime.root().get(SETTINGS).unwrap()).clone();
-    (
-        vec![loader_fiber, editor_fiber, settings_fiber],
-        settings,
-    )
+    (vec![loader_fiber, editor_fiber, settings_fiber], settings)
 }

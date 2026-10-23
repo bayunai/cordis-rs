@@ -314,6 +314,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "cordis-plugin-plugin-manager"
+version = "0.2.0"
+dependencies = [
+ "async-trait",
+ "cordis-core",
+ "cordis-loader",
+ "cordis-plugin-config-editor",
+ "cordis-plugin-include",
+ "cordis-testkit",
+ "schemars",
+ "serde",
+ "tempfile",
+ "tokio",
+ "toml",
+]
+
+[[package]]
 name = "cordis-plugin-settings"
 version = "0.2.0"
 dependencies = [

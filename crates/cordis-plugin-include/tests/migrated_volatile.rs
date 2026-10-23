@@ -376,15 +376,16 @@ async fn invalid_candidates_and_panics_do_not_mutate_runtime_or_file() {
 }
 
 #[tokio::test]
-async fn lifecycle_failure_commits_desired_defers_hot_and_same_target_retries() {
+async fn lifecycle_failure_preserves_committed_desired_and_hot_and_same_target_retries() {
     let state = Arc::new(State::default());
     let h = Harness::new(&state, vec![entry("a", "db", 1), entry("b", "db", 1)]).await;
     let first = state.refs.lock().unwrap()[0].clone();
     h.write(vec![entry("a", "db", 2), entry("b", "apply-error", 2)]);
     for _ in 0..2 {
         assert!(h.loader.subtree("include").unwrap().reload().await.is_err());
-        // 热值未提交；声明已按 desired 提交。
+        // 热值与完整声明都未提交；失败目标仍可显式重试。
         assert_eq!(first.get().revision, 0);
+        assert_eq!(first.get().value.limit, 1);
         assert_eq!(
             h.loader
                 .subtree("include")
@@ -393,8 +394,10 @@ async fn lifecycle_failure_commits_desired_defers_hot_and_same_target_retries() 
                 .unwrap()
                 .extensions[0]
                 .config,
-            entry("a", "db", 2).config
+            entry("a", "db", 1).config
         );
+        let published = h.loader.snapshot_entry_config("include:a").await.unwrap();
+        assert_eq!(published.config["limit"].as_integer(), Some(1));
     }
     h.write(vec![entry("a", "db", 2), entry("b", "fixed", 2)]);
     h.loader.subtree("include").unwrap().reload().await.unwrap();

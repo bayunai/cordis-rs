@@ -88,12 +88,21 @@ pub(crate) async fn commit(
     let local = local.to_owned();
     // 调用方取消等待不能把“协调已经提交、文件尚未写回”留成永久半提交。
     // 正在执行的任务持有 operations 锁，树释放仍会等待它结算。
-    tokio::spawn(async move { commit_owned(&tree, &local, expected, config).await })
-        .await
-        .map_err(|_| LoaderControlError::ConfigOperationAborted)?
+    tokio::spawn(async move {
+        let loader = tree
+            .loader
+            .lock()
+            .expect("loader weak")
+            .upgrade()
+            .ok_or(LoaderControlError::LoaderUnavailable)?;
+        let _control = loader.config_operations.lock().await;
+        commit_owned(&tree, &local, expected, config).await
+    })
+    .await
+    .map_err(|_| LoaderControlError::ConfigOperationAborted)?
 }
 
-async fn commit_owned(
+pub(crate) async fn commit_owned(
     tree: &Arc<RuntimeTree>,
     local: &str,
     expected: ConfigRevision,

@@ -1,0 +1,28 @@
+[package]
+name = "cordis-plugin-plugin-manager"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+readme = "README.md"
+description = "Entry inventory and enable/disable facade over ConfigEditor (DSH plugin-manager peer)."
+
+[dependencies]
+async-trait.workspace = true
+cordis-core.workspace = true
+cordis-loader.workspace = true
+cordis-plugin-config-editor = { path = "../cordis-plugin-config-editor" }
+tokio = { workspace = true, features = ["sync"] }
+
+[dev-dependencies]
+async-trait.workspace = true
+cordis-plugin-include = { workspace = true }
+cordis-testkit.workspace = true
+schemars.workspace = true
+serde = { workspace = true }
+tempfile = "3"
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+toml.workspace = true

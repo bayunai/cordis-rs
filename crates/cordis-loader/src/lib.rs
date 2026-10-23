@@ -34,7 +34,9 @@ pub use config::{
 };
 pub use config_control::{ConfigRevision, EntryConfigSnapshot};
 pub use error::LoaderError;
-pub use loader::{EntryUpdate, LOADER, Loader, LoaderControlError, LoaderEvent, LoaderSubtree};
+pub use loader::{
+    ConfigTransaction, EntryUpdate, LOADER, Loader, LoaderControlError, LoaderEvent, LoaderSubtree,
+};
 pub use meta::{ENTRY_LOCATION, EntryLocation};
 pub use plugin::LoaderPlugin;
 pub use prepared::PreparedExtension;

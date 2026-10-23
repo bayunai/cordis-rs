@@ -9,7 +9,7 @@
 | **应用 Host** | 创建 Runtime、显式挂载 LoaderPlugin、运行应用事件循环并受控关闭 | `crates/cordis-host`；应用再接入网络/持久化 |
 | **生命周期能力** | Timer / Console Logger 等须由 Host 显式挂载；不属于 Loader builtin | `cordis-plugin-timer`、`cordis-plugin-logger-console` |
 | **文件配置树** | 可选 Include：根路径、TOML／JSON／YAML、patches、文件检查与写回；须 Catalog 显式注册 | `crates/cordis-plugin-include` |
-| **配置控制面** | Host 显式挂载：settings（表单投影）→ config-editor（校验与写回） | `cordis-plugin-settings`、`cordis-plugin-config-editor`；见 [config-surface.md](config-surface.md) |
+| **配置控制面** | Host 显式挂载：settings（表单）→ config-editor（写回）；plugin-manager（库存/启停） | `cordis-plugin-settings`、`cordis-plugin-config-editor`、`cordis-plugin-plugin-manager`；见 [config-surface.md](config-surface.md) |
 | **扩展** | 实现 `Plugin`，`provide` / `inject` / `on`，不触碰宿主内部类型 | 插件 crate |
 
 `cordis-core` **不包含** HTTP、数据库、Redis、JSON 配置、Manifest、WASM、网关或计时器语义。

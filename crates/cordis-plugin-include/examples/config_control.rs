@@ -93,7 +93,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             vec![deploy_path.clone()],
             directory.path().join("user.patches.toml"),
             directory.path().join("home.patches.toml"),
-            directory.path(),
         ))))
         .await?;
     let _settings = runtime.root().plugin(Arc::new(SettingsPlugin)).await?;

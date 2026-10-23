@@ -336,14 +336,9 @@ impl RuntimeTree {
                         reason: format!("reconcile worker: {error}"),
                     }),
                 };
-            // 个别 Entry 生命周期失败时运行树已按 desired 尝试挂载；仍须提交声明，
-            // 否则投影/表单读到空树，而 Fiber 已存在（空根 + patches 组成时尤其明显）。
-            let commit_desired = match &result {
-                Ok(_) => true,
-                Err(error) if error.is_entry_lifecycle_failure() => true,
-                Err(_) => false,
-            };
-            if commit_desired {
+            // 运行期失败可留下局部生命周期结果，但不能发布尚未提交的热值、
+            // 来源版本或完整目标。初次声明保留由 initialize/create 单独处理。
+            if result.is_ok() {
                 *tree.desired.lock().expect("desired") = config;
                 if let Some(revision) = revision {
                     *tree.revision.lock().expect("revision") = Some(revision);
@@ -480,6 +475,12 @@ impl RuntimeTree {
         let tree = self.clone();
         // read 可能初始化缺失来源。接受后保留整次 reload，取消等待不遗留文件工作。
         tokio::spawn(async move {
+            let loader = tree.loader.lock().expect("loader weak").upgrade().ok_or(
+                LoaderError::ReconcileAborted {
+                    reason: "Loader 已释放".into(),
+                },
+            )?;
+            let _control = loader.config_operations.lock().await;
             let _operation = tree.operations.lock().await;
             tree.ensure_open()?;
             let source = tree

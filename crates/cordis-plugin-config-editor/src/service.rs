@@ -6,14 +6,11 @@ use crate::{
 };
 use async_trait::async_trait;
 use cordis_core::{Context, CoreError, Plugin, PluginKey, ServiceId, ServiceKey};
-use cordis_loader::{
-    ConfigRevision, EntryConfigSnapshot, LOADER, Loader, LoaderControlError,
-};
+use cordis_loader::{ConfigRevision, EntryConfigSnapshot, LOADER, Loader, LoaderControlError};
 use std::sync::Arc;
 
 /// ConfigEditor 服务 Key。
-pub static CONFIG_EDITOR: ServiceKey<ConfigEditorService> =
-    ServiceKey::new("cordis.config-editor");
+pub static CONFIG_EDITOR: ServiceKey<ConfigEditorService> = ServiceKey::new("cordis.config-editor");
 
 /// 受信任配置编辑：user patch 为表单默认写路径；整表 commit 仅供运维。
 #[derive(Clone)]
@@ -23,6 +20,10 @@ pub struct ConfigEditorService {
 }
 
 impl ConfigEditorService {
+    /// 是否具有本编辑器拥有的 deploy 声明；嵌套来源和未登记条目不冒充可编辑。
+    pub async fn can_edit(&self, path: impl AsRef<str>) -> Result<bool, LoaderControlError> {
+        self.engine.can_edit(path.as_ref()).await
+    }
     /// 分层读取（base=deploy / user / effective=deploy∘user∘home）；可含明文秘密。
     pub async fn layers(
         &self,
@@ -49,9 +50,7 @@ impl ConfigEditorService {
         expected: ConfigRevision,
         config: toml::Value,
     ) -> Result<LayeredEntryConfig, LoaderControlError> {
-        self.engine
-            .edit_user(path.as_ref(), expected, config)
-            .await
+        self.engine.edit_user(path.as_ref(), expected, config).await
     }
 
     /// 启停写入 user patch 的 `disabled`；与 deploy base 一致时清除该覆盖。
@@ -108,7 +107,6 @@ impl Plugin for ConfigEditorPlugin {
         let engine = Arc::new(LayerEngine {
             loader: loader.clone(),
             store,
-            edit_lock: Arc::new(tokio::sync::Mutex::new(())),
             include_root: self.config.include_root.clone(),
             deploy_patch_paths: self.config.deploy_patch_paths.clone(),
             home_patch_path: self.config.home_patch_path.clone(),

@@ -178,10 +178,12 @@ Loader reconcile 是**局部**的：仅创建、删除、移动、启停或配�
 ### 面向管理界面的配置控制面
 
 Host 在 Loader（及 Include 根）之后显式挂载
-[`ConfigEditorPlugin`](../crates/cordis-plugin-config-editor) 与
-[`SettingsPlugin`](../crates/cordis-plugin-settings)。分层见 [配置控制面拆分](config-surface.md)。
+[`ConfigEditorPlugin`](../crates/cordis-plugin-config-editor)、
+[`SettingsPlugin`](../crates/cordis-plugin-settings) 与
+[`PluginManagerPlugin`](../crates/cordis-plugin-plugin-manager)。分层见 [配置控制面拆分](config-surface.md)。
 Loader **不**提供 `describe_config` / `mutate_config`；表单只走 `SETTINGS` → config-editor
-**user** 层。运维整表写回走 `CONFIG_EDITOR.commit_source`（其下为 `commit_entry_config`）。
+**user** 层；库存与启停走 `PLUGIN_MANAGER`（内部仍调 `CONFIG_EDITOR.set_enabled`）。
+运维整表写回走 `CONFIG_EDITOR.commit_source`（其下为 `commit_entry_config`）。
 
 `settings.describe(path).await` 返回 `EntryConfigView`：完整路径、Factory ID、管理 Schema、
 脱敏 `base` / `user` / `value`（effective）、秘密字段存在状态与 `ConfigRevision`。
@@ -200,8 +202,14 @@ Entry 控制字段；空路径、穿过标量或数组、删除不存在的键�
 `ConfigRevisionConflict`。所属树的协调一旦启动，即使生命周期失败，也会让旧令牌失效；
 同树无关条目的修改也会导致保守冲突。重新读取描述后再编辑，不自动重试写操作。
 配置编辑一经提交便由独立任务完成；取消调用方的等待不会取消已接受的编辑或跳过
-user 文档写回。Host 须注入有序 `deploy_patch_paths`、`user_patch_path`、`home_patch_path` 与
-`config_dir`。
+user 文档写回。Host 须注入有序 `deploy_patch_paths`、`user_patch_path`、`home_patch_path`；
+相对 Include 路径仅由 Include 的来源上下文解析，不另设编辑器路径基准。
+
+配置编辑经 `Loader::config_transaction` 串行化，同一 Loader 的直接 CRUD、配置提交与
+reload 也使用该准入边界。事务回调只能使用传入的 `ConfigTransaction` 执行受控读写，
+不得递归调用普通变更接口；事务不是业务副作用回滚。取消等待后仍结算，
+`await_idle()` 等待该边界。不同 Loader 实例之间不共享锁。
+ConfigEditor 的文件读取、解析和写入在完整阻塞任务内执行；patch 文件读取 API 必须 `.await`。
 
 表单路径约定为「先原子写 user，再 reconcile」；校验或应用失败回滚 user 文档。
 `commit_source` 仍沿用「运行时先应用，再写回来源」并可能产生 `Persist`。操作返回

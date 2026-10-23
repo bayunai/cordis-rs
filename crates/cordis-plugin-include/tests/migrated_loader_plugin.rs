@@ -842,7 +842,7 @@ async fn plugin_key_changed_during_group_rebuild_is_zero_runtime_change() {
 }
 
 #[tokio::test]
-async fn lifecycle_failure_keeps_unrelated_active_and_commits_desired_without_file_write() {
+async fn lifecycle_failure_keeps_unrelated_active_without_committing_desired_or_file() {
     let mut catalog = catalog(vec![Factory {
         id: "demo.value",
         needs_dep: false,
@@ -899,7 +899,7 @@ async fn lifecycle_failure_keeps_unrelated_active_and_commits_desired_without_fi
         after.entry("include:flaky").unwrap().state,
         Some(FiberState::Failed)
     );
-    // 生命周期失败仍提交 desired（运行树已按目标尝试）；来源文件不写回。
+    // 局部运行状态可变化，但完整声明和来源文件均不提交。
     assert_eq!(
         loader
             .subtree("include")
@@ -908,7 +908,7 @@ async fn lifecycle_failure_keeps_unrelated_active_and_commits_desired_without_fi
             .unwrap()
             .extensions[1]
             .config,
-        toml::Value::try_from(FailConfig { fail: true }).unwrap()
+        toml::Value::try_from(FailConfig { fail: false }).unwrap()
     );
     assert_eq!(fs::read_to_string(&cordis).unwrap(), before_file);
     runtime.shutdown().await.unwrap();
@@ -1116,7 +1116,7 @@ async fn failed_reload_mounts_later_entries_and_retries_without_committing_decla
             assert_eq!(fiber_id(&snapshot, "provider"), id);
         }
         provider_id = Some(fiber_id(&snapshot, "provider"));
-        // 生命周期失败仍提交 desired；外部文件内容未改写。
+        // 失败目标不成为已提交声明，外部文件也未被 Loader 改写。
         assert_eq!(
             loader
                 .subtree("include")
@@ -1125,17 +1125,28 @@ async fn failed_reload_mounts_later_entries_and_retries_without_committing_decla
                 .unwrap()
                 .extensions
                 .len(),
-            3
+            0
         );
         assert_eq!(fs::read_to_string(&file).unwrap(), text);
     }
-    // 外部文件与已提交声明一致时可管理写；此处删掉 broken 以便收敛。
-    loader
-        .subtree("include")
-        .unwrap()
-        .remove("broken")
-        .await
-        .unwrap();
+    // 失败 reload 不接受候选来源版本；管理写仍必须报告外部版本冲突。
+    assert!(matches!(
+        loader
+            .subtree("include")
+            .unwrap()
+            .create(EntryOptions::new("another", "demo.dep"), None, None)
+            .await,
+        Err(LoaderControlError::ConfigConflict { .. })
+    ));
+    let repaired = config(
+        target
+            .extensions
+            .into_iter()
+            .filter(|entry| entry.id != "broken")
+            .collect(),
+    );
+    fs::write(&file, toml::to_string(&repaired).unwrap()).unwrap();
+    loader.subtree("include").unwrap().reload().await.unwrap();
     runtime.shutdown().await.unwrap();
 }
 
@@ -1173,7 +1184,7 @@ async fn failed_external_reload_is_visible_and_retried_until_fixed() {
             .unwrap()
             .extensions[0]
             .config,
-        toml::Value::try_from(FailConfig { fail: true }).unwrap()
+        toml::Value::try_from(FailConfig { fail: false }).unwrap()
     );
 
     assert!(matches!(
@@ -1191,11 +1202,7 @@ async fn failed_external_reload_is_visible_and_retried_until_fixed() {
         Some(FiberState::Failed)
     );
 
-    fs::write(
-        &cordis,
-        toml::to_string(&config(vec![initial])).unwrap(),
-    )
-    .unwrap();
+    fs::write(&cordis, toml::to_string(&config(vec![initial])).unwrap()).unwrap();
     loader.subtree("include").unwrap().reload().await.unwrap();
     assert_eq!(
         loader
@@ -1247,7 +1254,7 @@ async fn reload_remounts_entry_after_runtime_unmount() {
 }
 
 #[tokio::test]
-async fn failed_create_is_visible_and_can_be_removed_before_a_later_success() {
+async fn failed_create_is_visible_without_committing_and_reload_cleans_it_before_later_success() {
     let mut catalog = ExtensionCatalog::new();
     catalog.register(FailFactory).unwrap();
     let (runtime, _loader_fiber, loader, _dir, _) = mount_with_file(catalog, vec![]).await;
@@ -1275,15 +1282,10 @@ async fn failed_create_is_visible_and_can_be_removed_before_a_later_success() {
             .unwrap()
             .extensions
             .len(),
-        1
+        0
     );
 
-    loader
-        .subtree("include")
-        .unwrap()
-        .remove("flaky")
-        .await
-        .unwrap();
+    loader.subtree("include").unwrap().reload().await.unwrap();
     assert!(
         loader
             .await_idle()

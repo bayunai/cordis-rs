@@ -27,6 +27,7 @@
 | [`cordis-plugin-include`](crates/cordis-plugin-include) | 可选文件配置树（`cordis:include`）：TOML／JSON／YAML、initial、patches、文件版本检查与原子写回；须 Catalog 显式注册。 |
 | [`cordis-plugin-config-editor`](crates/cordis-plugin-config-editor) | Host 显式挂载的配置编辑器：本机 user patch、base∘user 组成与 reconcile；可选整表 `commit_source`。 |
 | [`cordis-plugin-settings`](crates/cordis-plugin-settings) | Host 显式挂载的配置设置服务：分层 Schema 表单投影（base/user/value）与秘密安全编辑；mutate 只写 user。 |
+| [`cordis-plugin-plugin-manager`](crates/cordis-plugin-plugin-manager) | Host 显式挂载的插件库存与启停门面（对齐 DSH `pluginManager`）；`set_plugin_enabled` 委托 config-editor。 |
 | [`cordis-testkit`](crates/cordis-testkit) | 测试辅助；不应用于生产宿主。 |
 
 ## 快速开始

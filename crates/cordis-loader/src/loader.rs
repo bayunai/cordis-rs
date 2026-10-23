@@ -95,6 +95,30 @@ pub struct Loader {
 }
 
 impl Loader {
+    /// 串行执行跨树配置事务。回调内只使用传入的事务控制面，不能递归调用
+    /// Loader/LoaderSubtree 变更方法；所有直接 CRUD、配置提交及 reload 均等待本边界。
+    /// 已接受的事务不因调用方取消等待而中断。事务不提供业务副作用回滚。
+    pub async fn config_transaction<F, T>(&self, operation: F) -> Result<T, LoaderControlError>
+    where
+        T: Send + 'static,
+        F: for<'a> FnOnce(
+                &'a ConfigTransaction,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = Result<T, LoaderControlError>> + Send + 'a>,
+            > + Send
+            + 'static,
+    {
+        let loader = self.clone();
+        tokio::spawn(async move {
+            let inner = loader.inner()?;
+            let _control = inner.config_operations.lock().await;
+            loader.inner()?;
+            operation(&ConfigTransaction { loader }).await
+        })
+        .await
+        .map_err(|_| LoaderControlError::ConfigOperationAborted)?
+    }
+
     /// 受信任读取完整路径上的原始配置与 Catalog Schema；可含明文秘密。
     ///
     /// 不要求 Fiber Active。不得把返回值原样发给浏览器；表单投影由 settings 插件完成。
@@ -103,6 +127,7 @@ impl Loader {
         path: impl AsRef<str>,
     ) -> Result<crate::EntryConfigSnapshot, LoaderControlError> {
         let inner = self.inner()?;
+        let _control = inner.config_operations.lock().await;
         let path = path.as_ref();
         let tree = inner
             .subtree_owning_path(path)
@@ -186,7 +211,9 @@ impl Loader {
     /// 业务生命周期错误由变更调用、条目诊断和日志报告，不使整棵树不可读取。
     /// Loader 关闭及内部协调错误仍返回错误。
     pub async fn await_idle(&self) -> Result<LoaderSnapshot, LoaderControlError> {
-        let snapshot = self.inner()?.await_idle_all().await;
+        let inner = self.inner()?;
+        let _control = inner.config_operations.lock().await;
+        let snapshot = inner.await_idle_all().await;
         self.inner()?;
         Ok(snapshot?)
     }
@@ -311,6 +338,53 @@ impl Loader {
         } else {
             Err(LoaderControlError::LoaderUnavailable)
         }
+    }
+}
+
+/// 配置事务的受限控制面；不能克隆、不能逃逸回调，也不暴露互斥锁。
+pub struct ConfigTransaction {
+    loader: Loader,
+}
+
+impl ConfigTransaction {
+    pub async fn snapshot_entry_config(
+        &self,
+        path: impl AsRef<str>,
+    ) -> Result<crate::EntryConfigSnapshot, LoaderControlError> {
+        let inner = self.loader.inner()?;
+        let path = path.as_ref();
+        let tree = inner
+            .subtree_owning_path(path)
+            .unwrap_or_else(|| inner.root.clone());
+        crate::config_control::snapshot(&tree, config_local_path(&tree, path)).await
+    }
+
+    pub async fn await_idle(&self) -> Result<LoaderSnapshot, LoaderControlError> {
+        Ok(self.loader.inner()?.await_idle_all().await?)
+    }
+
+    pub fn prepare_entry_config(
+        &self,
+        factory: &str,
+        config: &toml::Value,
+    ) -> Result<(), LoaderControlError> {
+        self.loader.prepare_entry_config(factory, config)
+    }
+
+    /// 复用既有整表提交链路，不再次获取事务准入锁。
+    pub async fn commit_entry_config(
+        &self,
+        path: impl AsRef<str>,
+        expected: crate::ConfigRevision,
+        config: toml::Value,
+    ) -> Result<crate::EntryConfigSnapshot, LoaderControlError> {
+        let inner = self.loader.inner()?;
+        let path = path.as_ref();
+        let tree = inner
+            .subtree_owning_path(path)
+            .unwrap_or_else(|| inner.root.clone());
+        crate::config_control::commit_owned(&tree, config_local_path(&tree, path), expected, config)
+            .await
     }
 }
 
@@ -468,6 +542,13 @@ where
 {
     let tree = tree.clone();
     tokio::spawn(async move {
+        let loader = tree
+            .loader
+            .lock()
+            .expect("loader weak")
+            .upgrade()
+            .ok_or(LoaderControlError::LoaderUnavailable)?;
+        let _control = loader.config_operations.lock().await;
         let _operation = tree.operations.lock().await;
         tree.ensure_open()?;
         tree.await_idle().await?;
