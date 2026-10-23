@@ -39,10 +39,10 @@ path = "extensions.toml"
 ```
 
 ```text
-bootstrap.toml
-  → await Include.bootstrap_entry("include", path) 构造显式根 Include 声明
-  → 应用入口构造内存 LoaderPlugin
+应用入口构造 LoaderPlugin::new(catalog)
   → root.plugin(LoaderPlugin)
+  → await Include.bootstrap_entry("include", bootstrap.toml) 构造显式根 Include 声明
+  → await loader.create(entry, None, None)
   → include Include 读取文件、提供来源上下文与文件版本
   → Loader 预检文件条目并收敛为 include:* 子树
 ```

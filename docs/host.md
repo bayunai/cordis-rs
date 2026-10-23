@@ -8,15 +8,17 @@ Loader 根树只在内存中；根文件和嵌套文件均由显式登记的 Inc
 let host = CordisHost::new()?;
 let mut catalog = build_catalog()?;
 catalog.register(cordis_plugin_include::IncludeFactory)?;
-let plugin = LoaderPlugin::new(catalog, ExtensionsConfig {
-    version: CONFIG_VERSION,
-    extensions: vec![cordis_plugin_include::bootstrap_entry("include", "bootstrap.toml").await?],
-})?;
+let plugin = LoaderPlugin::new(catalog);
 let _loader_fiber = host.root().plugin(Arc::new(plugin)).await?;
 let loader = host.root().get(LOADER)?;
+loader.create(cordis_plugin_include::bootstrap_entry("include", "bootstrap.toml").await?, None, None).await?;
 ```
 
 保留 `_loader_fiber` 直到应用关闭；释放它会撤销 `LOADER` 并后序释放整棵条目树。
+Loader 挂载后即为空树 Active；启动条目与运行期条目统一使用 `create()`。配置预检或业务
+挂载失败由该调用返回，不升级为 Loader 自身挂载失败。内存根保留已通过预检但业务挂载失败的
+声明供修复；来源树仍沿用生命周期失败不写回的规则。应用入口自行决定遇到必需条目失败时
+退出，或明确报告错误并继续提供管理界面，不得把 Failed/Pending 快照表述为全部启动成功。
 
 ## 配置树
 
@@ -264,8 +266,11 @@ let database = loader.entry_context("include:infrastructure:database")?.get(DATA
 `FactoryChanged`、`PluginKeyChanged`、无效 inject/isolate、非 v3 等）零运行时变更。生命周期失败
 不回滚已触及节点、不提交 `desired`/revision、不由 Loader 发起写回；无关 Entry 继续运行。
 本轮继续尝试其他独立条目，逐项记录业务生命周期错误，控制调用返回首个错误；有失败时不提交待更新热值。
-根树或 Include 子树初次挂载时，通过完整预检的初始声明会保留，业务挂载失败标记为 Failed，
-不撤销树控制面或无关插件。`entries()` 返回初始加载或后续成功提交的声明，不代表全部条目已 Active。
+内存根通过 `create()` 登记且完整预检通过的声明会保留，业务挂载失败由调用返回并标记为 Failed。
+Include 子树初次加载同样保留通过预检的初始声明，不撤销树控制面或无关插件。
+根 `entries()` 返回通过 `create()` 登记的声明或后续成功更新的声明；失败更新不提交新目标。
+来源子树 `entries()` 返回初始加载或后续成功提交的声明，
+两者都不代表全部条目已 Active。
 配置、Factory 预检和内部协调错误仍明确报错；父挂载上下文无效时停止其后代挂载，不转挂到根节点。
 失败后的 `LoaderSnapshot` 仍包含实际已插入的 Failed/Pending 节点，即使该次 reconcile
 尚未来得及提交目标排序；对同一外部配置再次 `reload()` 会重试失败的启用 Entry。

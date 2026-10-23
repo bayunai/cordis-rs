@@ -103,19 +103,13 @@ async fn mount(entries: Vec<EntryOptions>) -> (Runtime, Fiber, Loader) {
     let runtime = Runtime::new().unwrap();
     let fiber = runtime
         .root()
-        .plugin(Arc::new(
-            LoaderPlugin::new(
-                catalog,
-                ExtensionsConfig {
-                    version: 3,
-                    extensions: entries,
-                },
-            )
-            .unwrap(),
-        ))
+        .plugin(Arc::new(LoaderPlugin::new(catalog)))
         .await
         .unwrap();
     let loader = (*runtime.root().get(LOADER).unwrap()).clone();
+    for entry in entries {
+        loader.create(entry, None, None).await.unwrap();
+    }
     loader.await_idle().await.unwrap();
     (runtime, fiber, loader)
 }

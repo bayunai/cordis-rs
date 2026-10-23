@@ -201,12 +201,155 @@ fn config(entries: Vec<EntryOptions>) -> ExtensionsConfig {
         extensions: entries,
     }
 }
-async fn mount(plugin: LoaderPlugin) -> (Runtime, Fiber, Loader) {
+async fn mount(catalog: ExtensionCatalog, entries: Vec<EntryOptions>) -> (Runtime, Fiber, Loader) {
     let runtime = Runtime::new().unwrap();
     let root = runtime.root();
-    let fiber = root.plugin(Arc::new(plugin)).await.unwrap();
+    let fiber = root
+        .plugin(Arc::new(LoaderPlugin::new(catalog)))
+        .await
+        .unwrap();
     let loader = (*root.get(LOADER).unwrap()).clone();
+    for entry in entries {
+        loader.create(entry, None, None).await.unwrap();
+    }
     (runtime, fiber, loader)
+}
+
+#[tokio::test]
+async fn empty_loader_is_active_and_factories_are_only_prepared_by_create() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct CountedFactory(Arc<AtomicUsize>);
+    impl ExtensionFactory for CountedFactory {
+        type Config = Empty;
+        fn id(&self) -> &'static str {
+            "counted"
+        }
+        fn prepare(&self, _: Empty) -> Result<PreparedExtension, LoaderError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(PreparedExtension::ordinary(|| {
+                Ok(Arc::new(TestPlugin {
+                    id: "counted",
+                    needs_dep: false,
+                    record: None,
+                }))
+            }))
+        }
+    }
+    let prepares = Arc::new(AtomicUsize::new(0));
+    let mut catalog = ExtensionCatalog::new();
+    catalog.register(CountedFactory(prepares.clone())).unwrap();
+    let plugin = LoaderPlugin::new(catalog);
+    assert_eq!(prepares.load(Ordering::SeqCst), 0);
+    let runtime = Runtime::new().unwrap();
+    let fiber = runtime.root().plugin(Arc::new(plugin)).await.unwrap();
+    let loader = runtime.root().get(LOADER).unwrap();
+    assert_eq!(fiber.state(), FiberState::Active);
+    assert!(loader.entries().unwrap().extensions.is_empty());
+    assert!(loader.await_idle().await.unwrap().entries.is_empty());
+    assert_eq!(prepares.load(Ordering::SeqCst), 0);
+    assert!(matches!(
+        loader
+            .create(EntryOptions::new("unknown", "absent"), None, None)
+            .await,
+        Err(LoaderControlError::Loader(
+            LoaderError::UnknownFactory { .. }
+        ))
+    ));
+    assert!(loader.entries().unwrap().extensions.is_empty());
+    loader
+        .create(EntryOptions::new("one", "counted"), None, None)
+        .await
+        .unwrap();
+    assert_eq!(prepares.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        loader
+            .await_idle()
+            .await
+            .unwrap()
+            .entry("one")
+            .unwrap()
+            .state,
+        Some(FiberState::Active)
+    );
+    assert_eq!(fiber.state(), FiberState::Active);
+    runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn failed_create_keeps_loader_and_declaration_available_for_independent_entries() {
+    let mut catalog = catalog(vec![Factory {
+        id: "demo.value",
+        needs_dep: false,
+        record: None,
+    }]);
+    catalog
+        .register(GatedLoadingFactory {
+            entered: Arc::new(Mutex::new(None)),
+            release: Arc::new(Mutex::new(None)),
+            fail: true,
+        })
+        .unwrap();
+    let runtime = Runtime::new().unwrap();
+    runtime.root().provide(DEP, ()).unwrap();
+    let fiber = runtime
+        .root()
+        .plugin(Arc::new(LoaderPlugin::new(catalog)))
+        .await
+        .unwrap();
+    let loader = runtime.root().get(LOADER).unwrap();
+    assert!(matches!(
+        loader
+            .create(EntryOptions::new("bad", "demo.gated-loading"), None, None)
+            .await,
+        Err(LoaderControlError::Loader(LoaderError::Lifecycle { .. }))
+    ));
+    assert_eq!(fiber.state(), FiberState::Active);
+    assert_eq!(loader.entries().unwrap().extensions[0].id, "bad");
+    assert_eq!(
+        loader
+            .await_idle()
+            .await
+            .unwrap()
+            .entry("bad")
+            .unwrap()
+            .state,
+        Some(FiberState::Failed)
+    );
+    // 对旧失败目标的重试仍报错，但不得阻止新建的独立目标实际挂载。
+    assert!(matches!(
+        loader
+            .create(EntryOptions::new("good", "demo.value"), None, None)
+            .await,
+        Err(LoaderControlError::Loader(LoaderError::Lifecycle { .. }))
+    ));
+    let actual = loader.await_idle().await.unwrap();
+    assert_eq!(
+        actual.entry("good").unwrap().state,
+        Some(FiberState::Active)
+    );
+    assert_eq!(actual.entry("bad").unwrap().state, Some(FiberState::Failed));
+    assert_eq!(fiber.state(), FiberState::Active);
+    loader
+        .update(
+            "bad",
+            EntryUpdate {
+                disabled: Some(true),
+                ..Default::default()
+            },
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(
+        loader
+            .entries()
+            .unwrap()
+            .extensions
+            .iter()
+            .any(|entry| entry.id == "good")
+    );
+    runtime.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -215,15 +358,12 @@ async fn tree_uses_paths_group_contexts_and_ancestor_disable() {
     let mut group = EntryOptions::group("parent", vec![child]).unwrap();
     group.disabled = true;
     let (runtime, mut loader_fiber, loader) = mount(
-        LoaderPlugin::new(
-            catalog(vec![Factory {
-                id: "demo.value",
-                needs_dep: false,
-                record: None,
-            }]),
-            config(vec![group]),
-        )
-        .unwrap(),
+        catalog(vec![Factory {
+            id: "demo.value",
+            needs_dep: false,
+            record: None,
+        }]),
+        vec![group],
     )
     .await;
     let snapshot = loader.await_idle().await.unwrap();
@@ -244,25 +384,22 @@ async fn tree_uses_paths_group_contexts_and_ancestor_disable() {
 #[tokio::test]
 async fn sibling_provider_unblocks_pending_consumer() {
     let (runtime, _loader_fiber, loader) = mount(
-        LoaderPlugin::new(
-            catalog(vec![
-                Factory {
-                    id: "demo.dep",
-                    needs_dep: false,
-                    record: None,
-                },
-                Factory {
-                    id: "demo.consumer",
-                    needs_dep: true,
-                    record: None,
-                },
-            ]),
-            config(vec![
-                EntryOptions::new("provider", "demo.dep"),
-                EntryOptions::new("consumer", "demo.consumer"),
-            ]),
-        )
-        .unwrap(),
+        catalog(vec![
+            Factory {
+                id: "demo.dep",
+                needs_dep: false,
+                record: None,
+            },
+            Factory {
+                id: "demo.consumer",
+                needs_dep: true,
+                record: None,
+            },
+        ]),
+        vec![
+            EntryOptions::new("provider", "demo.dep"),
+            EntryOptions::new("consumer", "demo.consumer"),
+        ],
     )
     .await;
     let snapshot = loader.await_idle().await.unwrap();
@@ -280,15 +417,12 @@ async fn sibling_provider_unblocks_pending_consumer() {
 #[tokio::test]
 async fn managed_fiber_activation_after_external_provider_invalidates_snapshot() {
     let (runtime, _loader_fiber, loader) = mount(
-        LoaderPlugin::new(
-            catalog(vec![Factory {
-                id: "demo.consumer",
-                needs_dep: true,
-                record: None,
-            }]),
-            config(vec![EntryOptions::new("consumer", "demo.consumer")]),
-        )
-        .unwrap(),
+        catalog(vec![Factory {
+            id: "demo.consumer",
+            needs_dep: true,
+            record: None,
+        }]),
+        vec![EntryOptions::new("consumer", "demo.consumer")],
     )
     .await;
     assert_eq!(
@@ -354,8 +488,7 @@ async fn assert_idle_waits_for_loading(fail: bool) {
             fail,
         })
         .unwrap();
-    let (runtime, _loader_fiber, loader) =
-        mount(LoaderPlugin::new(catalog, config(vec![entry])).unwrap()).await;
+    let (runtime, _loader_fiber, loader) = mount(catalog, vec![entry]).await;
     let _provider = runtime
         .root()
         .plugin(Arc::new(TestPlugin {
@@ -430,16 +563,18 @@ async fn await_idle_waits_for_managed_unloading_fiber() {
     provider.provide(DEP, ()).unwrap();
     let root = runtime.root();
     let loader_fiber = root
-        .plugin(Arc::new(
-            LoaderPlugin::new(
-                catalog,
-                config(vec![EntryOptions::new("consumer", "demo.gated-unloading")]),
-            )
-            .unwrap(),
-        ))
+        .plugin(Arc::new(LoaderPlugin::new(catalog)))
         .await
         .unwrap();
     let loader = (*root.get(LOADER).unwrap()).clone();
+    loader
+        .create(
+            EntryOptions::new("consumer", "demo.gated-unloading"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
     assert_eq!(
         loader
             .await_idle()
@@ -477,15 +612,12 @@ async fn unloading_loader_stops_events_and_releases_managed_subtree() {
     let child = EntryOptions::new("child", "demo.value");
     let group = EntryOptions::group("group", vec![child]).unwrap();
     let (runtime, mut loader_fiber, loader) = mount(
-        LoaderPlugin::new(
-            catalog(vec![Factory {
-                id: "demo.value",
-                needs_dep: false,
-                record: Some(record.clone()),
-            }]),
-            config(vec![group]),
-        )
-        .unwrap(),
+        catalog(vec![Factory {
+            id: "demo.value",
+            needs_dep: false,
+            record: Some(record.clone()),
+        }]),
+        vec![group],
     )
     .await;
     loader.await_idle().await.unwrap();
@@ -562,8 +694,7 @@ async fn group_sibling_provider_unblocks_consumer() {
         ],
     )
     .unwrap();
-    let (runtime, _loader_fiber, loader) =
-        mount(LoaderPlugin::new(dep_catalog(), config(vec![group])).unwrap()).await;
+    let (runtime, _loader_fiber, loader) = mount(dep_catalog(), vec![group]).await;
     let snapshot = loader.await_idle().await.unwrap();
     assert_eq!(
         snapshot.entry("app:provider").unwrap().state,
@@ -597,8 +728,7 @@ async fn group_inject_config_is_visible_to_children() {
         )]
         .into(),
     ));
-    let (runtime, _loader_fiber, loader) =
-        mount(LoaderPlugin::new(catalog, config(vec![group])).unwrap()).await;
+    let (runtime, _loader_fiber, loader) = mount(catalog, vec![group]).await;
     let snapshot = loader.await_idle().await.unwrap();
     assert_eq!(
         snapshot.entry("app:provider").unwrap().state,
@@ -648,8 +778,7 @@ async fn nested_group_inject_overrides_parent_config() {
         )]
         .into(),
     ));
-    let (runtime, _loader_fiber, loader) =
-        mount(LoaderPlugin::new(catalog, config(vec![outer])).unwrap()).await;
+    let (runtime, _loader_fiber, loader) = mount(catalog, vec![outer]).await;
     let snapshot = loader.await_idle().await.unwrap();
     assert_eq!(
         snapshot.entry("outer:inner:label").unwrap().state,
@@ -745,23 +874,20 @@ async fn group_without_isolate_shares_root_domain_and_conflicts() {
     let runtime = Runtime::new().unwrap();
     let fiber = runtime
         .root()
-        .plugin(Arc::new(
-            LoaderPlugin::new(
-                dep_catalog(),
-                config(vec![EntryOptions::new("root-provider", "demo.dep2"), group]),
-            )
-            .unwrap(),
-        ))
+        .plugin(Arc::new(LoaderPlugin::new(dep_catalog())))
         .await
         .expect("handle returned");
     assert_eq!(fiber.state(), FiberState::Active);
-    let snapshot = runtime
-        .root()
-        .get(LOADER)
-        .unwrap()
-        .await_idle()
+    let loader = runtime.root().get(LOADER).unwrap();
+    loader
+        .create(EntryOptions::new("root-provider", "demo.dep2"), None, None)
         .await
         .unwrap();
+    assert!(matches!(
+        loader.create(group, None, None).await,
+        Err(LoaderControlError::Loader(LoaderError::Lifecycle { .. }))
+    ));
+    let snapshot = loader.await_idle().await.unwrap();
     assert_eq!(
         snapshot.entry("root-provider").unwrap().state,
         Some(FiberState::Active)
@@ -781,15 +907,12 @@ async fn group_exclusive_isolate_hides_provider_from_root_and_siblings() {
     let group_b =
         EntryOptions::group("b", vec![EntryOptions::new("consumer", "demo.consumer")]).unwrap();
     let (runtime, _loader_fiber, loader) = mount(
-        LoaderPlugin::new(
-            dep_catalog_with_isolation(),
-            config(vec![
-                group_a,
-                group_b,
-                EntryOptions::new("root-consumer", "demo.consumer"),
-            ]),
-        )
-        .unwrap(),
+        dep_catalog_with_isolation(),
+        vec![
+            group_a,
+            group_b,
+            EntryOptions::new("root-consumer", "demo.consumer"),
+        ],
     )
     .await;
     let snapshot = loader.await_idle().await.unwrap();
@@ -824,10 +947,8 @@ async fn different_groups_with_exclusive_isolate_may_provide_same_service_key() 
     let group_b = EntryOptions::group("b", vec![EntryOptions::new("provider", "demo.dep2")])
         .unwrap()
         .with_isolate(isolate_dep(true));
-    let (runtime, _loader_fiber, loader) = mount(
-        LoaderPlugin::new(dep_catalog_with_isolation(), config(vec![group_a, group_b])).unwrap(),
-    )
-    .await;
+    let (runtime, _loader_fiber, loader) =
+        mount(dep_catalog_with_isolation(), vec![group_a, group_b]).await;
     let snapshot = loader.await_idle().await.unwrap();
     assert_eq!(
         snapshot.entry("a:provider").unwrap().state,
@@ -858,10 +979,8 @@ async fn named_isolate_label_shares_provider_across_groups() {
     let group_b = EntryOptions::group("b", vec![EntryOptions::new("consumer", "demo.consumer")])
         .unwrap()
         .with_isolate(isolate_dep(false));
-    let (runtime, _loader_fiber, loader) = mount(
-        LoaderPlugin::new(dep_catalog_with_isolation(), config(vec![group_a, group_b])).unwrap(),
-    )
-    .await;
+    let (runtime, _loader_fiber, loader) =
+        mount(dep_catalog_with_isolation(), vec![group_a, group_b]).await;
     let snapshot = loader.await_idle().await.unwrap();
     assert_eq!(
         snapshot.entry("a:provider").unwrap().state,
@@ -888,15 +1007,12 @@ async fn group_services_do_not_leak_to_root_or_other_groups() {
     let group_b =
         EntryOptions::group("b", vec![EntryOptions::new("consumer", "demo.consumer")]).unwrap();
     let (runtime, _loader_fiber, loader) = mount(
-        LoaderPlugin::new(
-            dep_catalog_with_isolation(),
-            config(vec![
-                group_a,
-                group_b,
-                EntryOptions::new("root-consumer", "demo.consumer"),
-            ]),
-        )
-        .unwrap(),
+        dep_catalog_with_isolation(),
+        vec![
+            group_a,
+            group_b,
+            EntryOptions::new("root-consumer", "demo.consumer"),
+        ],
     )
     .await;
     let snapshot = loader.await_idle().await.unwrap();
@@ -937,10 +1053,8 @@ async fn different_groups_may_provide_same_service_key() {
     let group_b = EntryOptions::group("b", vec![EntryOptions::new("provider", "demo.dep2")])
         .unwrap()
         .with_isolate(isolate_dep(true));
-    let (runtime, _loader_fiber, loader) = mount(
-        LoaderPlugin::new(dep_catalog_with_isolation(), config(vec![group_a, group_b])).unwrap(),
-    )
-    .await;
+    let (runtime, _loader_fiber, loader) =
+        mount(dep_catalog_with_isolation(), vec![group_a, group_b]).await;
     let snapshot = loader.await_idle().await.unwrap();
     assert_eq!(
         snapshot.entry("a:provider").unwrap().state,
@@ -976,13 +1090,15 @@ async fn duplicate_provider_in_same_group_fails() {
     let runtime = Runtime::new().unwrap();
     let fiber = runtime
         .root()
-        .plugin(Arc::new(
-            LoaderPlugin::new(dep_catalog(), config(vec![group])).unwrap(),
-        ))
+        .plugin(Arc::new(LoaderPlugin::new(dep_catalog())))
         .await
-        .expect("Loader Fiber handle is returned even when reconcile fails");
+        .expect("empty Loader is mounted independently of entry operations");
     assert_eq!(fiber.state(), FiberState::Active);
     let loader = runtime.root().get(LOADER).unwrap();
+    assert!(matches!(
+        loader.create(group, None, None).await,
+        Err(LoaderControlError::Loader(LoaderError::Lifecycle { .. }))
+    ));
     let snapshot = loader.await_idle().await.unwrap();
     assert_eq!(
         snapshot.entry("app:one").unwrap().state,
@@ -1028,8 +1144,7 @@ async fn inject_config_does_not_isolate_sibling_services() {
         ],
     )
     .unwrap();
-    let (runtime, _loader_fiber, loader) =
-        mount(LoaderPlugin::new(catalog, config(vec![group])).unwrap()).await;
+    let (runtime, _loader_fiber, loader) = mount(catalog, vec![group]).await;
     let snapshot = loader.await_idle().await.unwrap();
     assert_eq!(
         snapshot.entry("app:provider").unwrap().state,
@@ -1071,13 +1186,12 @@ async fn configured_inject_is_typed_and_static_dependency_is_merged() {
     runtime.root().provide(DEP, ()).unwrap();
     let fiber = runtime
         .root()
-        .plugin(Arc::new(
-            LoaderPlugin::new(catalog, config(vec![entry])).unwrap(),
-        ))
+        .plugin(Arc::new(LoaderPlugin::new(catalog)))
         .await
         .unwrap();
     assert_ne!(fiber.state(), FiberState::Failed);
     let loader = runtime.root().get(LOADER).unwrap();
+    loader.create(entry, None, None).await.unwrap();
     assert_eq!(
         &*loader.entry_context("label").unwrap().get(VALUE).unwrap(),
         "configured"
@@ -1121,20 +1235,17 @@ async fn named_isolate_same_label_duplicate_provider_conflicts() {
     let runtime = Runtime::new().unwrap();
     let fiber = runtime
         .root()
-        .plugin(Arc::new(
-            LoaderPlugin::new(dep_catalog_with_isolation(), config(vec![group_a, group_b]))
-                .unwrap(),
-        ))
+        .plugin(Arc::new(LoaderPlugin::new(dep_catalog_with_isolation())))
         .await
         .expect("handle returned");
     assert_eq!(fiber.state(), FiberState::Active);
-    let snapshot = runtime
-        .root()
-        .get(LOADER)
-        .unwrap()
-        .await_idle()
-        .await
-        .unwrap();
+    let loader = runtime.root().get(LOADER).unwrap();
+    loader.create(group_a, None, None).await.unwrap();
+    assert!(matches!(
+        loader.create(group_b, None, None).await,
+        Err(LoaderControlError::Loader(LoaderError::Lifecycle { .. }))
+    ));
+    let snapshot = loader.await_idle().await.unwrap();
     assert_eq!(
         snapshot.entry("a:provider").unwrap().state,
         Some(FiberState::Active)
@@ -1184,8 +1295,7 @@ async fn named_isolate_labels_do_not_cross_service_keys() {
     let group_b = EntryOptions::group("b", vec![EntryOptions::new("other", "demo.other")])
         .unwrap()
         .with_isolate([("other".into(), shared)].into());
-    let (runtime, _loader_fiber, loader) =
-        mount(LoaderPlugin::new(catalog, config(vec![group_a, group_b])).unwrap()).await;
+    let (runtime, _loader_fiber, loader) = mount(catalog, vec![group_a, group_b]).await;
     let snapshot = loader.await_idle().await.unwrap();
     assert_eq!(
         snapshot.entry("a:provider").unwrap().state,
@@ -1210,40 +1320,50 @@ async fn named_isolate_labels_do_not_cross_service_keys() {
 async fn isolate_precheck_rejects_unknown_false_empty_and_v2() {
     let catalog = dep_catalog_with_isolation();
     assert!(matches!(
-        LoaderPlugin::new(
-            catalog.clone(),
-            ExtensionsConfig {
-                version: 2,
-                extensions: vec![],
-            },
-        ),
+        ExtensionsConfig {
+            version: 2,
+            extensions: vec![],
+        }
+        .validate(&catalog),
         Err(LoaderError::UnsupportedVersion { found: 2 })
     ));
+    let (runtime, fiber, loader) = mount(catalog, vec![]).await;
     assert!(matches!(
-        LoaderPlugin::new(
-            catalog.clone(),
-            config(vec![EntryOptions::new("x", "demo.dep").with_isolate(
-                [("missing".into(), IsolateValue::Flag(true))].into()
-            )]),
-        ),
-        Err(LoaderError::UnknownIsolation { .. })
+        loader
+            .create(
+                EntryOptions::new("x", "demo.dep")
+                    .with_isolate([("missing".into(), IsolateValue::Flag(true))].into()),
+                None,
+                None
+            )
+            .await,
+        Err(LoaderControlError::Loader(
+            LoaderError::UnknownIsolation { .. }
+        ))
     ));
     assert!(matches!(
-        LoaderPlugin::new(
-            catalog.clone(),
-            config(vec![EntryOptions::new("x", "demo.dep").with_isolate(
-                [("dep".into(), IsolateValue::Flag(false))].into()
-            )]),
-        ),
-        Err(LoaderError::InvalidEntry { .. })
+        loader
+            .create(
+                EntryOptions::new("x", "demo.dep")
+                    .with_isolate([("dep".into(), IsolateValue::Flag(false))].into()),
+                None,
+                None
+            )
+            .await,
+        Err(LoaderControlError::Loader(LoaderError::InvalidEntry { .. }))
     ));
     assert!(matches!(
-        LoaderPlugin::new(
-            catalog,
-            config(vec![EntryOptions::new("x", "demo.dep").with_isolate(
-                [("dep".into(), IsolateValue::Name(String::new()))].into()
-            )]),
-        ),
-        Err(LoaderError::InvalidEntry { .. })
+        loader
+            .create(
+                EntryOptions::new("x", "demo.dep")
+                    .with_isolate([("dep".into(), IsolateValue::Name(String::new()))].into()),
+                None,
+                None
+            )
+            .await,
+        Err(LoaderControlError::Loader(LoaderError::InvalidEntry { .. }))
     ));
+    assert_eq!(fiber.state(), FiberState::Active);
+    assert!(loader.entries().unwrap().extensions.is_empty());
+    runtime.shutdown().await.unwrap();
 }

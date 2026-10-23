@@ -131,7 +131,7 @@ impl Loader {
         Self { inner }
     }
 
-    /// 已加载的初始声明或后续成功提交的声明；不代表各条目均为 Active。
+    /// 内存根中已通过预检的声明；业务挂载失败仍保留以供修复，不代表均为 Active。
     pub fn entries(&self) -> Result<ExtensionsConfig, LoaderControlError> {
         Ok(self.inner()?.root.desired.lock().expect("desired").clone())
     }
@@ -209,7 +209,7 @@ impl Loader {
         let inner = self.inner()?;
         reject_cross_tree(&inner, parent)?;
         let parent = parent.map(str::to_owned);
-        mutate_tree(&inner.root, move |config| {
+        mutate_tree(&inner.root, true, move |config| {
             insert_entry(&mut config.extensions, parent.as_deref(), position, entry)
         })
         .await
@@ -232,7 +232,7 @@ impl Loader {
             reject_cross_tree(&inner, Some(parent))?;
         }
         let parent = parent.map(|parent| parent.map(str::to_owned));
-        mutate_tree(&inner.root, move |config| {
+        mutate_tree(&inner.root, false, move |config| {
             let destination = if let Some(parent) = parent.as_ref() {
                 let parent = parent.as_deref();
                 if parent.is_some_and(|parent| {
@@ -262,7 +262,7 @@ impl Loader {
         if inner.subtree_owning_path(&path).is_some() {
             return Err(LoaderControlError::CrossTreeMove { path });
         }
-        mutate_tree(&inner.root, move |config| {
+        mutate_tree(&inner.root, false, move |config| {
             remove_entry(&mut config.extensions, &path).map(|_| ())
         })
         .await
@@ -357,7 +357,7 @@ impl LoaderSubtree {
             self.reject_nested_path(parent)?;
         }
         let parent = parent.map(str::to_owned);
-        mutate_tree(&self.tree, move |config| {
+        mutate_tree(&self.tree, false, move |config| {
             insert_entry(&mut config.extensions, parent.as_deref(), position, entry)
         })
         .await
@@ -377,7 +377,7 @@ impl LoaderSubtree {
             self.reject_nested_path(parent)?;
         }
         let parent = parent.map(|parent| parent.map(str::to_owned));
-        mutate_tree(&self.tree, move |config| {
+        mutate_tree(&self.tree, false, move |config| {
             let destination = if let Some(parent) = parent.as_ref() {
                 let parent = parent.as_deref();
                 if parent.is_some_and(|parent| {
@@ -404,7 +404,7 @@ impl LoaderSubtree {
         self.ensure_alive()?;
         let path = path.as_ref().to_owned();
         self.reject_nested_path(&path)?;
-        mutate_tree(&self.tree, move |config| {
+        mutate_tree(&self.tree, false, move |config| {
             remove_entry(&mut config.extensions, &path).map(|_| ())
         })
         .await
@@ -450,6 +450,7 @@ fn config_local_path<'a>(tree: &RuntimeTree, full: &'a str) -> &'a str {
 
 async fn mutate_tree<F>(
     tree: &Arc<RuntimeTree>,
+    retain_created_declaration: bool,
     mutate: F,
 ) -> Result<LoaderSnapshot, LoaderControlError>
 where
@@ -463,7 +464,15 @@ where
         ensure_tree_revision_control(&tree).await?;
         let mut target = tree.desired.lock().expect("desired").clone();
         mutate(&mut target)?;
-        commit_tree_locked(&tree, target, None).await
+        let retained = retain_created_declaration.then(|| target.clone());
+        let result = commit_tree_locked(&tree, target, None).await;
+        if let (Some(declaration), Err(LoaderControlError::Loader(error))) = (retained, &result)
+            && error.is_entry_lifecycle_failure()
+        {
+            // create 的业务失败仍保留可修复声明；更新失败和来源树提交规则不变。
+            *tree.desired.lock().expect("desired") = declaration;
+        }
+        result
     })
     .await
     .map_err(|_| LoaderControlError::ConfigOperationAborted)?

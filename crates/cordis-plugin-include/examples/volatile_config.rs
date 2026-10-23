@@ -101,15 +101,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let runtime = Runtime::new()?;
     let mut loader_fiber = runtime
         .root()
-        .plugin(Arc::new(LoaderPlugin::new(
-            catalog,
-            ExtensionsConfig {
-                version: cordis_loader::CONFIG_VERSION,
-                extensions: vec![bootstrap_entry("include", &bootstrap).await?],
-            },
-        )?))
+        .plugin(Arc::new(LoaderPlugin::new(catalog)))
         .await?;
     let loader = runtime.root().get(LOADER)?;
+    loader
+        .create(bootstrap_entry("include", &bootstrap).await?, None, None)
+        .await?;
     let before = loader
         .await_idle()
         .await?

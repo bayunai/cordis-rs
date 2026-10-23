@@ -108,11 +108,7 @@ fn include_entry(path: &str) -> EntryOptions {
 
 async fn mount(bootstrap: &std::path::Path) -> (Runtime, cordis_core::Fiber, Loader) {
     let runtime = Runtime::new().unwrap();
-    let fiber = runtime
-        .root()
-        .plugin(Arc::new(file_plugin(catalog(), bootstrap).await.unwrap()))
-        .await
-        .unwrap();
+    let fiber = mount_file(&runtime, catalog(), bootstrap).await;
     let loader = (*runtime.root().get(LOADER).unwrap()).clone();
     (runtime, fiber, loader)
 }
@@ -133,20 +129,19 @@ async fn root_include_id_is_application_owned_and_has_no_path_aliases() {
             },
         );
         let runtime = Runtime::new().unwrap();
-        let plugin = LoaderPlugin::new(
-            catalog(),
-            ExtensionsConfig {
-                version: 3,
-                extensions: vec![
-                    cordis_plugin_include::bootstrap_entry(root_id, &bootstrap)
-                        .await
-                        .unwrap(),
-                ],
-            },
-        )
-        .unwrap();
+        let plugin = LoaderPlugin::new(catalog());
         let _fiber = runtime.root().plugin(Arc::new(plugin)).await.unwrap();
         let loader = runtime.root().get(LOADER).unwrap();
+        loader
+            .create(
+                cordis_plugin_include::bootstrap_entry(root_id, &bootstrap)
+                    .await
+                    .unwrap(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
         let snapshot = loader.await_idle().await.unwrap();
         let full_path = format!("{root_id}:worker");
         assert_eq!(
@@ -358,11 +353,7 @@ async fn invalid_include_fails_apply_without_residue() {
     )
     .unwrap();
     let runtime = Runtime::new().unwrap();
-    let fiber = runtime
-        .root()
-        .plugin(Arc::new(file_plugin(catalog(), &bootstrap).await.unwrap()))
-        .await
-        .expect("handle returned");
+    let fiber = mount_file(&runtime, catalog(), &bootstrap).await;
     assert_eq!(fiber.state(), FiberState::Active);
     let loader = runtime.root().get(LOADER).unwrap();
     let snapshot = loader.await_idle().await.unwrap();
@@ -424,11 +415,7 @@ async fn failed_child_keeps_include_control_plane_and_independent_sibling() {
     let mut catalog = catalog();
     catalog.register(BrokenFactory).unwrap();
     let runtime = Runtime::new().unwrap();
-    let mut fiber = runtime
-        .root()
-        .plugin(Arc::new(file_plugin(catalog, bootstrap).await.unwrap()))
-        .await
-        .unwrap();
+    let mut fiber = mount_file(&runtime, catalog, bootstrap).await;
     let loader = runtime.root().get(LOADER).unwrap();
     let snapshot = loader.await_idle().await.unwrap();
     assert_eq!(fiber.state(), FiberState::Active);
@@ -513,11 +500,7 @@ async fn duplicate_include_file_fails() {
     };
     let bootstrap = write_tree(dir.path(), &root, &include);
     let runtime = Runtime::new().unwrap();
-    let fiber = runtime
-        .root()
-        .plugin(Arc::new(file_plugin(catalog(), &bootstrap).await.unwrap()))
-        .await
-        .expect("handle");
+    let fiber = mount_file(&runtime, catalog(), &bootstrap).await;
     assert_eq!(fiber.state(), FiberState::Active);
     let loader = runtime.root().get(LOADER).unwrap();
     let snapshot = loader.await_idle().await.unwrap();
@@ -562,11 +545,7 @@ async fn include_cycle_fails_only_cyclic_entry_without_registering_another_tree(
     };
     let bootstrap = write_tree(dir.path(), &root, &nested);
     let runtime = Runtime::new().unwrap();
-    let fiber = runtime
-        .root()
-        .plugin(Arc::new(file_plugin(catalog(), &bootstrap).await.unwrap()))
-        .await
-        .expect("handle returned");
+    let fiber = mount_file(&runtime, catalog(), &bootstrap).await;
     assert_eq!(fiber.state(), FiberState::Active);
     let loader = runtime.root().get(LOADER).unwrap();
     let snapshot = loader.await_idle().await.unwrap();
@@ -720,18 +699,25 @@ async fn nested_include_prefixes_paths() {
     runtime.shutdown().await.unwrap();
 }
 
-async fn file_plugin(
+async fn mount_file(
+    runtime: &Runtime,
     catalog: ExtensionCatalog,
     bootstrap: impl AsRef<std::path::Path>,
-) -> Result<LoaderPlugin, LoaderError> {
+) -> cordis_core::Fiber {
     let entry = cordis_plugin_include::bootstrap_entry("include", bootstrap)
         .await
-        .map_err(|error| LoaderError::invalid_config(error.to_string()))?;
-    LoaderPlugin::new(
-        catalog,
-        ExtensionsConfig {
-            version: 3,
-            extensions: vec![entry],
-        },
-    )
+        .unwrap();
+    let fiber = runtime
+        .root()
+        .plugin(Arc::new(LoaderPlugin::new(catalog)))
+        .await
+        .unwrap();
+    runtime
+        .root()
+        .get(LOADER)
+        .unwrap()
+        .create(entry, None, None)
+        .await
+        .unwrap();
+    fiber
 }

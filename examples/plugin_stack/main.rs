@@ -692,15 +692,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     runtime.root().register_log_exporter(sse.clone())?;
 
     let catalog = build_catalog()?;
-    let plugin = LoaderPlugin::new(
-        catalog,
-        ExtensionsConfig {
-            version: cordis_loader::CONFIG_VERSION,
-            extensions: vec![bootstrap_entry("include", &bootstrap).await?],
-        },
-    )?;
+    let plugin = LoaderPlugin::new(catalog);
     let loader_fiber = runtime.root().plugin(Arc::new(plugin)).await?;
     let loader = (*runtime.root().get(LOADER)?).clone();
+    loader
+        .create(bootstrap_entry("include", &bootstrap).await?, None, None)
+        .await?;
     let _ = loader.await_idle().await?;
     sys_log(
         &runtime,

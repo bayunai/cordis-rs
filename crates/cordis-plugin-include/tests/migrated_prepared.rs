@@ -182,15 +182,7 @@ impl Harness {
             .register(cordis_plugin_include::IncludeFactory)
             .unwrap();
         let runtime = Runtime::new().unwrap();
-        let fiber = runtime
-            .root()
-            .plugin(Arc::new(
-                file_plugin(catalog, directory.path().join("bootstrap.toml"))
-                    .await
-                    .unwrap(),
-            ))
-            .await
-            .unwrap();
+        let fiber = mount_file(&runtime, catalog, directory.path().join("bootstrap.toml")).await;
         let loader = (*runtime.root().get(LOADER).unwrap()).clone();
         Self {
             runtime,
@@ -239,7 +231,7 @@ fn prepare_does_not_construct_even_when_closure_will_fail() {
 }
 
 #[tokio::test]
-async fn initial_factory_precheck_failure_still_fails_loader_without_applying_entries() {
+async fn create_factory_precheck_failure_keeps_loader_active_without_applying_entries() {
     for mode in [
         Mode::Invalid,
         Mode::PreparePanic,
@@ -250,18 +242,22 @@ async fn initial_factory_precheck_failure_still_fails_loader_without_applying_en
         let mut catalog = ExtensionCatalog::new();
         catalog.register(Factory(counts.clone())).unwrap();
         let runtime = Runtime::new().unwrap();
-        let plugin = LoaderPlugin::new(
-            catalog,
-            ExtensionsConfig {
-                version: cordis_loader::CONFIG_VERSION,
-                extensions: vec![EntryOptions::new("a", "prepared").with_config(raw(mode, 1))],
-            },
-        )
-        .unwrap();
+        let plugin = LoaderPlugin::new(catalog);
         let fiber = runtime.root().plugin(Arc::new(plugin)).await.unwrap();
-        assert_eq!(fiber.state(), FiberState::Failed);
-        assert!(fiber.last_error().is_some());
-        assert!(runtime.root().get(LOADER).is_err());
+        let loader = runtime.root().get(LOADER).unwrap();
+        assert!(
+            loader
+                .create(
+                    EntryOptions::new("a", "prepared").with_config(raw(mode, 1)),
+                    None,
+                    None
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(fiber.state(), FiberState::Active);
+        assert!(fiber.last_error().is_none());
+        assert!(loader.await_idle().await.unwrap().entries.is_empty());
         assert_eq!(counts.applies.load(Ordering::SeqCst), 0);
         runtime.shutdown().await.unwrap();
     }
@@ -421,18 +417,25 @@ async fn comparison_panic_is_rejected_before_any_runtime_or_file_change() {
     h.runtime.shutdown().await.unwrap();
 }
 
-async fn file_plugin(
+async fn mount_file(
+    runtime: &Runtime,
     catalog: ExtensionCatalog,
     bootstrap: impl AsRef<std::path::Path>,
-) -> Result<LoaderPlugin, LoaderError> {
+) -> Fiber {
     let entry = cordis_plugin_include::bootstrap_entry("include", bootstrap)
         .await
-        .map_err(|error| LoaderError::invalid_config(error.to_string()))?;
-    LoaderPlugin::new(
-        catalog,
-        ExtensionsConfig {
-            version: 3,
-            extensions: vec![entry],
-        },
-    )
+        .unwrap();
+    let fiber = runtime
+        .root()
+        .plugin(Arc::new(LoaderPlugin::new(catalog)))
+        .await
+        .unwrap();
+    runtime
+        .root()
+        .get(LOADER)
+        .unwrap()
+        .create(entry, None, None)
+        .await
+        .unwrap();
+    fiber
 }

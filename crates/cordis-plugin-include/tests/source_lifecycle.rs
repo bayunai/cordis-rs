@@ -109,22 +109,19 @@ impl Harness {
         let runtime = Runtime::new().unwrap();
         let fiber = runtime
             .root()
-            .plugin(Arc::new(
-                LoaderPlugin::new(
-                    catalog,
-                    ExtensionsConfig {
-                        version: 3,
-                        extensions: vec![
-                            EntryOptions::new("include", "cordis:include")
-                                .with_config(toml::Value::try_from(&config).unwrap()),
-                        ],
-                    },
-                )
-                .unwrap(),
-            ))
+            .plugin(Arc::new(LoaderPlugin::new(catalog)))
             .await
             .unwrap();
         let loader = (*runtime.root().get(LOADER).unwrap()).clone();
+        loader
+            .create(
+                EntryOptions::new("include", "cordis:include")
+                    .with_config(toml::Value::try_from(&config).unwrap()),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
         Self {
             runtime,
             loader,

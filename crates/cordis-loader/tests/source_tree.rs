@@ -220,12 +220,15 @@ async fn mount_source(source: Arc<MemorySource>) -> (Runtime, Fiber, Loader, Arc
     let runtime = Runtime::new().unwrap();
     let fiber = runtime
         .root()
-        .plugin(Arc::new(
-            LoaderPlugin::new(catalog, config(vec![EntryOptions::new("tree", "source")])).unwrap(),
-        ))
+        .plugin(Arc::new(LoaderPlugin::new(catalog)))
         .await
         .unwrap();
     let loader = (*runtime.root().get(LOADER).unwrap()).clone();
+    // 来源载体自身成功，来源内 Failed 条目由该子树保留并隔离。
+    loader
+        .create(EntryOptions::new("tree", "source"), None, None)
+        .await
+        .unwrap();
     (runtime, fiber, loader, source)
 }
 

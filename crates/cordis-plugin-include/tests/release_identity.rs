@@ -29,19 +29,11 @@ async fn stale_parent_detach_preserves_recreated_descendants_and_is_idempotent()
         .with_config(toml::Value::try_from(IncludeConfig::new(&root)).unwrap());
     let _fiber = runtime
         .root()
-        .plugin(Arc::new(
-            LoaderPlugin::new(
-                catalog,
-                ExtensionsConfig {
-                    version: 3,
-                    extensions: vec![entry],
-                },
-            )
-            .unwrap(),
-        ))
+        .plugin(Arc::new(LoaderPlugin::new(catalog)))
         .await
         .unwrap();
     let loader = runtime.root().get(LOADER).unwrap();
+    loader.create(entry, None, None).await.unwrap();
     loader.await_idle().await.unwrap();
     let stale_parent = loader.subtree("include").unwrap();
     let stale_child = loader.subtree("include:nested").unwrap();

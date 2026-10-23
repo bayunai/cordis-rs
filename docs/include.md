@@ -8,17 +8,16 @@
 ## 显式挂载根文件
 
 ```rust
-use cordis_loader::{CONFIG_VERSION, ExtensionCatalog, ExtensionsConfig, LoaderPlugin};
+use cordis_loader::{ExtensionCatalog, LOADER, LoaderPlugin};
 use cordis_plugin_include::{IncludeFactory, bootstrap_entry};
 
 let mut catalog = ExtensionCatalog::new();
 catalog.register(IncludeFactory)?;
 // 继续登记本应用的业务 Factory。
-let plugin = LoaderPlugin::new(catalog, ExtensionsConfig {
-    version: CONFIG_VERSION,
-    extensions: vec![bootstrap_entry("include", "bootstrap.toml").await?],
-})?;
+let plugin = LoaderPlugin::new(catalog);
 let _loader_fiber = host.root().plugin(std::sync::Arc::new(plugin)).await?;
+let loader = host.root().get(LOADER)?;
+loader.create(bootstrap_entry("include", "bootstrap.toml").await?, None, None).await?;
 ```
 
 启动文件仍是极小 v3 文档，由 Include 读取，不交给 Loader 解析：
@@ -177,7 +176,9 @@ Include 将路径规范化、读取与解析、版本检查、写回验证及原
 
 ## 破坏性 API 迁移
 
-- 删除 `LoaderPlugin::bootstrap`；改为 `LoaderPlugin::new` 加显式 `bootstrap_entry("include", …).await?`。
+- `LoaderPlugin::new(catalog)` 返回空 Loader 插件，不再接收初始声明，也不返回 `Result`。
+  挂载后显式调用 `loader.create(entry, None, None).await`；启动与运行期只有这一创建入口。
+- 删除 `LoaderPlugin::bootstrap`；启动文件条目由 `bootstrap_entry("include", …).await?` 生成后交给 `create()`。
 - 文件 bootstrap/read 辅助函数改从 `cordis_plugin_include` 导入，不保留 Loader 重导出。
 - `FileSource::open` / `from_config`、`load_bootstrap`、`bootstrap_entry`、`load_extensions` 统一改为异步，调用方须使用 `.await`，不提供同步兼容入口。
 - 自定义 `EntryTreeSource` 使用 `async_trait` 实现异步读写方法；`PreparedExtension::tree` 的来源构造闭包改为接收拥有的 `Context` 并返回异步结果。

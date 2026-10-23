@@ -137,19 +137,14 @@ mod tests {
         let runtime = Runtime::new().unwrap();
         let fiber = runtime
             .root()
-            .plugin(Arc::new(
-                LoaderPlugin::new(
-                    catalog,
-                    ExtensionsConfig {
-                        version: 3,
-                        extensions: vec![EntryOptions::new("tree", "carrier")],
-                    },
-                )
-                .unwrap(),
-            ))
+            .plugin(Arc::new(LoaderPlugin::new(catalog)))
             .await
             .unwrap();
         let loader = (*runtime.root().get(LOADER).unwrap()).clone();
+        loader
+            .create(EntryOptions::new("tree", "carrier"), None, None)
+            .await
+            .unwrap();
         loader.await_idle().await.unwrap();
         tokio::task::yield_now().await;
         (runtime, fiber, loader)

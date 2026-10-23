@@ -10,7 +10,7 @@ mod host;
 mod plugins;
 
 use cordis_host::CordisHost;
-use cordis_loader::{CONFIG_VERSION, ExtensionsConfig, LoaderPlugin};
+use cordis_loader::LoaderPlugin;
 use cordis_plugin_include::bootstrap_entry;
 use cordis_plugin_logger_console::{ConsoleLoggerConfig, ConsoleLoggerPlugin};
 use cordis_plugin_timer::TimerPlugin;
@@ -36,18 +36,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })))
         .await?;
     let _timer_fiber = host.root().plugin(Arc::new(TimerPlugin)).await?;
-    // 启动文件由 Include 读取；main 是应用显式选择的文件树前缀，不是 Loader 隐式根。
-    let loader = LoaderPlugin::new(
-        host::build_catalog()?,
-        ExtensionsConfig {
-            version: CONFIG_VERSION,
-            extensions: vec![bootstrap_entry("include", bootstrap_path).await?],
-        },
-    )?;
+    // Loader 先就绪，启动文件由应用显式创建的 Include 读取。
+    let loader = LoaderPlugin::new(host::build_catalog()?);
     let _loader_fiber = host.root().plugin(Arc::new(loader)).await?;
 
     // 真实应用在此运行 HTTP、窗口事件循环或后台任务。
     let loader = host.root().get(cordis_loader::LOADER)?;
+    loader
+        .create(
+            bootstrap_entry("include", bootstrap_path).await?,
+            None,
+            None,
+        )
+        .await?;
     let greeting = loader
         .entry_context("include:default-greeting")?
         .get(GREETING)?;

@@ -94,11 +94,24 @@ fn config(entries: Vec<EntryOptions>) -> ExtensionsConfig {
     }
 }
 
-async fn mount(plugin: LoaderPlugin) -> (Runtime, Fiber, Loader) {
+async fn mount_file(
+    mut catalog: ExtensionCatalog,
+    bootstrap: impl AsRef<std::path::Path>,
+) -> (Runtime, Fiber, Loader) {
+    catalog
+        .register(cordis_plugin_include::IncludeFactory)
+        .unwrap();
+    let entry = cordis_plugin_include::bootstrap_entry("include", bootstrap)
+        .await
+        .unwrap();
     let runtime = Runtime::new().unwrap();
     let root = runtime.root();
-    let fiber = root.plugin(Arc::new(plugin)).await.unwrap();
+    let fiber = root
+        .plugin(Arc::new(LoaderPlugin::new(catalog)))
+        .await
+        .unwrap();
     let loader = (*root.get(LOADER).unwrap()).clone();
+    loader.create(entry, None, None).await.unwrap();
     (runtime, fiber, loader)
 }
 
@@ -292,7 +305,7 @@ async fn mount_with_file(
     )
     .unwrap();
     fs::write(&extensions, toml::to_string(&config(entries)).unwrap()).unwrap();
-    let (runtime, fiber, loader) = mount(file_plugin(catalog, &bootstrap).await.unwrap()).await;
+    let (runtime, fiber, loader) = mount_file(catalog, &bootstrap).await;
     (runtime, fiber, loader, directory, extensions)
 }
 
@@ -315,8 +328,7 @@ async fn disabling_provider_returns_consumer_to_pending_then_recovers() {
     )
     .unwrap();
     fs::write(&extensions, toml::to_string(&config(vec![group])).unwrap()).unwrap();
-    let (runtime, _loader_fiber, loader) =
-        mount(file_plugin(dep_catalog(), &bootstrap).await.unwrap()).await;
+    let (runtime, _loader_fiber, loader) = mount_file(dep_catalog(), &bootstrap).await;
     assert_eq!(
         loader
             .await_idle()
@@ -386,17 +398,13 @@ async fn persistent_create_move_and_conflict_use_paths() {
     )
     .unwrap();
     fs::write(&extensions, "version = 3\nextensions = []\n").unwrap();
-    let (runtime, _loader_fiber, loader) = mount(
-        file_plugin(
-            catalog(vec![Factory {
-                id: "demo.value",
-                needs_dep: false,
-                record: None,
-            }]),
-            &bootstrap,
-        )
-        .await
-        .unwrap(),
+    let (runtime, _loader_fiber, loader) = mount_file(
+        catalog(vec![Factory {
+            id: "demo.value",
+            needs_dep: false,
+            record: None,
+        }]),
+        &bootstrap,
     )
     .await;
     loader
@@ -511,24 +519,20 @@ async fn deleting_group_disposes_children_in_postorder() {
     )
     .unwrap();
     fs::write(&extensions, toml::to_string(&config(vec![group])).unwrap()).unwrap();
-    let (runtime, _loader_fiber, loader) = mount(
-        file_plugin(
-            catalog(vec![
-                Factory {
-                    id: "demo.first",
-                    needs_dep: false,
-                    record: Some(record.clone()),
-                },
-                Factory {
-                    id: "demo.second",
-                    needs_dep: false,
-                    record: Some(record.clone()),
-                },
-            ]),
-            &bootstrap,
-        )
-        .await
-        .unwrap(),
+    let (runtime, _loader_fiber, loader) = mount_file(
+        catalog(vec![
+            Factory {
+                id: "demo.first",
+                needs_dep: false,
+                record: Some(record.clone()),
+            },
+            Factory {
+                id: "demo.second",
+                needs_dep: false,
+                record: Some(record.clone()),
+            },
+        ]),
+        &bootstrap,
     )
     .await;
     loader
@@ -1638,21 +1642,4 @@ async fn update_enable_disable_notifies_subscribers_with_increasing_revision() {
     let LoaderEvent::SnapshotChanged { revision: enabled } = events.recv().await.unwrap();
     assert!(enabled > disabled);
     runtime.shutdown().await.unwrap();
-}
-
-async fn file_plugin(
-    mut catalog: ExtensionCatalog,
-    bootstrap: impl AsRef<std::path::Path>,
-) -> Result<LoaderPlugin, LoaderError> {
-    catalog.register(cordis_plugin_include::IncludeFactory)?;
-    let entry = cordis_plugin_include::bootstrap_entry("include", bootstrap)
-        .await
-        .map_err(|error| LoaderError::invalid_config(error.to_string()))?;
-    LoaderPlugin::new(
-        catalog,
-        ExtensionsConfig {
-            version: 3,
-            extensions: vec![entry],
-        },
-    )
 }

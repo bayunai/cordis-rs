@@ -118,7 +118,7 @@ impl RuntimeTree {
             parent_tree: Weak::new(),
             release: Mutex::new(None),
             closing: std::sync::atomic::AtomicBool::new(false),
-            unsettled: std::sync::atomic::AtomicBool::new(true),
+            unsettled: std::sync::atomic::AtomicBool::new(false),
             desired: Mutex::new(ExtensionsConfig {
                 version: crate::config::CONFIG_VERSION,
                 extensions: Vec::new(),
@@ -177,7 +177,7 @@ impl RuntimeTree {
         }))
     }
 
-    /// 初始声明通过预检后，业务生命周期失败不撤销树的控制面。
+    /// 来源树初始声明通过预检后，业务生命周期失败不撤销来源控制面。
     pub(crate) async fn initialize(
         self: &Arc<Self>,
         config: ExtensionsConfig,

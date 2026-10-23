@@ -70,17 +70,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let runtime = Runtime::new()?;
     let _fiber = runtime
         .root()
-        .plugin(Arc::new(LoaderPlugin::new(
-            catalog,
-            ExtensionsConfig {
-                version: cordis_loader::CONFIG_VERSION,
-                extensions: vec![
-                    bootstrap_entry("include", directory.path().join("bootstrap.toml")).await?,
-                ],
-            },
-        )?))
+        .plugin(Arc::new(LoaderPlugin::new(catalog)))
         .await?;
     let loader = runtime.root().get(LOADER)?;
+    loader
+        .create(
+            bootstrap_entry("include", directory.path().join("bootstrap.toml")).await?,
+            None,
+            None,
+        )
+        .await?;
     let before = loader.describe_config("include:ocr").await?;
     // 应用可以用字符串 DTO 往返版本令牌；它不是访问凭据。
     let expected = before.revision.to_string().parse()?;

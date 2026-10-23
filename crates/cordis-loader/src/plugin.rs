@@ -38,22 +38,15 @@ pub(crate) struct RuntimeEntry {
 
 pub struct LoaderPlugin {
     catalog: ExtensionCatalog,
-    config: ExtensionsConfig,
-    state: Mutex<Option<Arc<LoaderInner>>>,
 }
 
 impl LoaderPlugin {
-    pub fn new(catalog: ExtensionCatalog, config: ExtensionsConfig) -> Result<Self, LoaderError> {
-        preflight(&catalog, &config)?;
-        Ok(Self {
-            catalog,
-            config,
-            state: Mutex::new(None),
-        })
+    /// 仅创建空内存 Loader；所有条目（包括启动 Include）均通过 Loader::create 登记。
+    pub fn new(catalog: ExtensionCatalog) -> Self {
+        Self { catalog }
     }
 
     fn initial_state(&self, context: Context) -> Result<Arc<LoaderInner>, LoaderError> {
-        let config = self.config.clone();
         let root = RuntimeTree::new_root(self.catalog.clone(), context)?;
         let (events, _) = broadcast::channel(64);
         let inner = Arc::new(LoaderInner {
@@ -64,7 +57,6 @@ impl LoaderPlugin {
             events,
             change_revision: AtomicU64::new(0),
             state_progress: Notify::new(),
-            initial: Mutex::new(Some(config)),
         });
         *root.loader.lock().expect("loader weak") = Arc::downgrade(&inner);
         Ok(inner)
@@ -78,7 +70,6 @@ impl Plugin for LoaderPlugin {
     }
 
     async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
-        self.state.lock().expect("loader plugin state").take();
         let inner = self
             .initial_state(ctx.clone())
             .map_err(|error| CoreError::PluginApply(error.to_string()))?;
@@ -102,19 +93,7 @@ impl Plugin for LoaderPlugin {
                 }
             }
         });
-        *self.state.lock().expect("loader plugin state") = Some(inner.clone());
-        let config = inner
-            .initial
-            .lock()
-            .expect("initial config")
-            .take()
-            .expect("LoaderPlugin applies once per state");
-        inner
-            .root
-            .initialize(config)
-            .await
-            .map(|_| ())
-            .map_err(|error| CoreError::PluginApply(error.to_string()))
+        Ok(())
     }
 }
 
@@ -126,7 +105,6 @@ pub(crate) struct LoaderInner {
     pub(crate) events: broadcast::Sender<LoaderEvent>,
     change_revision: AtomicU64,
     state_progress: Notify,
-    initial: Mutex<Option<ExtensionsConfig>>,
 }
 
 /// 所有子树索引必须作为一个原子注册表读写。
