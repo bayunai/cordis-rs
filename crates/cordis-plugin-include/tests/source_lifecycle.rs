@@ -555,5 +555,25 @@ async fn one_source_definition_failure_does_not_skip_an_independent_source_updat
         Some(FiberState::Active)
     );
     assert_eq!(*right.get().value, 12);
+    let errors: Vec<_> = h
+        .runtime
+        .root()
+        .logger()
+        .unwrap()
+        .service()
+        .buffer_snapshot()
+        .into_iter()
+        .filter(|record| {
+            record.level == cordis_core::LogLevel::Error
+                && record
+                    .message
+                    .contains("实例 include:left:child 生命周期失败")
+        })
+        .collect();
+    assert_eq!(
+        errors.len(),
+        1,
+        "来源失败向上传播时不得重复记录：{errors:?}"
+    );
     h.runtime.shutdown().await.unwrap();
 }

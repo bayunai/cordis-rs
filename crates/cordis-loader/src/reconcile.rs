@@ -216,11 +216,16 @@ impl RuntimeTree {
                 None => Some("插件实例未创建".into()),
                 Some(_) => None,
             };
+            drop(entries);
             if let Some(reason) = error {
-                lifecycle_error = Some(LoaderError::Lifecycle {
-                    instance: path.to_string(),
-                    source: CoreError::PluginApply(reason),
-                });
+                record_lifecycle_result(
+                    Err(LoaderError::Lifecycle {
+                        instance: path.to_string(),
+                        source: CoreError::PluginApply(reason),
+                    }),
+                    &mut lifecycle_error,
+                    &logger,
+                )?;
             }
         }
         // 独立条目均已尝试；生命周期失败仍向上返回，由 RuntimeTree 决定是否提交 desired。
@@ -297,8 +302,14 @@ impl RuntimeTree {
                 Ok(())
             }
             .await;
-            // 某个来源子树的业务失败仍须隔离，不能阻止其他独立来源定义更新。
-            record_lifecycle_result(result, &mut lifecycle_error, &logger)?;
+            // 子树在错误发生处已记录日志；父树只收集并传播，继续处理其他来源。
+            match result {
+                Err(error) if error.is_entry_lifecycle_failure() => {
+                    lifecycle_error.get_or_insert(error);
+                }
+                Err(error) => return Err(error),
+                Ok(()) => {}
+            }
         }
         if let Some(error) = lifecycle_error {
             return Err(error);
