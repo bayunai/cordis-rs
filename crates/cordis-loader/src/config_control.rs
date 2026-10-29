@@ -100,7 +100,7 @@ pub(crate) async fn commit(
             .upgrade()
             .ok_or(LoaderControlError::LoaderUnavailable)?;
         let _control = loader.config_operations.lock().await;
-        commit_owned(&tree, &local, expected, config).await
+        commit_owned(&tree, &local, expected, config, None).await
     })
     .await
     .map_err(|_| LoaderControlError::ConfigOperationAborted)?
@@ -111,6 +111,7 @@ pub(crate) async fn commit_owned(
     local: &str,
     expected: ConfigRevision,
     config: toml::Value,
+    required: Option<EntryId>,
 ) -> Result<EntryConfigSnapshot, LoaderControlError> {
     let _operation = tree.operations.lock().await;
     ensure_available(tree, local)?;
@@ -141,7 +142,7 @@ pub(crate) async fn commit_owned(
         },
     )?;
     let full = full_path(tree, local);
-    commit_tree_locked(tree, target, Some((full, prepared)))
+    commit_tree_locked(tree, target, Some((full, prepared)), required)
         .await
         .map_err(|error| match error {
             // Factory 构造、比较及 PluginKey 预检也不能通过错误回显配置。

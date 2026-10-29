@@ -197,7 +197,7 @@ impl RuntimeTree {
         config: ExtensionsConfig,
         revision: Option<SourceRevision>,
     ) -> Result<LoaderSnapshot, LoaderError> {
-        self.apply_prepared(config, revision, None).await
+        self.apply_prepared(config, revision, None, None).await
     }
 
     pub(crate) fn config_revision(&self) -> ConfigRevision {
@@ -213,8 +213,12 @@ impl RuntimeTree {
         config: ExtensionsConfig,
         revision: Option<SourceRevision>,
         prepared: Option<(EntryId, PreparedExtension)>,
+        required: Option<EntryId>,
     ) -> Result<LoaderSnapshot, LoaderError> {
-        let plan = self.prepare_plan(config, revision, prepared).await?;
+        let retry_failed = revision.is_some() && prepared.is_none();
+        let plan = self
+            .prepare_plan(config, revision, prepared, required, retry_failed)
+            .await?;
         self.apply_plan(plan).await
     }
 
@@ -223,6 +227,8 @@ impl RuntimeTree {
         config: ExtensionsConfig,
         revision: Option<SourceRevision>,
         prepared: Option<(EntryId, PreparedExtension)>,
+        required: Option<EntryId>,
+        retry_failed: bool,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<PreparedTreePlan, LoaderError>> + Send + '_>,
     > {
@@ -234,10 +240,18 @@ impl RuntimeTree {
                 Some(self.prefix.as_str())
             };
             let (mut desired, roots) = index_desired_tree(&self.catalog, &config, prefix)?;
+            let required = required.or_else(|| prepared.as_ref().map(|(path, _)| path.clone()));
             let mut plan = {
                 let entries = self.entries.lock().expect("entries");
-                plan_reconcile(&entries, &desired, &roots)?
+                plan_reconcile(&entries, &desired, &roots, retry_failed, required.as_ref())?
             };
+            let committed = self.desired.lock().expect("desired").clone();
+            let (committed, _) = index_desired_tree(&self.catalog, &committed, prefix)?;
+            plan.committed = committed
+                .into_iter()
+                .map(|(path, node)| (path, node.options))
+                .collect();
+            plan.required = required;
             build_plan_plugins(
                 &self.catalog,
                 &mut desired,
@@ -512,7 +526,7 @@ impl RuntimeTree {
         // 只建立结构差分，不调用 Factory。Pending 本身不导致重新构造。
         let (desired, roots) = index_desired_tree(&self.catalog, &document.config, prefix)?;
         let entries = self.entries.lock().expect("entries");
-        Ok(plan_reconcile(&entries, &desired, &roots)?.is_empty())
+        Ok(plan_reconcile(&entries, &desired, &roots, true, None)?.is_empty())
     }
 
     pub(crate) fn needs_reconcile(&self) -> bool {

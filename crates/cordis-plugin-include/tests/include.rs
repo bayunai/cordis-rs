@@ -423,7 +423,16 @@ async fn failed_child_keeps_include_control_plane_and_independent_sibling() {
     assert_eq!(stable.state, Some(FiberState::Active));
     let subtree = loader.subtree("include:reports").unwrap();
     assert_eq!(subtree.snapshot().unwrap().entries.len(), 2);
-    assert!(subtree.reload().await.is_err());
+    subtree.reload().await.unwrap();
+    assert_eq!(
+        subtree
+            .snapshot()
+            .unwrap()
+            .entry("include:reports:broken")
+            .unwrap()
+            .state,
+        Some(FiberState::Failed)
+    );
     subtree.remove("broken").await.unwrap();
     let recovered = loader.await_idle().await.unwrap();
     assert!(recovered.entry("include:reports:broken").is_none());

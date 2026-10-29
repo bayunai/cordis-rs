@@ -376,6 +376,26 @@ impl ConfigTransaction {
         self.loader.prepare_entry_config(factory, config)
     }
 
+    /// 提交载体配置时指定本次必须激活的子条目。
+    pub async fn commit_entry_config_requiring(
+        &self,
+        path: impl AsRef<str>,
+        expected: crate::ConfigRevision,
+        config: toml::Value,
+        required: impl AsRef<str>,
+    ) -> Result<crate::EntryConfigSnapshot, LoaderControlError> {
+        let inner = self.loader.inner()?;
+        let (tree, local) = resolve_entry_path(&inner, path.as_ref());
+        crate::config_control::commit_owned(
+            &tree,
+            &local,
+            expected,
+            config,
+            Some(EntryId::from(required.as_ref())),
+        )
+        .await
+    }
+
     /// 复用既有整表提交链路，不再次获取事务准入锁。
     pub async fn commit_entry_config(
         &self,
@@ -386,7 +406,7 @@ impl ConfigTransaction {
         let inner = self.loader.inner()?;
         let path = path.as_ref();
         let (tree, local) = resolve_entry_path(&inner, path);
-        crate::config_control::commit_owned(&tree, &local, expected, config).await
+        crate::config_control::commit_owned(&tree, &local, expected, config, None).await
     }
 }
 
@@ -570,7 +590,7 @@ where
         let mut target = tree.desired.lock().expect("desired").clone();
         mutate(&mut target)?;
         let retained = retain_created_declaration.then(|| target.clone());
-        let result = commit_tree_locked(&tree, target, None).await;
+        let result = commit_tree_locked(&tree, target, None, None).await;
         if let (Some(declaration), Err(LoaderControlError::Loader(error))) = (retained, &result)
             && error.is_entry_lifecycle_failure()
         {
@@ -588,6 +608,7 @@ pub(crate) async fn commit_tree_locked(
     tree: &Arc<RuntimeTree>,
     target: ExtensionsConfig,
     prepared: Option<(EntryId, crate::PreparedExtension)>,
+    required: Option<EntryId>,
 ) -> Result<LoaderSnapshot, LoaderControlError> {
     tree.ensure_open()?;
     let source = tree.source.lock().expect("source").clone();
@@ -597,7 +618,9 @@ pub(crate) async fn commit_tree_locked(
             .await
             .map_err(|error| LoaderControlError::from_source(source.identity(), error))?;
     }
-    let snapshot = tree.apply_prepared(target.clone(), None, prepared).await?;
+    let snapshot = tree
+        .apply_prepared(target.clone(), None, prepared, required)
+        .await?;
     let Some(source) = source else {
         return Ok(snapshot);
     };

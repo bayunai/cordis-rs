@@ -315,13 +315,11 @@ async fn failed_create_keeps_loader_and_declaration_available_for_independent_en
             .state,
         Some(FiberState::Failed)
     );
-    // 对旧失败目标的重试仍报错，但不得阻止新建的独立目标实际挂载。
-    assert!(matches!(
-        loader
-            .create(EntryOptions::new("good", "demo.value"), None, None)
-            .await,
-        Err(LoaderControlError::Loader(LoaderError::Lifecycle { .. }))
-    ));
+    // 旧失败仍可见，但不会让独立条目的创建失败。
+    loader
+        .create(EntryOptions::new("good", "demo.value"), None, None)
+        .await
+        .unwrap();
     let actual = loader.await_idle().await.unwrap();
     assert_eq!(
         actual.entry("good").unwrap().state,
@@ -1365,5 +1363,60 @@ async fn isolate_precheck_rejects_unknown_false_empty_and_v2() {
     ));
     assert_eq!(fiber.state(), FiberState::Active);
     assert!(loader.entries().unwrap().extensions.is_empty());
+    runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn unrelated_creation_does_not_retry_unchanged_failed_plugin() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct ChangingFactory(Arc<AtomicUsize>);
+    struct ChangingPlugin(Arc<AtomicUsize>);
+    #[async_trait]
+    impl Plugin for ChangingPlugin {
+        fn key(&self) -> PluginKey {
+            PluginKey::new("demo.changing")
+        }
+        async fn apply(&self, _: &Context) -> Result<(), CoreError> {
+            let attempt = self.0.fetch_add(1, Ordering::SeqCst);
+            Err(CoreError::PluginApply(format!("failure {attempt}")))
+        }
+    }
+    impl ExtensionFactory for ChangingFactory {
+        type Config = Empty;
+        fn id(&self) -> &'static str {
+            "demo.changing"
+        }
+        fn prepare(&self, _: Empty) -> Result<PreparedExtension, LoaderError> {
+            let counter = self.0.clone();
+            Ok(PreparedExtension::ordinary(move || {
+                Ok(Arc::new(ChangingPlugin(counter.clone())))
+            }))
+        }
+    }
+    let mut catalog = catalog(vec![Factory {
+        id: "demo.value",
+        needs_dep: false,
+        record: None,
+    }]);
+    let attempts = Arc::new(AtomicUsize::new(0));
+    catalog.register(ChangingFactory(attempts.clone())).unwrap();
+    let runtime = Runtime::new().unwrap();
+    let _fiber = runtime
+        .root()
+        .plugin(Arc::new(LoaderPlugin::new(catalog)))
+        .await
+        .unwrap();
+    let loader = runtime.root().get(LOADER).unwrap();
+    assert!(
+        loader
+            .create(EntryOptions::new("bad", "demo.changing"), None, None)
+            .await
+            .is_err()
+    );
+    loader
+        .create(EntryOptions::new("good", "demo.value"), None, None)
+        .await
+        .unwrap();
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
     runtime.shutdown().await.unwrap();
 }

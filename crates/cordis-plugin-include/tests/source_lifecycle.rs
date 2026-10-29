@@ -248,6 +248,20 @@ async fn patch_lifecycle_failure_is_waited_and_same_target_can_retry() {
     assert!(!call.is_finished());
     h.counts.release.notify_one();
     assert!(call.await.unwrap().is_err());
+    let errors: Vec<_> = h
+        .runtime
+        .root()
+        .logger()
+        .unwrap()
+        .service()
+        .buffer_snapshot()
+        .into_iter()
+        .filter(|record| {
+            record.level == cordis_core::LogLevel::Error
+                && record.message.contains("实例 include:one 生命周期失败")
+        })
+        .collect();
+    assert_eq!(errors.len(), 1, "同一次子树失败只应记录一次：{errors:?}");
     assert_eq!(h.file(), file);
     assert_eq!(
         h.loader

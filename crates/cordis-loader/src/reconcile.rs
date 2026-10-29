@@ -25,7 +25,7 @@ use std::{
 /// 目标树节点（预检索引；Plugin 按需填充）。
 pub(crate) struct DesiredNode {
     parent: Option<EntryId>,
-    options: EntryOptions,
+    pub(crate) options: EntryOptions,
     children: Vec<EntryId>,
     plugin: Option<Arc<dyn Plugin>>,
     plugin_key: Option<PluginKey>,
@@ -48,6 +48,8 @@ pub(crate) struct ReconcilePlan {
     /// 目标前序。
     desired_order: Vec<EntryId>,
     hot: BTreeMap<EntryId, HotCommit>,
+    pub(crate) required: Option<EntryId>,
+    pub(crate) committed: BTreeMap<EntryId, EntryOptions>,
 }
 
 impl ReconcilePlan {
@@ -93,6 +95,22 @@ impl RuntimeTree {
             .logger()
             .map_err(|source| LoaderError::Runtime { source })?;
         let mut lifecycle_error = None;
+        // 记录操作前的失败身份、配置和诊断；仅同一实例的相同失败可作为旧问题。
+        let previous_failures: BTreeMap<_, _> = self
+            .entries
+            .lock()
+            .expect("entries")
+            .iter()
+            .filter_map(|(path, entry)| {
+                let fiber = entry.fiber.as_ref()?;
+                (fiber.state() == FiberState::Failed).then(|| {
+                    (
+                        path.clone(),
+                        (fiber.id(), entry.options.clone(), fiber.last_error()),
+                    )
+                })
+            })
+            .collect();
         // 1) 后序删除整节点
         let remove_order = postorder_among(&plan.remove, &self.order.lock().expect("entry order"));
         for path in remove_order {
@@ -136,11 +154,39 @@ impl RuntimeTree {
 
         // 4) replace
         for path in &plan.replace {
-            record_lifecycle_result(
-                self.replace_entry(path, &desired).await,
-                &mut lifecycle_error,
-                &logger,
-            )?;
+            let result = self.replace_entry(path, &desired).await;
+            let unchanged_failure = matches!(
+                &result,
+                Err(LoaderError::Lifecycle {
+                    source: CoreError::PluginApply(_),
+                    ..
+                })
+            ) && plan.required.as_ref() != Some(path)
+                && previous_failures
+                    .get(path)
+                    .is_some_and(|(id, options, diagnostic)| {
+                        if plan.committed.get(path) != Some(options)
+                            || desired
+                                .get(path)
+                                .is_none_or(|node| &node.options != options)
+                        {
+                            return false;
+                        }
+                        let entries = self.entries.lock().expect("entries");
+                        entries
+                            .get(path)
+                            .and_then(|entry| entry.fiber.as_ref())
+                            .is_some_and(|fiber| {
+                                fiber.id() == *id
+                                    && fiber.state() == FiberState::Failed
+                                    && fiber.last_error() == *diagnostic
+                            })
+                    });
+            if unchanged_failure {
+                logger.warn(format!("原有插件失败未改变：{}", path));
+            } else {
+                record_lifecycle_result(result, &mut lifecycle_error, &logger)?;
+            }
         }
 
         // 5) 前序挂载
@@ -151,6 +197,32 @@ impl RuntimeTree {
             }
         }
 
+        // 启用目标失败须报错；Pending 表示依赖尚未就绪，保持启用并等待。
+        if let Some(path) = &plan.required
+            && desired
+                .get(path)
+                .is_some_and(|node| !node.options.disabled && !node.options.group)
+            && lifecycle_error.is_none()
+        {
+            let entries = self.entries.lock().expect("entries");
+            let fiber = entries.get(path).and_then(|entry| entry.fiber.as_ref());
+            let error = match fiber {
+                Some(fiber) if fiber.state() == FiberState::Failed => {
+                    Some(fiber.last_error().unwrap_or_else(|| "插件挂载失败".into()))
+                }
+                Some(fiber) if fiber.state() == FiberState::Disposed => {
+                    Some("插件实例已释放".into())
+                }
+                None => Some("插件实例未创建".into()),
+                Some(_) => None,
+            };
+            if let Some(reason) = error {
+                lifecycle_error = Some(LoaderError::Lifecycle {
+                    instance: path.to_string(),
+                    source: CoreError::PluginApply(reason),
+                });
+            }
+        }
         // 独立条目均已尝试；生命周期失败仍向上返回，由 RuntimeTree 决定是否提交 desired。
         if let Some(error) = lifecycle_error {
             return Err(error);
@@ -594,6 +666,8 @@ pub(crate) fn plan_reconcile(
     mounted: &BTreeMap<EntryId, RuntimeEntry>,
     desired: &BTreeMap<EntryId, DesiredNode>,
     roots: &[EntryId],
+    retry_failed: bool,
+    required: Option<&EntryId>,
 ) -> Result<ReconcilePlan, LoaderError> {
     let mut remove = BTreeSet::new();
     let mut dispose_fiber = BTreeSet::new();
@@ -696,7 +770,9 @@ pub(crate) fn plan_reconcile(
                     mount.insert(path.clone());
                     build.insert(path.clone());
                 }
-            } else if want_enabled && (config_changed || failed) {
+            } else if want_enabled
+                && (config_changed || (failed && (retry_failed || required == Some(path))))
+            {
                 replace.insert(path.clone());
                 build.insert(path.clone());
             }
@@ -745,6 +821,8 @@ pub(crate) fn plan_reconcile(
         build,
         desired_order,
         hot: BTreeMap::new(),
+        required: None,
+        committed: BTreeMap::new(),
     })
 }
 
@@ -866,6 +944,9 @@ pub(crate) async fn build_plan_plugins(
             )
         })
         .collect();
+    if plan.required.is_none() {
+        plan.required = prepared.as_ref().map(|(path, _)| path.clone());
+    }
     let mut candidates = plan.build.clone();
     for (path, entry) in mounted.iter() {
         if entry.binding.is_some()
@@ -951,7 +1032,13 @@ pub(crate) async fn build_plan_plugins(
                 }
                 let document = source.read().await?;
                 let prepared = tree
-                    .prepare_plan(document.config, Some(document.revision), None)
+                    .prepare_plan(
+                        document.config,
+                        Some(document.revision),
+                        None,
+                        plan.required.clone(),
+                        false,
+                    )
                     .await?;
                 let fiber_id = current
                     .and_then(|entry| entry.active_fiber)

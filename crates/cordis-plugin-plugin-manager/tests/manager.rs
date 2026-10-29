@@ -1,7 +1,9 @@
 //! PluginManager：库存与启停只经 user patch。
 
 use async_trait::async_trait;
-use cordis_core::{Context, CoreError, FiberState, Plugin, PluginKey, Runtime};
+use cordis_core::{
+    Context, CoreError, FiberState, Plugin, PluginKey, Runtime, ServiceId, ServiceKey,
+};
 use cordis_loader::{
     EntryOptions, EntryUpdate, ExtensionCatalog, ExtensionFactory, ExtensionsConfig, LOADER,
     LoaderControlError, LoaderError, LoaderPlugin, PreparedExtension,
@@ -46,7 +48,68 @@ impl Plugin for Instance {
     }
 }
 
+static PENDING_DEP: ServiceKey<()> = ServiceKey::new("test.pending-dependency");
+struct PendingFactory;
+struct PendingInstance;
+impl ExtensionFactory for PendingFactory {
+    type Config = Input;
+    fn id(&self) -> &'static str {
+        "demo.pending"
+    }
+    fn prepare(&self, _: Input) -> Result<PreparedExtension, LoaderError> {
+        Ok(PreparedExtension::ordinary(|| {
+            Ok(Arc::new(PendingInstance))
+        }))
+    }
+}
+#[async_trait]
+impl Plugin for PendingInstance {
+    fn key(&self) -> PluginKey {
+        PluginKey::new("demo.pending")
+    }
+    fn inject(&self) -> Vec<ServiceId> {
+        vec![PENDING_DEP.id()]
+    }
+    async fn apply(&self, _: &Context) -> Result<(), CoreError> {
+        Ok(())
+    }
+}
+
+static FAILURE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+static FAIL_ATTEMPTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+struct FailingFactory;
+struct FailingInstance;
+
+impl ExtensionFactory for FailingFactory {
+    type Config = Input;
+    fn id(&self) -> &'static str {
+        "demo.failing"
+    }
+    fn prepare(&self, _: Input) -> Result<PreparedExtension, LoaderError> {
+        Ok(PreparedExtension::ordinary(|| {
+            Ok(Arc::new(FailingInstance))
+        }))
+    }
+}
+
+#[async_trait]
+impl Plugin for FailingInstance {
+    fn key(&self) -> PluginKey {
+        PluginKey::new("demo.failing")
+    }
+    async fn apply(&self, _: &Context) -> Result<(), CoreError> {
+        FAIL_ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Err(CoreError::PluginApply("unsupported platform".into()))
+    }
+}
+
 async fn harness() -> (Runtime, tempfile::TempDir, Vec<cordis_core::Fiber>) {
+    harness_with_failure(false).await
+}
+
+async fn harness_with_failure(
+    failure: bool,
+) -> (Runtime, tempfile::TempDir, Vec<cordis_core::Fiber>) {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(
         dir.path().join("cordis.toml"),
@@ -59,10 +122,20 @@ async fn harness() -> (Runtime, tempfile::TempDir, Vec<cordis_core::Fiber>) {
         vec![EntryOptions::new("nested", "demo.row").with_config(toml::toml! { value = 2 }.into())],
     )
     .unwrap();
+    let mut pending =
+        EntryOptions::new("waiting", "demo.pending").with_config(toml::toml! { value = 1 }.into());
+    pending.disabled = true;
+    let mut entries = vec![one, group, pending];
+    if failure {
+        entries.push(
+            EntryOptions::new("broken", "demo.failing")
+                .with_config(toml::toml! { value = 1 }.into()),
+        );
+    }
     let deploy = PatchFileDocument {
         version: PATCH_FILE_VERSION,
         patches: vec![EntryPatch {
-            insert: Some(vec![one, group]),
+            insert: Some(entries),
             ..Default::default()
         }],
     };
@@ -75,6 +148,8 @@ async fn harness() -> (Runtime, tempfile::TempDir, Vec<cordis_core::Fiber>) {
 
     let mut catalog = ExtensionCatalog::new();
     catalog.register(Factory).unwrap();
+    catalog.register(FailingFactory).unwrap();
+    catalog.register(PendingFactory).unwrap();
     catalog.register(IncludeFactory).unwrap();
     let runtime = Runtime::new().unwrap();
     let loader_fiber = runtime
@@ -308,5 +383,92 @@ async fn subscriptions_are_shared_and_close_on_unload_without_affecting_new_inst
         Err(LoaderControlError::LoaderUnavailable)
     ));
     new_fiber.dispose_wait().await.unwrap();
+    runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn unrelated_plugin_toggle_succeeds_with_existing_failed_entry() {
+    let _guard = FAILURE_TEST_LOCK.lock().await;
+    let (runtime, dir, _fibers) = harness_with_failure(true).await;
+    let manager = runtime.root().get(PLUGIN_MANAGER).unwrap();
+    let before = manager.list_plugins().await.unwrap();
+    let failed = before
+        .iter()
+        .find(|entry| entry.path == "include:broken")
+        .unwrap();
+    assert_eq!(failed.state, Some(FiberState::Failed));
+    let attempts = FAIL_ATTEMPTS.load(std::sync::atomic::Ordering::SeqCst);
+    manager
+        .set_plugin_enabled("include:one", false)
+        .await
+        .unwrap();
+    let patch = std::fs::read_to_string(dir.path().join("user.patches.toml")).unwrap();
+    assert!(patch.contains("disabled = true"));
+    manager
+        .set_plugin_enabled("include:one", true)
+        .await
+        .unwrap();
+    assert_eq!(
+        FAIL_ATTEMPTS.load(std::sync::atomic::Ordering::SeqCst),
+        attempts
+    );
+    let after = manager.list_plugins().await.unwrap();
+    let failed = after
+        .iter()
+        .find(|entry| entry.path == "include:broken")
+        .unwrap();
+    assert_eq!(failed.state, Some(FiberState::Failed));
+    let one = after
+        .iter()
+        .find(|entry| entry.path == "include:one")
+        .unwrap();
+    assert!(one.enabled);
+    assert_eq!(one.state, Some(FiberState::Active));
+    runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn explicitly_enabling_existing_failed_target_reports_failure() {
+    let _guard = FAILURE_TEST_LOCK.lock().await;
+    let (runtime, _dir, _fibers) = harness_with_failure(true).await;
+    let manager = runtime.root().get(PLUGIN_MANAGER).unwrap();
+    let error = manager
+        .set_plugin_enabled("include:broken", true)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("unsupported platform"));
+    runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn enable_pending_plugin_persists_and_activates_when_dependency_appears() {
+    let (runtime, dir, _fibers) = harness().await;
+    let manager = runtime.root().get(PLUGIN_MANAGER).unwrap();
+    manager
+        .set_plugin_enabled("include:waiting", true)
+        .await
+        .unwrap();
+    let entry = manager
+        .list_plugins()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|p| p.path == "include:waiting")
+        .unwrap();
+    assert!(entry.enabled);
+    assert_eq!(entry.state, Some(FiberState::Pending));
+    let patch = std::fs::read_to_string(dir.path().join("user.patches.toml")).unwrap();
+    assert!(patch.contains("disabled = false"));
+    runtime.root().provide(PENDING_DEP, ()).unwrap();
+    runtime.settle().await;
+    let entry = manager
+        .list_plugins()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|p| p.path == "include:waiting")
+        .unwrap();
+    assert!(entry.enabled);
+    assert_eq!(entry.state, Some(FiberState::Active));
     runtime.shutdown().await.unwrap();
 }

@@ -330,7 +330,10 @@ impl LayerEngine {
                         return Err(LoaderControlError::ConfigNotEditable);
                     }
                     edit.store(&document).await.map_err(user_layer_error)?;
-                    if let Err(error) = engine.apply_include_patches(tx, &document).await {
+                    if let Err(error) = engine
+                        .apply_include_patches(tx, &document, enabled.then_some(full_path.as_str()))
+                        .await
+                    {
                         return Err(engine
                             .restore_user_after_failure(&edit, &previous, error)
                             .await);
@@ -394,7 +397,7 @@ impl LayerEngine {
                         return Err(LoaderControlError::ConfigNotEditable);
                     }
                     edit.store(&document).await.map_err(user_layer_error)?;
-                    if let Err(error) = engine.apply_include_patches(tx, &document).await {
+                    if let Err(error) = engine.apply_include_patches(tx, &document, None).await {
                         return Err(engine
                             .restore_user_after_failure(&edit, &previous, error)
                             .await);
@@ -430,6 +433,7 @@ impl LayerEngine {
         &self,
         tx: &ConfigTransaction,
         document: &UserPatchDocument,
+        required: Option<&str>,
     ) -> Result<(), LoaderControlError> {
         let (mut include, revision) = self.include_config(tx).await?;
         let patches = self.runtime_patches(document).await?;
@@ -437,9 +441,17 @@ impl LayerEngine {
         include.patches = patches;
         let config = toml::Value::try_from(&include)
             .map_err(|_| user_layer_error("无法序列化 Include 配置以同步 patches".into()))?;
-        tx.commit_entry_config(&self.include_root, revision, config)
-            .await
-            .map_err(map_form_edit_error)?;
+        match required {
+            Some(required) => {
+                tx.commit_entry_config_requiring(&self.include_root, revision, config, required)
+                    .await
+            }
+            None => {
+                tx.commit_entry_config(&self.include_root, revision, config)
+                    .await
+            }
+        }
+        .map_err(map_form_edit_error)?;
         tx.await_idle().await.map_err(map_form_edit_error)?;
         Ok(())
     }
@@ -494,7 +506,7 @@ impl LayerEngine {
                 Box::pin(async move {
                     let edit = engine.store.begin_edit().await.map_err(user_layer_error)?;
                     let document = edit.load().await.map_err(user_layer_error)?;
-                    engine.apply_include_patches(tx, &document).await
+                    engine.apply_include_patches(tx, &document, None).await
                 })
             })
             .await
