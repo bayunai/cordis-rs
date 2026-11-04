@@ -171,9 +171,29 @@ ctx.logger()?.info("hello");
 - `Loading` / `Unloading` 由内部协调器收敛，不会因取消而粘滞。
 - `apply` 失败 → `FiberState::Failed`，句柄仍返回；查 `last_error()`。
 - 热更新：同 Key → `fiber.replace(new)`；跨 Key → `Runtime::unmount(old)` 后再 `plugin(new)`。
-- `unmount(自身 Key)` 不可在该插件的 `apply` / inject / spawn / async disposer 内调用（`UnmountReentrant`）；卸载无关 Key 可以。`dispose_now` 与 `dispose_wait` 在释放完成前均保留归属，两条路径下重入判定一致。
+- 生命周期回调内不得等待会反向等待自身 Scope 的 `dispose_wait` / `restart` / `replace`（`LifecycleReentrant { scope }`）。`unmount` 还拒绝同树或经服务依赖反向等待当前回调的目标（`UnmountReentrant`）；无关目标仍可卸载。同步及异步清理也受此检查约束。
 - `restart()`、`replace()` 和依赖 Provider 变更会先进入 `Unloading`，等待旧 Effect 的受控任务退出，再重新激活；不要在任务取消后继续使用旧实例资源。
 - 宿主可通过 `Runtime::subscribe_fiber_states()` 观察状态；这是可能丢失的广播流，收到 `Lagged` 后应使用 `Runtime::diagnostics()` 重建当前状态。
+
+## 依赖服务的清理
+
+需要在清理阶段使用服务时，必须通过 `Plugin::inject()` 或 `Context::inject()` 声明依赖。Core 会让提供者等本轮消费者回调、子 Scope、清理和受控任务全部完成，再取消提供者任务及释放资源。这个顺序也适用于兄弟插件和普通 Effect 提供的服务。普通 `get()` 不建立生命周期依赖；保留 `Arc` 只能保留对象，不能代替依赖声明。
+
+在激活时取得引用，并将其捕获到清理闭包中。以下片段假设 `QUEUE` 的服务提供返回 `Result<(), CoreError>` 的异步 `flush()`：
+
+```rust
+ctx.inject([QUEUE.id()], |services, effect| async move {
+    let queue = services.get(QUEUE)?;
+    effect.on_dispose_async(move || async move {
+        queue.flush().await
+    })?;
+    Ok(())
+})?;
+```
+
+插件级依赖则在 `Plugin::inject()` 中声明，并于 `apply()` 中通过 `ctx.get(KEY)?` 捕获服务。提供者进入 retiring 后，新的严格 `Context::get()` 不再返回该服务；清理闭包应使用已经取得的引用，不在清理时重新读取 Context。服务因网络或其他外部故障不可用，不属于 Core 的释放顺序保证。
+
+每次激活独立绑定 Provider 实例与执行 Scope，旧执行完整结束后才允许下一轮激活。派生注入可通过 `InjectionHandle::state()` 观察 `Loading` / `Unloading`。依赖与资源归属形成循环等待时，Core 返回 `DependencyCycle { scopes }` 并拒绝执行候选回调；不要通过重试、旁路读取或隐藏错误绕过它。
 
 ## 配置更新
 
@@ -240,11 +260,11 @@ impl ExtensionFactory for GreeterFactory {
 
 ## 任务与取消
 
-- 长期监听、循环和后台刷新用 `EffectContext::spawn`，并响应 `CancellationToken`。
+- 长期监听、循环和后台刷新用 `EffectContext::spawn`，并响应 `CancellationToken`。子 Scope 令牌独立；取消由释放协调器按依赖顺序推进，父 Scope 请求释放不会立即取消尚在服务消费者的提供者任务。
 - 连接关闭、flush、注销等一次性收尾用 `on_dispose_async`（Scope 已进入释放阶段，不接收取消令牌；多个 disposer **严格串行 LIFO**）。
 - 需要确认资源真实释放或获取失败时必须 `await dispose_wait()` / `unmount()` / `shutdown()`。
-- 单纯 `dispose()` 是 fire-and-forget；之后仍可 `dispose_wait()` 等待同一轮完成并读取相同错误。非 Tokio 线程也可调用 `dispose()`（由 Runtime 创建时捕获的 Handle 调度）。
-- `Drop` / 未 `shutdown` 的进程退出不会启动尚未执行的 async disposer；受控关闭路径才会完整执行。
+- 单纯 `dispose()` 是 fire-and-forget：立即禁止新工作，取消及同步、异步清理由协调器按依赖顺序执行；不要依赖 `on_dispose` 在返回前运行。之后仍可 `dispose_wait()` 等待同一轮完成并读取相同错误，取消等待不会取消协调器。非 Tokio 线程也可调用 `dispose()`（由 Runtime 创建时捕获的 Handle 调度）。
+- 仅 Drop Runtime 或未 `shutdown` 的进程退出不会启动尚未执行的 async disposer，也不保证依赖卸载顺序；受控关闭路径才会完整执行。清理失败仍会继续释放其他资源，同一错误经多条等待路径汇合时只报告一次。
 - `dispose` 上收释放协调；热路径用 `dispose_wait` / `replace`。
 
 ## Timer（`cordis-plugin-timer`）
@@ -283,3 +303,5 @@ Runtime shutdown 都会停止未触发回调；等待中的 `sleep` / `ticks` �
 - 不要实现 Manifest、Loader/HMR——属 Loader 层。插件配置 Schema 由 Factory 的 `Config` 类型声明，并由 Loader 在调用 `prepare` 前进行类型化反序列化；业务约束由 `prepare` 校验。
 - `intercept` 仅派生配置（`ConfigKey`），不可替代 `provide` / Service。
 - 不要给 `Context` 做 Timer mixin；未挂载 `TimerPlugin` 时不得假定计时器可用。
+
+Provider 应注册在实际拥有服务资源的 Scope。该 Scope 的普通子 Effect 资源也会等待消费者完成；直接和传递消费者分支必须先清理。将服务注册到 Root 等过宽 Scope，可能与其他服务的资源归属形成循环等待并得到 `DependencyCycle`。宿主可通过 `let owner = root.effect()?; owner.provide(KEY, service)?;` 为服务建立独立资源归属。

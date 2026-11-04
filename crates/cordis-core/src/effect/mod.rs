@@ -14,7 +14,7 @@ use std::{
     },
 };
 
-use tokio::{runtime::Handle, task::JoinHandle};
+use tokio::runtime::Handle;
 use tokio_util::sync::CancellationToken;
 
 use dispose::DisposeCompletion;
@@ -54,6 +54,9 @@ pub(super) struct EffectScopeInner {
     /// 并发调用者必须等待同一轮结果。先写入它再置 `disposed`，避免父 Scope
     /// 观察到“已释放但尚未有 Completion”的中间状态。
     completion: Mutex<Option<Arc<DisposeCompletion>>>,
+    registry: Mutex<Weak<crate::registry::Registry>>,
+    executions: Mutex<usize>,
+    execution_finished: tokio::sync::Notify,
 }
 
 /// 一个可撤销的资源所有权边界。
@@ -84,6 +87,9 @@ impl EffectScope {
                 lineage,
                 resources: Mutex::new(Resources::default()),
                 completion: Mutex::new(None),
+                registry: Mutex::new(Weak::new()),
+                executions: Mutex::new(0),
+                execution_finished: tokio::sync::Notify::new(),
             }),
         }
     }
@@ -100,9 +106,11 @@ impl EffectScope {
         let child = Self::new(
             name,
             self.inner.handle.clone(),
-            self.inner.cancellation.child_token(),
+            CancellationToken::new(),
             lineage,
         );
+        *child.inner.registry.lock().expect("scope registry") =
+            self.inner.registry.lock().expect("scope registry").clone();
         if let Ok(mut parent) = child.inner.parent.lock() {
             *parent = Some(Arc::downgrade(&self.inner));
         }
@@ -117,6 +125,43 @@ impl EffectScope {
         }
         resources.children.push(child.clone());
         child
+    }
+
+    pub(crate) fn attach_registry(&self, registry: &Arc<crate::registry::Registry>) {
+        *self.inner.registry.lock().expect("scope registry") = Arc::downgrade(registry);
+    }
+
+    pub(crate) fn registry(&self) -> Option<Arc<crate::registry::Registry>> {
+        self.inner
+            .registry
+            .lock()
+            .expect("scope registry")
+            .upgrade()
+    }
+
+    pub(crate) fn contains(&self, other: &Self) -> bool {
+        self.ptr_eq(other) || lineage_contains(&other.inner.lineage, self.id())
+    }
+
+    pub(crate) fn begin_execution(&self) -> Result<ExecutionGuard, CoreError> {
+        let mut count = self.inner.executions.lock().expect("executions");
+        if self.is_disposed() {
+            return Err(CoreError::ContextDisposed);
+        }
+        *count += 1;
+        Ok(ExecutionGuard(self.clone()))
+    }
+
+    pub(crate) async fn wait_executions(&self) {
+        loop {
+            let notified = self.inner.execution_finished.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if *self.inner.executions.lock().expect("executions") == 0 {
+                return;
+            }
+            notified.await;
+        }
     }
 
     pub(crate) fn runtime_handle(&self) -> Handle {
@@ -155,6 +200,9 @@ impl EffectScope {
 
     pub(crate) fn is_disposed(&self) -> bool {
         self.inner.disposed.load(Ordering::Acquire)
+            || self
+                .parent_inner()
+                .is_some_and(|parent| EffectScope { inner: parent }.is_disposed())
     }
 
     pub(crate) fn is_cancelled(&self) -> bool {
@@ -206,7 +254,7 @@ impl EffectScope {
             cleanup();
             return;
         };
-        if self.inner.disposed.load(Ordering::Acquire) {
+        if self.is_disposed() && *self.inner.executions.lock().expect("executions") == 0 {
             drop(resources);
             cleanup();
             return;
@@ -222,7 +270,7 @@ impl EffectScope {
         let Ok(mut resources) = self.inner.resources.lock() else {
             return Err(CoreError::ContextDisposed);
         };
-        if self.inner.disposed.load(Ordering::Acquire) {
+        if self.is_disposed() && *self.inner.executions.lock().expect("executions") == 0 {
             return Err(CoreError::ContextDisposed);
         }
         resources
@@ -231,17 +279,31 @@ impl EffectScope {
         Ok(())
     }
 
-    pub(crate) fn push_task(&self, task: JoinHandle<()>) {
-        let Ok(mut resources) = self.inner.resources.lock() else {
-            task.abort();
-            return;
-        };
-        if self.inner.disposed.load(Ordering::Acquire) {
-            drop(resources);
-            task.abort();
-            return;
+    /// Start work only after it has atomically joined this Scope's resource set.
+    pub(crate) fn spawn_task(
+        &self,
+        future: impl Future<Output = ()> + Send + 'static,
+    ) -> Result<(), CoreError> {
+        let mut resources = self
+            .inner
+            .resources
+            .lock()
+            .map_err(|_| CoreError::ContextDisposed)?;
+        if self.is_disposed() {
+            return Err(CoreError::ContextDisposed);
         }
+        let task = self.inner.handle.spawn(future);
         resources.work.push(ManagedWork::Task(task));
+        Ok(())
+    }
+}
+
+pub(crate) struct ExecutionGuard(EffectScope);
+
+impl Drop for ExecutionGuard {
+    fn drop(&mut self) {
+        *self.0.inner.executions.lock().expect("executions") -= 1;
+        self.0.inner.execution_finished.notify_waiters();
     }
 }
 

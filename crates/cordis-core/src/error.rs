@@ -40,6 +40,10 @@ pub enum CoreError {
     EventModeMismatch { event: &'static str },
     #[error("事件 {event} 的答案类型已绑定其他 Rust 类型")]
     EventAnswerTypeConflict { event: &'static str },
+    #[error("服务依赖与资源归属形成循环等待: {scopes:?}")]
+    DependencyCycle { scopes: Vec<u64> },
+    #[error("生命周期等待会反向等待当前 Scope {scope}")]
+    LifecycleReentrant { scope: u64 },
     #[error("注入依赖不能为空")]
     EmptyInjection,
     #[error("运行时调度器不可用；请在 Tokio Runtime 中创建 Runtime")]

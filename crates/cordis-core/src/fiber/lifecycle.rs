@@ -15,11 +15,14 @@ use crate::{
 use std::sync::{Arc, atomic::Ordering};
 
 impl Fiber {
+    /// 请求卸载；服务立即停止接受新绑定，资源在消费者完整结束后释放。
     pub fn dispose(&mut self) {
         self.inner.dispose_now();
     }
 
+    /// 等待本轮卸载完整结束；取消等待不中断释放，反向等待当前回调时明确报错。
     pub async fn dispose_wait(&mut self) -> Result<(), CoreError> {
+        self.inner.check_lifecycle_wait()?;
         self.inner.dispose_wait_inner().await
     }
 
@@ -30,6 +33,7 @@ impl Fiber {
         if self.is_disposed() {
             return Err(CoreError::FiberDisposed);
         }
+        self.inner.check_lifecycle_wait()?;
         let completion = self.inner.start_lifecycle(LifecycleOp::Restart)?;
         completion.wait().await
     }
@@ -44,6 +48,7 @@ impl Fiber {
         if self.is_disposed() {
             return Err(CoreError::FiberDisposed);
         }
+        self.inner.check_lifecycle_wait()?;
         let metadata = read_metadata(plugin.as_ref())?;
         if metadata.key != self.inner.plugin_key {
             return Err(CoreError::PluginKeyMismatch {
@@ -69,6 +74,19 @@ enum TerminalRelease {
 }
 
 impl FiberInner {
+    pub(crate) fn check_lifecycle_wait(&self) -> Result<(), CoreError> {
+        let scope = self
+            .ownership
+            .lock()
+            .expect("ownership")
+            .live_scope()
+            .cloned();
+        if let Some(scope) = scope {
+            scope.check_wait()?;
+        }
+        Ok(())
+    }
+
     fn store_dispose_result(&self, result: Result<(), CoreError>) {
         let mut slot = self.dispose_result.lock().expect("dispose_result");
         if slot.is_none() {
@@ -304,14 +322,6 @@ impl FiberInner {
             Ok(())
         } else {
             Err(CoreError::FiberDisposed)
-        }
-    }
-
-    pub(crate) async fn unload_to_pending_wait(self: &Arc<Self>) -> Result<(), CoreError> {
-        match self.start_lifecycle(LifecycleOp::Unload) {
-            Ok(completion) => completion.wait().await,
-            Err(CoreError::FiberBusy) => Err(CoreError::FiberBusy),
-            Err(error) => Err(error),
         }
     }
 }

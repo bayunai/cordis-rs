@@ -52,6 +52,8 @@ impl From<InjectionPhase> for FiberStateSnapshot {
     fn from(value: InjectionPhase) -> Self {
         match value {
             InjectionPhase::Pending => Self::Pending,
+            InjectionPhase::Loading => Self::Loading,
+            InjectionPhase::Unloading => Self::Unloading,
             InjectionPhase::Active => Self::Active,
             InjectionPhase::Failed => Self::Failed,
             InjectionPhase::Disposed => Self::Disposed,

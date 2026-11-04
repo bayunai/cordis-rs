@@ -1,9 +1,10 @@
 //! Effect 清理与等待协调。
 //!
-//! 同步 cleanup 立即执行；等待顺序为：子 Scope 完成 → 当前异步 disposer LIFO → 当前受控任务。
+//! 先关闭新绑定并排空消费者，再取消任务并执行同步/异步清理。
 //! 资源集合定义见 `resources`，本文件只管处置时序。
 
 use std::{
+    collections::BTreeMap,
     panic::{AssertUnwindSafe, catch_unwind},
     sync::{Arc, Weak, atomic::Ordering},
 };
@@ -21,9 +22,14 @@ use super::{
 use futures_util::FutureExt;
 use tokio::{sync::Notify, task::JoinHandle};
 
+pub(super) type DisposalErrors = BTreeMap<u64, Vec<String>>;
+
+static NEXT_COMPLETION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 pub(super) struct DisposeCompletion {
+    id: u64,
     notify: Notify,
-    result: std::sync::Mutex<Option<Result<(), Vec<String>>>>,
+    result: std::sync::Mutex<Option<DisposalErrors>>,
     /// 保持释放协调任务存活，直至本对象被释放。
     retain: std::sync::Mutex<Option<JoinHandle<()>>>,
 }
@@ -31,6 +37,7 @@ pub(super) struct DisposeCompletion {
 impl DisposeCompletion {
     pub(super) fn new() -> Arc<Self> {
         Arc::new(Self {
+            id: NEXT_COMPLETION.fetch_add(1, Ordering::Relaxed),
             notify: Notify::new(),
             result: std::sync::Mutex::new(None),
             retain: std::sync::Mutex::new(None),
@@ -42,34 +49,50 @@ impl DisposeCompletion {
     }
 
     pub(super) fn finish(&self, result: Result<(), Vec<String>>) {
-        {
-            let mut slot = self.result.lock().expect("dispose completion");
-            if slot.is_some() {
-                return;
-            }
-            *slot = Some(result);
+        let report = match result {
+            Ok(()) => DisposalErrors::new(),
+            Err(errors) => BTreeMap::from([(self.id, errors)]),
+        };
+        self.finish_report(report, None);
+    }
+
+    fn finish_report(
+        &self,
+        report: DisposalErrors,
+        registry: Option<&Arc<crate::registry::Registry>>,
+    ) {
+        let mut slot = self.result.lock().expect("dispose completion");
+        if slot.is_some() {
+            return;
         }
+        *slot = Some(report);
+        if let Some(registry) = registry {
+            registry.mark_dirty();
+        }
+        drop(slot);
         self.notify.notify_waiters();
     }
 
-    pub(super) async fn wait(self: &Arc<Self>) -> Result<(), CoreError> {
+    async fn report(self: &Arc<Self>) -> DisposalErrors {
         loop {
-            // 先 pin+enable 登记 waiter，再读结果，避免 finish() 夹在检查与 await 之间丢唤醒。
             let notified = self.notify.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            {
-                let slot = self.result.lock().expect("dispose completion");
-                if let Some(result) = slot.as_ref() {
-                    return match result {
-                        Ok(()) => Ok(()),
-                        Err(errors) => Err(CoreError::DisposeFailed {
-                            errors: errors.clone(),
-                        }),
-                    };
-                }
+            if let Some(report) = self.result.lock().expect("dispose completion").clone() {
+                return report;
             }
             notified.await;
+        }
+    }
+
+    pub(super) async fn wait(self: &Arc<Self>) -> Result<(), CoreError> {
+        let report = self.report().await;
+        if report.is_empty() {
+            Ok(())
+        } else {
+            Err(CoreError::DisposeFailed {
+                errors: report.into_values().flatten().collect(),
+            })
         }
     }
 }
@@ -133,13 +156,9 @@ impl Drop for DisposeFinishGuard {
     }
 }
 
-async fn wait_child_releases(children: Vec<Arc<DisposeCompletion>>, errors: &mut Vec<String>) {
-    for child in children {
-        match child.wait().await {
-            Ok(()) => {}
-            Err(CoreError::DisposeFailed { errors: mut nested }) => errors.append(&mut nested),
-            Err(other) => errors.push(other.to_string()),
-        }
+async fn wait_releases(releases: Vec<Arc<DisposeCompletion>>, report: &mut DisposalErrors) {
+    for completion in releases {
+        report.extend(completion.report().await);
     }
 }
 
@@ -187,6 +206,7 @@ impl EffectScope {
     }
 
     pub(crate) async fn dispose_wait(&self) -> Result<(), CoreError> {
+        self.check_wait()?;
         self.begin_dispose(DisposePolicy::AwaitLocal).wait().await
     }
 
@@ -202,43 +222,29 @@ impl EffectScope {
             }
             let completion = DisposeCompletion::new();
             *slot = Some(completion.clone());
+            self.inner.disposed.store(true, Ordering::Release);
             completion
         };
-        self.inner.disposed.store(true, Ordering::Release);
-        self.inner.cancellation.cancel();
-
-        let Ok(mut resources) = self.inner.resources.lock() else {
-            completion.finish(Ok(()));
-            self.detach_from_parent();
-            return completion;
-        };
-        let children = std::mem::take(&mut resources.children);
-        let child_errors = std::mem::take(&mut resources.child_errors);
-        let cleanups = std::mem::take(&mut resources.cleanups);
-        let async_disposers = std::mem::take(&mut resources.async_disposers);
-        let existing_work = std::mem::take(&mut resources.work);
-        drop(resources);
-
-        // children 在本 Scope 的释放线性化点被摘出。对子 Scope 调用同一个入口，
-        // 无论它是否已自行开始释放，都能取得稳定 Completion。
+        let consumers = self
+            .registry()
+            .map(|registry| registry.retire_scope(self))
+            .unwrap_or_default();
+        let children = self
+            .inner
+            .resources
+            .lock()
+            .expect("resources")
+            .children
+            .clone();
         let child_releases = children
             .into_iter()
             .rev()
             .map(|child| child.begin_dispose(DisposePolicy::AwaitLocal))
-            .collect::<Vec<_>>();
-        let mut sync_errors = child_errors;
-        for cleanup in cleanups.into_iter().rev() {
-            run_sync_cleanup_collect(cleanup, &mut sync_errors);
-        }
-
-        let mut tasks = Vec::new();
-        for item in existing_work.into_iter().chain(self.take_work_shallow()) {
-            match item {
-                ManagedWork::Task(task) => tasks.push(task),
-            }
-        }
-
-        let handle = self.inner.handle.clone();
+            .collect();
+        let consumer_releases = consumers
+            .into_iter()
+            .map(|consumer| consumer.begin_dispose(DisposePolicy::HoistToParent))
+            .collect();
         let propagate_error_to_parent = match policy {
             DisposePolicy::HoistToParent => true,
             DisposePolicy::AwaitLocal => self
@@ -247,55 +253,107 @@ impl EffectScope {
                 .is_some_and(|parent| !parent.is_root()),
         };
         let completion_for_task = completion.clone();
-        let scope_for_frame = self.clone();
-        let scope_for_worker = scope_for_frame.clone();
-        let supervisor = handle.spawn(async move {
+        let scope = self.clone();
+        let supervisor = self.inner.handle.spawn(async move {
             let mut guard = DisposeFinishGuard {
                 completion: completion_for_task.clone(),
                 finished: false,
             };
+            let worker_scope = scope.clone();
+            let origin = completion_for_task.id;
             let worker = tokio::spawn(async move {
-                let mut errors = sync_errors;
-                wait_child_releases(child_releases, &mut errors).await;
+                let mut report = DisposalErrors::new();
+                wait_releases(consumer_releases, &mut report).await;
+                // Provider tasks remain operational until all consumers have exited.
+                wait_releases(child_releases, &mut report).await;
+                worker_scope.inner.cancellation.cancel();
+                worker_scope.wait_executions().await;
+                let (cleanups, async_disposers, work) = {
+                    let mut resources = worker_scope.inner.resources.lock().expect("resources");
+                    report.extend(std::mem::take(&mut resources.child_errors));
+                    resources.children.clear();
+                    (
+                        std::mem::take(&mut resources.cleanups),
+                        std::mem::take(&mut resources.async_disposers),
+                        std::mem::take(&mut resources.work),
+                    )
+                };
+                let mut errors = Vec::new();
+                for cleanup in cleanups.into_iter().rev() {
+                    USER_LIFECYCLE_CALLBACK.sync_scope(
+                        LifecycleFrame {
+                            scope: worker_scope.clone(),
+                        },
+                        || run_sync_cleanup_collect(cleanup, &mut errors),
+                    );
+                }
                 for disposer in async_disposers.into_iter().rev() {
-                    if let Err(error) = run_async_disposer(disposer, &scope_for_worker).await {
+                    if let Err(error) = run_async_disposer(disposer, &worker_scope).await {
                         errors.push(error);
                     }
                 }
-                for join in tasks {
-                    if let Err(error) = join.await {
+                for item in work {
+                    let ManagedWork::Task(task) = item;
+                    if let Err(error) = task.await {
                         errors.push(format!("managed task join failed: {error}"));
                     }
                 }
-                if errors.is_empty() {
-                    Ok(())
-                } else {
-                    Err(errors)
+                if !errors.is_empty() {
+                    report.insert(origin, errors);
                 }
+                report
             });
-            let result = match worker.await {
-                Ok(result) => result,
-                Err(error) => Err(vec![format!("dispose coordinator join failed: {error}")]),
+            let report = match worker.await {
+                Ok(report) => report,
+                Err(error) => BTreeMap::from([(
+                    origin,
+                    vec![format!("dispose coordinator join failed: {error}")],
+                )]),
             };
-            // 在 finish 之前于父 resources 锁内原子摘除；仍在 children 中则存款，
-            // 已被父 begin_dispose 摘走则禁止再写入，错误只经本 Completion 传递一次。
-            let deposit = match (&result, propagate_error_to_parent) {
-                (Err(errors), true) => Some(errors.as_slice()),
-                _ => None,
-            };
-            scope_for_frame.handoff_detach_from_parent(deposit);
-            completion_for_task.finish(result);
+            scope.handoff_detach_from_parent(if propagate_error_to_parent {
+                Some(&report)
+            } else {
+                None
+            });
+            let registry = scope.registry();
+            if let Some(registry) = &registry {
+                registry.release_bindings(&scope);
+            }
+            completion_for_task.finish_report(report, registry.as_ref());
             guard.finished = true;
         });
         completion.attach_coordinator(supervisor);
         completion
     }
 
-    pub(super) fn take_work_shallow(&self) -> Vec<ManagedWork> {
-        let Ok(mut resources) = self.inner.resources.lock() else {
-            return Vec::new();
-        };
-        std::mem::take(&mut resources.work)
+    pub(crate) fn check_wait(&self) -> Result<(), CoreError> {
+        if let Some(registry) = self.registry() {
+            registry.check_lifecycle_wait(self)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn release_result(&self) -> Option<Result<(), CoreError>> {
+        let completion = self
+            .inner
+            .completion
+            .lock()
+            .expect("dispose completion")
+            .clone()?;
+        completion
+            .result
+            .lock()
+            .expect("dispose completion")
+            .as_ref()
+            .map(|report| {
+                if report.is_empty() {
+                    Ok(())
+                } else {
+                    Err(CoreError::DisposeFailed {
+                        errors: report.values().flatten().cloned().collect(),
+                    })
+                }
+            })
     }
 
     pub(super) fn parent_inner(&self) -> Option<Arc<EffectScopeInner>> {
@@ -308,7 +366,7 @@ impl EffectScope {
 
     /// 从父 children 摘除自身；若仍在列表中且 `deposit_errors` 有值则同锁转入 `child_errors`。
     /// 父已 `take(children)` 时不做存款，由父 wait 本 Completion 聚合错误。
-    fn handoff_detach_from_parent(&self, deposit_errors: Option<&[String]>) {
+    fn handoff_detach_from_parent(&self, deposit_errors: Option<&DisposalErrors>) {
         let parent = self
             .inner
             .parent
@@ -330,7 +388,7 @@ impl EffectScope {
                 }
             });
             if removed && let Some(errors) = deposit_errors {
-                resources.child_errors.extend(errors.iter().cloned());
+                resources.child_errors.extend(errors.clone());
             }
         }
     }

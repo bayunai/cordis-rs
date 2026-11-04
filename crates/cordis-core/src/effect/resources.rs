@@ -21,7 +21,7 @@ pub(super) enum ManagedWork {
 pub(super) struct Resources {
     pub(super) children: Vec<EffectScope>,
     /// 已独立完成释放的子 Scope 错误；父 Scope 日后释放时仍需向上聚合。
-    pub(super) child_errors: Vec<String>,
+    pub(super) child_errors: super::dispose::DisposalErrors,
     pub(super) cleanups: Vec<Box<dyn FnOnce() + Send>>,
     pub(super) async_disposers: Vec<AsyncDisposer>,
     pub(super) work: Vec<ManagedWork>,

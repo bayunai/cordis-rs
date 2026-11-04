@@ -5,7 +5,7 @@
 | 侧 | 来源 | 说明 |
 | --- | --- | --- |
 | **TS 核心** | [deepseek-harness](https://github.com/deepseek-ai/deepseek-harness) `vendor/cordis`（`@deepseek-ai/cordis`） | Context / Fiber / Registry / Reflect / Events / Service / Logger |
-| **Rust 核心** | 本仓库 `crates/cordis-core` | Runtime / Context / Fiber / Effect / Event / Service / Isolation |
+| **Rust 核心** | 本仓库 `crates/cordis-core` | Runtime / Context / Fiber / Effect / Event / Service / Isolation / Logger |
 
 **不含** loader、HMR、include、timer 等扩展包（两边都放在核心外）。
 
@@ -48,6 +48,8 @@ vendor/
 | provide / get / inject（AND 全齐才就绪） | ✅ | ✅ |
 | Plugin → Fiber 状态机（Pending / Loading / Active / Failed / Unloading / Disposed） | ✅ | ✅ |
 | Effect + dispose（可异步） | ✅ | ✅ |
+| 提供者等待已绑定消费者清理 | Provider `dependents` → Fiber unload | Provider 实例 → 消费者执行 Scope；覆盖插件与派生注入 |
+| 内置日志总线与独立 Console exporter | LoggerService + logger-console | Runtime LoggerService + cordis-plugin-logger-console |
 | 事件：emit / parallel / serial / waterfall；prepend / global / once | ✅ | ✅ |
 | 同插件多实例归组与批量卸载 | `registry.delete` | `Runtime::unmount` |
 | 依赖变化时 unload → 再激活 | epoch / inertia | provider id 集合 + scheduler |
@@ -57,7 +59,6 @@ vendor/
 | 能力 | TS 位置 / 行为 | Rust 现状 | 建议 |
 | --- | --- | --- | --- |
 | Proxy + Reflect | `reflect.ts`：`ctx.foo` 穿透、`mixin` / `accessor`、`internal/get\|set` | 无；显式 `get` / `provide` | **不进核心**（刻意） |
-| 内置 Logger | `logger.ts` 整模块 | 无 | 宿主或扩展接 tracing/log |
 | Service 基类 | `service.ts`：构造时自动 provide、可选 `check`、可调用 Service | `ServiceKey` / `Services` + `provide_checked` / `ProviderHandle` | 不进 Core；扩展层有重复样板后再封装 |
 | 多形态 Plugin | fn / class / `{apply}`；`@Inject`；`Config` StandardSchema | 单一 `Plugin` trait + `PluginKey` | 当前不做宏；待真实插件重复样板稳定后，宏只生成 key / inject |
 | `fiber.update(config)` | 校验后 restart + `internal/update` | 无；宿主校验后 **`Fiber::replace`** | 保持现状 |
@@ -102,7 +103,9 @@ vendor/
 **provide**
 
 - **TS**：包在 `fiber.effect`；写入 `reflect.store[isolateKey]`；ACTIVE 时 `notify`；dispose 删 store 并 `await` 下游 Fiber。
-- **Rust**：`Registry::provide` 挂在 EffectScope；`provide_checked` 会保存无阻塞状态检查，并由 `ProviderHandle::refresh()` 在健康状态变化时标脏；`on_dispose` → `remove_provider` → `mark_dirty`。下游由 scheduler 驱动，不在 disposer 内直接 await 依赖方。
+- **Rust**：`Registry::provide` 挂在实际注册的 EffectScope；`provide_checked` 由 `ProviderHandle::refresh()` 刷新本地可用性。释放请求先将 Provider 标记 retiring，关闭新绑定并独立驱动消费者卸载；提供者等待消费者回调、子 Scope、清理及受控任务结束后，才取消自身任务和释放资源。retiring 槽位继续遮蔽父级，完成撤销后恢复正常解析。
+
+Rust 只跟踪 `Plugin::inject` / `Context::inject` 的显式依赖；解析与执行 Scope 绑定同锁完成，Loading 与失败清理也保留绑定。`get()` 和引用克隆不建立绑定。清理使用已捕获的引用，不放宽严格 `get()`；依赖与父子等待成环时报 `DependencyCycle`，反向生命周期等待报 `LifecycleReentrant`（`unmount` 使用 `UnmountReentrant`）。同一释放错误按 Completion 来源去重，调用方取消等待不取消释放协调器；仅 Drop Runtime 不提供受控顺序保证。
 
 ### 3.2 Fiber 生命周期
 
@@ -110,7 +113,7 @@ vendor/
 | --- | --- | --- |
 | 激活 | `_setEpoch` → `_reload` → 跑 plugin callback | `claim_activation` → `apply` → Active |
 | 依赖掉了 | epoch=`INACTIVE` → `_unload` → Pending | Active 且 providers 变 → unload → Pending |
-| 并发串行 | 同 Fiber 的 `inertia` | 全局 scheduler + `EffectOwnership` / handoff |
+| 并发协调 | 同 Fiber 的 `inertia` | scheduler + 独立生命周期/释放协调器；依赖卸载先启动后等待 |
 | 配置更新 | `update(config)`；Schema volatile 字段可原地更新 | 统一 Factory `prepare()`；普通结果构造新实例 → `replace`，热配置结果原子更新 `ConfigRef<Live>`（Core 无 `update(json)`） |
 
 ### 3.3 事件 / 配置 / 隔离
@@ -141,7 +144,7 @@ vendor/
 
 1. **TS Proxy 与 Rust 显式调用**：TS 服务读取可经过 Proxy / Reflect；Rust 必经类型化 `get` 与 Registry 锁。两者谁更快不能只由“有无 Proxy”判断。
 2. **TS 同步 notify 与 Rust 脏标记批处理**：TS 变更时同步扫描相关 Fiber；Rust 通过单一 scheduler 合并变化后重算。后者更利于控制抖动期的生命周期顺序。
-3. **并发模型不同**：TS 通常运行于 Node 事件循环；Rust 插件业务可在 Tokio 上并行，但 Core scheduler 为保证确定性仍串行。
+3. **并发模型不同**：TS 通常运行于 Node 事件循环；Rust 的 Registry 串行选批，独立 Fiber / inject 协调器并发推进；同一实例的旧轮清理结束后才启动下一轮。
 4. **资源成本不同**：Rust 有 `Mutex`、`Arc` 与 async 协调成本；TS 有 Proxy、动态属性与字符串 / Symbol 解析成本。
 
 ### 4.2 基准原则
@@ -155,7 +158,7 @@ vendor/
 ### 不必为对齐而塞进 core
 
 - Proxy / mixin / accessor
-- 内置 Logger
+- 文件、远程等日志 exporter（Runtime 日志总线已在 Core）
 - Config StandardSchema、`@Inject`、多形态 Plugin 入口
 - Generator effect
 - loader / HMR（与 deepseek 一样放扩展层）
@@ -171,7 +174,7 @@ vendor/
 ```text
 cordis-core          ← 库：Runtime 内核（必选）
 cordis-macros        ← 可选糖：声明样板
-宿主 / 扩展          ← loader、日志、HMR、业务插件
+宿主 / 扩展          ← loader、日志 exporter、HMR、业务插件
 ```
 
 核心以 crate 复用；宏只减轻已稳定的样板。热插拔、Provider 就绪语义与依赖重算必须留在库里。
@@ -180,4 +183,4 @@ cordis-macros        ← 可选糖：声明样板
 
 ## 6. 一句话
 
-概念层（Context 树、isolate/intercept、provide/get/inject、Plugin Fiber、事件多模式、Effect 清理）对齐。TS 强在 Proxy / Reflect、Logger、多形态插件与 `update(config)`；Rust 强在显式 Runtime、类型化 Key、`replace`、隔离令牌、结构化 diagnostics、Provider Ready 语义与 async 协调关闭。性能结论必须以同机基准为准，不能只凭抽象结构下定论。
+概念层（Context 树、isolate/intercept、provide/get/inject、Plugin Fiber、事件多模式、Effect 清理）对齐。两边都有内置 Logger 与消费者先卸载的依赖语义；TS 另有 Proxy / Reflect、多形态插件与 `update(config)`，Rust 提供显式 Runtime、类型化 Key、`replace`、隔离令牌、结构化 diagnostics、Provider Ready 语义与受控异步关闭。性能结论必须以同机基准为准，不能只凭抽象结构下定论。

@@ -65,8 +65,8 @@
 ## 响应式注入
 
 1. `Context::inject(deps, callback)` 登记派生 inject fiber；依赖未齐时为 `Pending`。
-2. `provide`、`provide_checked` 的就绪状态变化、Provider 释放都会标记 dirty，调度器串行重算。
-3. 派生 Context 覆盖父 Provider（未隔离 Key）；Effect/Fiber 释放后 Provider 自动回退。
+2. `provide`、`provide_checked` 的就绪状态变化、Provider 释放都会标记 dirty，调度器串行选批，独立协调器推进卸载与激活，无关服务图不互相等待。
+3. 派生 Context 覆盖父 Provider（未隔离 Key）；retiring Provider 保留槽位并遮蔽父级，完成撤销后才恢复父级解析。
 4. 同槽冲突返回 `ServiceConflict`；Runtime 内 ID↔TypeId 永久锁定。
 
 ## Fiber（Plugin 生命周期）
@@ -93,7 +93,7 @@ Context::plugin(Arc<dyn Plugin>)
 - 新实例 `apply` 失败：旧实例已释放，Fiber 进入 `Failed`；Core 不回滚配置或恢复旧实例。
 - `restart()` 只用于配置未变时的重新执行、依赖变化或人工恢复，禁止作为可变配置更新入口。
 
-`Context::inject` 仍返回 `InjectionHandle`（派生依赖），与 Plugin Fiber 分开诊断。
+`Context::inject` 返回 `InjectionHandle`（派生依赖），与 Plugin Fiber 分开诊断；状态包括 `Pending`、`Loading`、`Active`、`Unloading`、`Failed`、`Disposed`。旧回调及其资源完整释放后才运行下一轮回调。
 
 ### Factory 统一构造边界
 
@@ -133,15 +133,23 @@ Factory 是静态 Loader 的必要构造边界：Catalog 根据条目 `name` 找
 
 `Runtime::subscribe_fiber_states()` 提供容量为 1024 的只读广播流，依次报告 `None → Pending` 以及后续状态转换。监听滞后会收到 `broadcast::error::RecvError::Lagged`；宿主应调用 `Runtime::diagnostics()` 重建当前快照。状态通知不能阻塞、拒绝或回滚 Fiber 生命周期。
 
+## 服务依赖与卸载顺序
+
+只有 `Plugin::inject` 与 `Context::inject` 的显式声明建立生命周期绑定。Registry 在同一次锁内解析依赖并绑定 Provider 实例 ID 与本轮消费者执行 Scope；普通 `get()`、`Services` 克隆和 `Arc` 克隆不建立或延长绑定。绑定从用户回调开始前持续到回调、子 Scope、清理和受控任务全部结束，覆盖 Loading、失败及卸载中的执行。
+
+Provider 开始释放时先标记 retiring，拒绝新绑定并请求已有消费者卸载。提供者等待所有消费者完成后，才取消自身任务并运行资源清理。这个顺序适用于普通 Effect、插件 restart / replace / unmount 及 Runtime shutdown；兄弟插件也按声明的服务依赖排序。资源由实际注册 Provider 的 Scope 保护，不由 PluginKey 或 ServiceKey 代替实例归属。
+
+消费者清理使用激活时捕获的服务引用；`Context::get()` 仍严格要求 Provider Ready 且所属 Fiber Active。该保证保护 Core 管理的资源释放，不保证外部故障中的服务继续可用。服务等待关系与 Effect 父子等待关系形成环时返回 `DependencyCycle { scopes }`，不执行候选回调；依赖尚未满足的循环注入保持 Pending。
+
 ## Effect
 
 - 具名 `EffectHandle`（`effect()` / `effect_named`）；记录父子、取消状态与资源计数。
 - Provider / 订阅 / 任务 / 子 Fiber 挂在创建它们的 Effect 或 Fiber 上；Context 只是视图，不能单独释放。
 - 每次 Scope 释放共享一个 `DisposeCompletion`：`dispose()` 后再 `dispose_wait()`（可多次）等待同一轮结果与同一聚合错误。
-- `dispose`：取消 Scope，立即执行同步 `on_dispose`（LIFO），再经 Runtime 捕获的 Tokio Handle 启动释放协调任务；协调器先等待子 Scope 完成，再执行当前 Scope 的 async disposer（串行 LIFO），最后收敛当前 Scope 的后台任务；协调等待上收至父/Root。
-- `dispose_wait`：等待同一 `DisposeCompletion`；失败聚合为 `DisposeFailed`。
-- 长期后台工作用 `spawn`（带取消令牌）；一次性收尾用 `on_dispose_async`（无取消令牌）。
-- `Drop` 为非受控关闭：同步 cleanup + 终止已启动工作，**不**启动尚未执行的 async disposer；完整异步释放须 `dispose_wait` / `shutdown`。
+- `dispose`：立即禁止目标 Scope 树新增工作并发布唯一 Completion，先关闭 Provider 新绑定、请求消费者卸载，再按依赖顺序进入实际清理。消费者完整结束后才取消本 Scope 任务；等待本轮用户回调和子 Scope 结束后，执行同步 `on_dispose`（LIFO）、async disposer（严格串行 LIFO）并收敛受控任务。同步清理不再承诺在 `dispose()` 返回前运行。
+- `dispose_wait`：等待同一 `DisposeCompletion`；取消调用方等待不取消内部释放协调器。失败仍完成其他必要清理，聚合为 `DisposeFailed`；同一 Completion 的错误经依赖和父子路径汇合时按来源去重。
+- 长期后台工作用 `spawn`（带取消令牌）；一次性收尾用 `on_dispose_async`（无取消令牌）。子 Scope 使用独立令牌，由释放协调器按依赖顺序取消，不通过父令牌立即传播取消。
+- 仅 Drop Runtime 为非受控关闭：同步 cleanup + 终止已启动工作，**不**启动尚未执行的 async disposer，也不保证依赖卸载顺序；完整受控释放须 `dispose_wait` / `shutdown`。
 
 ## Event
 
@@ -170,7 +178,7 @@ identity** 的派生配置视图并写入覆盖；`config(key)` 向父链查找�
 
 `Plugin::key()` 声明稳定身份。Runtime 按 Key 归组 Fiber；`Runtime::unmount(key)` 标记卸载中、拒绝同 Key 新挂载、`dispose_wait` 全部实例后清分组；释放错误聚合返回，但仍完成分组清理。
 
-`unmount` 的重入保护按 **Effect Scope 树**判定，而非粗暴禁止所有生命周期回调：若当前用户回调（`apply` / inject / spawn / async disposer）所属 Scope 与任一待卸载 Fiber 将等待的 Scope 同树，立即返回 `UnmountReentrant`，不 cancel、不等待。卸载无关插件的 Key 仍允许。同树判定使用创建时冻结的共享祖先链（`detach` 后仍有效）。`shutdown` 的全局 `ShutdownReentrant` 约束不变。
+生命周期等待同时检查服务依赖与 Effect 父子等待关系：用户回调中的 `dispose_wait`、`restart`、`replace` 若会反向等待当前 Scope，立即返回 `LifecycleReentrant { scope }`，不启动该操作。`unmount` 保留同树检查，并增加跨树服务依赖检查，拒绝时返回 `UnmountReentrant`；卸载不形成反向等待的无关插件仍允许。同步清理、异步清理、`apply`、inject 和受控任务均携带所属 Scope。同树判定使用创建时冻结的共享祖先链（`detach` 后仍有效）。`shutdown` 的全局 `ShutdownReentrant` 约束不变。
 
 卸载 / `dispose_now` 在 Effect `DisposeCompletion` 完成前保留 `pending_wait` 与 plugin 索引，使 async disposer / 并发 `unmount` 仍能看到归属；完成后才 `unregister`。
 
@@ -181,3 +189,7 @@ identity** 的派生配置视图并写入覆盖；`config(key)` 向父链查找�
 ## 关闭
 
 宿主须 `await Runtime::shutdown()`（返回 `Result`）。插件热替换优先 `fiber.replace` 或 `dispose_wait` 后再挂载。单纯 `dispose()` 为 fire-and-forget；之后仍可 `dispose_wait()` 观察同一轮释放结果。仅 `drop` Runtime **不**保证执行未启动的 async disposer。
+
+### 服务资源的 Scope 归属
+
+Provider 的保护范围包含实际注册 Scope 的非消费资源子树；直接及传递消费者分支先完成清理，再释放提供者资源。把服务注册到 Root 等过宽 Scope，可能使其他服务的资源后代与消费者互相等待。Core 在绑定候选依赖时检查完整等待图并返回 `DependencyCycle`，不会等到 shutdown 才发现挂死。只有服务自身资源应归入其 Provider Scope；无全局资源归属要求的宿主服务应放在独立 Effect，而不是将整个 Runtime 子树归为它的资源。

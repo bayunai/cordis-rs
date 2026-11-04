@@ -212,7 +212,7 @@ impl FiberInner {
         let state = *self.state.lock().expect("state");
         match state {
             crate::fiber::FiberState::Loading => {
-                self.abandon_loading_to_pending(None, false);
+                let _ = self.abandon_loading_to_pending(None, false).await;
             }
             crate::fiber::FiberState::Unloading => {
                 // `dispose_wait()` 已经开始时，重新取得同一轮 Completion 并等待它。
@@ -478,14 +478,16 @@ mod lifecycle_completion_tests {
                 .context
                 .with_scope_and_log_source(scope.clone(), inner.id, inner.plugin_key);
         let registry = inner.registry.upgrade().expect("registry");
-        registry.register_effect(
-            effect_id,
-            scope.name().to_string(),
-            scope.parent_id(),
-            Some(inner.context.clone()),
-            Some(inner.id),
-            &scope,
-        );
+        registry
+            .register_effect(
+                effect_id,
+                scope.name().to_string(),
+                scope.parent_id(),
+                Some(inner.context.clone()),
+                Some(inner.id),
+                &scope,
+            )
+            .expect("register effect");
         context
             .provide(WORKER_ABORT_SERVICE, 7_u64)
             .expect("provide from activating scope");

@@ -8,7 +8,9 @@ use std::sync::Weak;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InjectionState {
     Pending,
+    Loading,
     Active,
+    Unloading,
     Failed,
     Disposed,
 }
@@ -33,6 +35,8 @@ impl From<InjectionPhase> for InjectionState {
     fn from(value: InjectionPhase) -> Self {
         match value {
             InjectionPhase::Pending => Self::Pending,
+            InjectionPhase::Loading => Self::Loading,
+            InjectionPhase::Unloading => Self::Unloading,
             InjectionPhase::Active => Self::Active,
             InjectionPhase::Failed => Self::Failed,
             InjectionPhase::Disposed => Self::Disposed,

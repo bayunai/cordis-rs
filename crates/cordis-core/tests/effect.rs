@@ -333,7 +333,7 @@ async fn on_dispose_async_runs_once_on_first_dispose_only() {
 }
 
 #[tokio::test]
-async fn dispose_runs_sync_cleanup_immediately_and_hoists_async_to_parent_wait() {
+async fn dispose_runs_sync_before_async_and_hoists_completion_to_parent_wait() {
     let runtime = runtime();
     let root = runtime.root();
     let parent = root.effect().unwrap();
@@ -369,9 +369,9 @@ async fn dispose_runs_sync_cleanup_immediately_and_hoists_async_to_parent_wait()
         .unwrap();
 
     child.dispose();
+    started_rx.await.expect("async disposer started");
     assert!(sync_done.load(Ordering::SeqCst));
     assert!(!async_done.load(Ordering::SeqCst));
-    started_rx.await.expect("async disposer started");
     let _ = release_tx.send(());
     parent.dispose_wait().await.expect("parent wait");
     assert!(async_done.load(Ordering::SeqCst));

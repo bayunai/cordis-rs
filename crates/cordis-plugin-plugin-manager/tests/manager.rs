@@ -459,7 +459,9 @@ async fn enable_pending_plugin_persists_and_activates_when_dependency_appears() 
     assert_eq!(entry.state, Some(FiberState::Pending));
     let patch = std::fs::read_to_string(dir.path().join("user.patches.toml")).unwrap();
     assert!(patch.contains("disabled = false"));
-    runtime.root().provide(PENDING_DEP, ()).unwrap();
+    // 仅将等待服务归属此 Effect，避免把 Loader 的业务子树当作该服务的资源。
+    let dependency = runtime.root().effect().unwrap();
+    dependency.provide(PENDING_DEP, ()).unwrap();
     runtime.settle().await;
     let entry = manager
         .list_plugins()

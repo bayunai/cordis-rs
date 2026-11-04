@@ -52,6 +52,7 @@ async fn effect_dispose_removes_resources_registered_from_extended_view() {
     child.on(PING, |_| Ok(())).unwrap();
     assert!(!runtime.diagnostics().providers.is_empty());
     owner.dispose();
+    owner.dispose_wait().await.unwrap();
     assert!(runtime.diagnostics().providers.is_empty());
     root.emit(PING, &Ping(1)).unwrap();
 }

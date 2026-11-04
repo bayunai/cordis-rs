@@ -51,6 +51,8 @@ pub(crate) enum ProviderKey {
 
 pub(crate) struct ProviderRecord {
     pub(crate) id: u64,
+    pub(crate) owner: EffectScope,
+    pub(crate) retiring: bool,
     pub(crate) availability_revision: u64,
     pub(crate) availability: ProviderAvailability,
     pub(crate) check: Option<ProviderCheck>,
@@ -94,27 +96,22 @@ impl Registry {
         context: Option<Context>,
         fiber_id: Option<u64>,
         scope: &EffectScope,
-    ) {
-        if let Ok(mut state) = self.state.lock() {
-            state.effects.insert(
-                id,
-                EffectRecord {
-                    name,
-                    parent,
-                    context,
-                    fiber_id,
-                    scope: scope.clone(),
-                },
-            );
+    ) -> Result<(), CoreError> {
+        let mut state = self.state.lock().map_err(|_| CoreError::ContextDisposed)?;
+        if scope.is_disposed() {
+            return Err(CoreError::ContextDisposed);
         }
-        let weak = Arc::downgrade(self);
-        scope.on_dispose(move || {
-            if let Some(registry) = weak.upgrade()
-                && let Ok(mut state) = registry.state.lock()
-            {
-                state.effects.remove(&id);
-            }
-        });
+        state.effects.insert(
+            id,
+            EffectRecord {
+                name,
+                parent,
+                context,
+                fiber_id,
+                scope: scope.clone(),
+            },
+        );
+        Ok(())
     }
 
     fn lock_service_type(
@@ -149,6 +146,9 @@ impl Registry {
         let provider_id = self.allocate_id();
         {
             let mut state = self.state.lock().map_err(|_| CoreError::ContextDisposed)?;
+            if owner.is_disposed() {
+                return Err(CoreError::ContextDisposed);
+            }
             Self::lock_service_type(&mut state, key, value.type_id)?;
             let isolation = context.nearest_isolation(key).map(|label| label.id());
             let slot = match isolation {
@@ -168,6 +168,8 @@ impl Registry {
                 slot,
                 ProviderRecord {
                     id: provider_id,
+                    owner: owner.clone(),
+                    retiring: false,
                     availability_revision: 0,
                     availability,
                     check,
@@ -178,12 +180,6 @@ impl Registry {
                 },
             );
         }
-        let weak = Arc::downgrade(self);
-        owner.on_dispose(move || {
-            if let Some(registry) = weak.upgrade() {
-                registry.remove_provider(provider_id);
-            }
-        });
         self.mark_dirty();
         Ok(provider_id)
     }
@@ -217,6 +213,9 @@ impl Registry {
             else {
                 return Err(CoreError::ProviderDisposed { service });
             };
+            if provider.retiring || provider.owner.is_disposed() {
+                return Err(CoreError::ProviderDisposed { service });
+            }
             provider
                 .check
                 .clone()
@@ -239,6 +238,9 @@ impl Registry {
             else {
                 return Err(CoreError::ProviderDisposed { service });
             };
+            if provider.retiring || provider.owner.is_disposed() {
+                return Err(CoreError::ProviderDisposed { service });
+            }
             let ready_changed = provider.availability.is_ready() != availability.is_ready();
             provider.availability = availability;
             if ready_changed {
@@ -250,21 +252,6 @@ impl Registry {
             self.mark_dirty();
         }
         result.map(|_| ())
-    }
-
-    fn remove_provider(self: &Arc<Self>, provider_id: u64) {
-        let removed = if let Ok(mut state) = self.state.lock() {
-            let key = state
-                .providers
-                .iter()
-                .find_map(|(key, value)| (value.id == provider_id).then_some(*key));
-            key.is_some_and(|key| state.providers.remove(&key).is_some())
-        } else {
-            false
-        };
-        if removed {
-            self.mark_dirty();
-        }
     }
 
     pub(crate) fn resolve(&self, context: &Context, key: ServiceId) -> Option<ErasedService> {

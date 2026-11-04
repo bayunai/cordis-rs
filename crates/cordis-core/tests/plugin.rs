@@ -23,6 +23,7 @@ async fn plugin_mount_provides_and_dispose_clears_resources() {
     handle.dispose();
     handle.dispose();
     assert!(handle.is_disposed());
+    handle.dispose_wait().await.unwrap();
     assert_eq!(dispose_count.load(Ordering::SeqCst), 1);
     assert_service_unavailable(&root, NUMBER);
 }

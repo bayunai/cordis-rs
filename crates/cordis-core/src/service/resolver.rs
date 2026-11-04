@@ -43,6 +43,9 @@ pub(crate) fn resolve_registered_provider<'a>(
 }
 
 fn unavailable_reason(state: &RegistryState, provider: &ProviderRecord) -> Option<Arc<str>> {
+    if provider.retiring || provider.owner.is_disposed() {
+        return Some(Arc::from("provider scope is retiring"));
+    }
     if let ProviderAvailability::Unavailable { reason } = &provider.availability {
         return Some(reason.clone());
     }

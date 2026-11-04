@@ -9,11 +9,10 @@ use crate::{
     error::format_panic_message,
     registry::provider::ProviderRevision,
     registry::{InjectionId, Registry},
-    service::resolver::{provider_ids, resolve_provider},
+    service::resolver::provider_ids,
 };
 use futures_util::FutureExt;
 use std::{
-    collections::HashMap,
     future::Future,
     panic::{AssertUnwindSafe, catch_unwind},
     pin::Pin,
@@ -26,7 +25,9 @@ pub(crate) type InjectCallback = Arc<dyn Fn(Services, EffectScope) -> InjectFutu
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum InjectionPhase {
     Pending,
+    Loading,
     Active,
+    Unloading,
     Failed,
     Disposed,
 }
@@ -38,6 +39,7 @@ pub(crate) struct InjectionRecord {
     pub(crate) callback: InjectCallback,
     pub(crate) child_scope: Option<EffectScope>,
     pub(crate) phase: InjectionPhase,
+    coordinating: bool,
     pub(crate) resolved_providers: Vec<ProviderRevision>,
     pub(crate) last_error: Option<String>,
 }
@@ -45,15 +47,6 @@ pub(crate) struct InjectionRecord {
 pub(crate) struct InjectionBatch {
     pub(crate) ready: Vec<InjectionId>,
     pub(crate) stale_scopes: Vec<EffectScope>,
-}
-
-pub(crate) struct InjectionSnapshot {
-    pub(crate) callback: InjectCallback,
-    pub(crate) services: Services,
-    pub(crate) parent: EffectScope,
-    pub(crate) providers: Vec<ProviderRevision>,
-    pub(crate) context: Context,
-    pub(crate) deps: Vec<ServiceId>,
 }
 
 async fn invoke_callback(
@@ -105,6 +98,7 @@ impl Registry {
                     callback,
                     child_scope: None,
                     phase: InjectionPhase::Pending,
+                    coordinating: false,
                     resolved_providers: Vec::new(),
                     last_error: None,
                 },
@@ -169,16 +163,49 @@ impl Registry {
                 if parent_disposed {
                     continue;
                 }
-                if phase == InjectionPhase::Active && resolved != providers {
+                let child_disposed = state
+                    .injections
+                    .get(&id)
+                    .and_then(|entry| entry.child_scope.as_ref())
+                    .is_some_and(|child| child.is_disposed());
+                if phase == InjectionPhase::Active && (resolved != providers || child_disposed) {
                     let Some(injection) = state.injections.get_mut(&id) else {
                         continue;
                     };
-                    if let Some(child) = injection.child_scope.take() {
+                    if let Some(child) = injection.child_scope.clone() {
                         stale_scopes.push(child);
                     }
-                    injection.phase = InjectionPhase::Pending;
-                    injection.resolved_providers.clear();
+                    injection.phase = InjectionPhase::Unloading;
                     injection.last_error = None;
+                }
+            }
+        }
+
+        {
+            let mut state = self.state.lock().expect("registry");
+            let completed = state
+                .injections
+                .iter()
+                .filter_map(|(id, injection)| {
+                    if injection.phase != InjectionPhase::Unloading || injection.coordinating {
+                        return None;
+                    }
+                    let result = injection.child_scope.as_ref()?.release_result()?;
+                    let baseline =
+                        provider_ids(&state, &injection.context, &injection.dependencies);
+                    Some((*id, result, baseline))
+                })
+                .collect::<Vec<_>>();
+            for (id, result, baseline) in completed {
+                let injection = state.injections.get_mut(&id).expect("completed injection");
+                injection.child_scope = None;
+                match result {
+                    Ok(()) => injection.phase = InjectionPhase::Pending,
+                    Err(error) => {
+                        injection.phase = InjectionPhase::Failed;
+                        injection.last_error = Some(error.to_string());
+                        injection.resolved_providers = baseline;
+                    }
                 }
             }
         }
@@ -219,79 +246,109 @@ impl Registry {
     }
 
     pub(crate) async fn run_injection(self: &Arc<Self>, id: InjectionId) {
-        let Some(snapshot) = self.snapshot_injection(id) else {
-            return;
-        };
-        let child = snapshot.parent.child();
-        let outcome = invoke_callback(&snapshot.callback, snapshot.services, child.clone()).await;
-        let fresh = {
-            let Ok(state) = self.state.lock() else {
-                child.dispose();
+        let (callback, context, parent, deps) = {
+            let mut state = self.state.lock().expect("registry");
+            let Some(entry) = state.injections.get_mut(&id) else {
                 return;
             };
-            provider_ids(&state, &snapshot.context, &snapshot.deps)
+            if !matches!(
+                entry.phase,
+                InjectionPhase::Pending | InjectionPhase::Failed
+            ) || entry.parent_scope.is_disposed()
+            {
+                return;
+            }
+            entry.phase = InjectionPhase::Loading;
+            entry.coordinating = true;
+            (
+                entry.callback.clone(),
+                entry.context.clone(),
+                entry.parent_scope.clone(),
+                entry.dependencies.clone(),
+            )
         };
-        let mut failed = None;
-        if let Ok(mut state) = self.state.lock() {
-            if let Some(injection) = state.injections.get_mut(&id) {
-                if injection.parent_scope.is_disposed() {
-                    failed = Some(child);
-                } else if let Err(error) = outcome {
-                    injection.child_scope = None;
-                    injection.phase = InjectionPhase::Failed;
-                    injection.resolved_providers = snapshot.providers;
-                    injection.last_error = Some(error.to_string());
-                    failed = Some(child);
-                } else if fresh.len() != snapshot.deps.len() || fresh != snapshot.providers {
-                    // 版本校验：await 期间 provider 漂移则不提交 Active。
-                    injection.child_scope = None;
-                    injection.phase = InjectionPhase::Pending;
-                    injection.resolved_providers.clear();
-                    injection.last_error = None;
-                    failed = Some(child);
-                    drop(state);
-                    self.mark_dirty();
-                    if let Some(scope) = failed.take() {
-                        scope.dispose();
-                    }
-                    return;
+        let child = parent.child();
+        {
+            let mut state = self.state.lock().expect("registry");
+            if let Some(entry) = state.injections.get_mut(&id) {
+                entry.child_scope = Some(child.clone());
+            }
+        }
+        let execution = child.begin_execution();
+        let binding = match &execution {
+            Ok(_) => self.bind_dependencies(&context, &deps, &child),
+            Err(error) => Err(error.clone()),
+        };
+        let (providers, outcome) = match binding {
+            Ok(Some((providers, services))) => {
+                let outcome = invoke_callback(&callback, services, child.clone()).await;
+                (providers, outcome)
+            }
+            Ok(None) => (Vec::new(), Ok(())),
+            Err(error) => {
+                let state = self.state.lock().expect("registry");
+                (
+                    provider_ids(&state, &context, &deps),
+                    Err(error.to_string()),
+                )
+            }
+        };
+        drop(execution);
+        let active = {
+            let mut state = self.state.lock().expect("registry");
+            let fresh = provider_ids(&state, &context, &deps);
+            if let Some(entry) = state.injections.get_mut(&id) {
+                if outcome.is_ok()
+                    && !child.is_disposed()
+                    && !parent.is_disposed()
+                    && providers.len() == deps.len()
+                    && providers == fresh
+                {
+                    entry.phase = InjectionPhase::Active;
+                    entry.coordinating = false;
+                    entry.resolved_providers = providers.clone();
+                    entry.last_error = None;
+                    true
                 } else {
-                    injection.child_scope = Some(child);
-                    injection.phase = InjectionPhase::Active;
-                    injection.resolved_providers = snapshot.providers;
-                    injection.last_error = None;
+                    entry.phase = InjectionPhase::Unloading;
+                    false
                 }
             } else {
-                failed = Some(child);
+                false
             }
-        } else {
-            failed = Some(child);
+        };
+        if !active {
+            let cleanup = child.dispose_wait().await;
+            let cleanup_failed = cleanup.is_err();
+            let error = match (outcome.err(), cleanup.err()) {
+                (Some(startup), Some(cleanup)) => Some(format!("{startup}; cleanup: {cleanup}")),
+                (Some(startup), None) => Some(startup),
+                (None, Some(cleanup)) => Some(cleanup.to_string()),
+                (None, None) => None,
+            };
+            let mut state = self.state.lock().expect("registry");
+            let providers = if cleanup_failed {
+                provider_ids(&state, &context, &deps)
+            } else {
+                providers
+            };
+            if let Some(entry) = state.injections.get_mut(&id)
+                && entry
+                    .child_scope
+                    .as_ref()
+                    .is_some_and(|current| current.ptr_eq(&child))
+            {
+                entry.coordinating = false;
+                entry.child_scope = None;
+                entry.phase = if error.is_some() {
+                    InjectionPhase::Failed
+                } else {
+                    InjectionPhase::Pending
+                };
+                entry.last_error = error;
+                entry.resolved_providers = providers;
+            }
         }
-        if let Some(scope) = failed {
-            scope.dispose();
-        }
-    }
-
-    pub(crate) fn snapshot_injection(&self, id: InjectionId) -> Option<InjectionSnapshot> {
-        let state = self.state.lock().ok()?;
-        let injection = state.injections.get(&id)?;
-        let mut values = HashMap::new();
-        let mut providers = Vec::with_capacity(injection.dependencies.len());
-        for key in &injection.dependencies {
-            let provider = resolve_provider(&state, &injection.context, *key)?;
-            values.insert(*key, provider.value.clone());
-            providers.push(ProviderRevision {
-                id: provider.id,
-                availability_revision: provider.availability_revision,
-            });
-        }
-        Some(InjectionSnapshot {
-            callback: injection.callback.clone(),
-            services: Services { values },
-            parent: injection.parent_scope.clone(),
-            providers,
-            context: injection.context.clone(),
-            deps: injection.dependencies.clone(),
-        })
+        self.mark_dirty();
     }
 }

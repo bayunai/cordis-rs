@@ -273,7 +273,7 @@ async fn concurrent_provide_and_dispose_converge() {
     let mut current = None::<cordis_core::EffectContext>;
     for value in 0..8 {
         if let Some(previous) = current.take() {
-            previous.dispose();
+            previous.dispose_wait().await.unwrap();
         }
         let effect = root.effect().unwrap();
         effect.provide(NUMBER, Number(value)).unwrap();

@@ -82,7 +82,8 @@ impl FiberInner {
             return Err(CoreError::FiberDisposed);
         }
         let mut ownership = self.ownership.lock().expect("ownership");
-        if self.disposed.load(Ordering::Acquire)
+        if scope.is_disposed()
+            || self.disposed.load(Ordering::Acquire)
             || matches!(*ownership, EffectOwnership::Releasing(_))
         {
             drop(ownership);
@@ -93,29 +94,47 @@ impl FiberInner {
         Ok(scope)
     }
 
-    pub(crate) fn abandon_loading_to_pending(
+    pub(crate) async fn abandon_loading_to_pending(
         &self,
         effect_scope: Option<&EffectScope>,
         mark_dirty: bool,
-    ) {
-        if let Some(scope) = effect_scope {
-            scope.dispose();
-        }
-        let mut ownership = self.ownership.lock().expect("ownership");
-        match std::mem::replace(&mut *ownership, EffectOwnership::Empty) {
-            EffectOwnership::Activating(scope) => {
-                if effect_scope.is_none_or(|expected| !scope.ptr_eq(expected)) {
-                    scope.dispose();
+    ) -> Result<(), CoreError> {
+        let scope = {
+            let mut ownership = self.ownership.lock().expect("ownership");
+            match &*ownership {
+                EffectOwnership::Activating(scope) => {
+                    let scope = scope.clone();
+                    *ownership = EffectOwnership::Releasing(super::ownership::FiberRelease {
+                        scope: scope.clone(),
+                        dispose_started: true,
+                    });
+                    Some(scope)
                 }
+                _ => effect_scope.cloned(),
             }
-            other => *ownership = other,
+        };
+        let result = if let Some(scope) = scope {
+            let result = scope.dispose_wait().await;
+            let mut ownership = self.ownership.lock().expect("ownership");
+            if matches!(&*ownership, EffectOwnership::Releasing(release) if release.scope.ptr_eq(&scope))
+            {
+                *ownership = EffectOwnership::Empty;
+            }
+            result
+        } else {
+            Ok(())
+        };
+        if let Err(error) = result {
+            *self.last_error.lock().expect("error") = Some(error.to_string());
+            let _ = self.transition_if_alive(FiberState::Failed);
+            return Err(error);
         }
         self.resolved_providers.lock().expect("providers").clear();
-        *self.last_error.lock().expect("error") = None;
         let _ = self.transition_if_alive(FiberState::Pending);
         if mark_dirty && let Some(registry) = self.registry.upgrade() {
             registry.mark_dirty_public();
         }
+        Ok(())
     }
 
     async fn revoke_abandoned_mount(self: &Arc<Self>) -> CoreError {
@@ -148,7 +167,8 @@ impl FiberInner {
     ) -> Result<(), CoreError> {
         let mut ownership = self.ownership.lock().expect("ownership");
         let mut handoff = self.handoff.lock().expect("handoff");
-        if self.disposed.load(Ordering::Acquire)
+        if scope.is_disposed()
+            || self.disposed.load(Ordering::Acquire)
             || matches!(*ownership, EffectOwnership::Releasing(_))
         {
             return Err(CoreError::FiberDisposed);
@@ -173,6 +193,10 @@ impl FiberInner {
         self: &Arc<Self>,
         initial_mount: bool,
     ) -> Result<(), CoreError> {
+        if self.parent_scope.is_disposed() {
+            self.dispose_now();
+            return Err(CoreError::FiberDisposed);
+        }
         if self.disposed.load(Ordering::Acquire) {
             return Err(CoreError::FiberDisposed);
         }
@@ -189,8 +213,8 @@ impl FiberInner {
             return Err(CoreError::ContextDisposed);
         };
         let deps = self.dependencies.lock().expect("deps").clone();
-        let Some(providers) = self.resolve_provider_ids(&registry, &deps) else {
-            self.abandon_loading_to_pending(None, false);
+        let Some(_) = self.resolve_provider_ids(&registry, &deps) else {
+            self.abandon_loading_to_pending(None, false).await?;
             if self.should_revoke_abandoned_mount() {
                 return Err(self.revoke_abandoned_mount().await);
             }
@@ -218,37 +242,75 @@ impl FiberInner {
         let apply_ctx =
             self.context
                 .with_scope_and_log_source(effect_scope.clone(), self.id, self.plugin_key);
-        registry.register_effect(
+        if let Err(error) = registry.register_effect(
             effect_scope.id(),
             effect_scope.name().to_string(),
             effect_scope.parent_id(),
             Some(self.context.clone()),
             Some(self.id),
             &effect_scope,
-        );
-        match invoke_plugin_apply(&plugin, &apply_ctx, &effect_scope).await {
+        ) {
+            self.abandon_loading_to_pending(Some(&effect_scope), false)
+                .await?;
+            self.mark_ready_for_handle_if_preparing(initial_mount);
+            return Err(error);
+        }
+        let execution = match effect_scope.begin_execution() {
+            Ok(execution) => execution,
+            Err(error) => {
+                self.abandon_loading_to_pending(Some(&effect_scope), false)
+                    .await?;
+                self.mark_ready_for_handle_if_preparing(initial_mount);
+                return Err(error);
+            }
+        };
+        let providers = match registry.bind_dependencies(&self.context, &deps, &effect_scope) {
+            Ok(Some((providers, _))) => providers,
+            Ok(None) => {
+                drop(execution);
+                self.abandon_loading_to_pending(Some(&effect_scope), true)
+                    .await?;
+                self.mark_ready_for_handle_if_preparing(initial_mount);
+                return Ok(());
+            }
+            Err(error) => {
+                drop(execution);
+                self.abandon_loading_to_pending(Some(&effect_scope), false)
+                    .await?;
+                *self.last_error.lock().expect("error") = Some(error.to_string());
+                let _ = self.transition_if_alive(FiberState::Failed);
+                self.mark_ready_for_handle_if_preparing(initial_mount);
+                return Err(error);
+            }
+        };
+        let outcome = invoke_plugin_apply(&plugin, &apply_ctx, &effect_scope).await;
+        drop(execution);
+        match outcome {
             Ok(()) => {
                 if self.should_revoke_abandoned_mount() || self.disposed.load(Ordering::Acquire) {
                     return Err(self.revoke_abandoned_mount().await);
                 }
+                let Some(fresh) = self.resolve_provider_ids(&registry, &deps) else {
+                    self.abandon_loading_to_pending(Some(&effect_scope), true)
+                        .await?;
+                    self.mark_ready_for_handle_if_preparing(initial_mount);
+                    return Ok(());
+                };
+                if fresh != providers {
+                    self.abandon_loading_to_pending(Some(&effect_scope), true)
+                        .await?;
+                    self.mark_ready_for_handle_if_preparing(initial_mount);
+                    return Ok(());
+                }
                 if effect_scope.is_disposed() || parent_scope.is_disposed() {
-                    self.abandon_loading_to_pending(Some(&effect_scope), true);
+                    self.abandon_loading_to_pending(Some(&effect_scope), true)
+                        .await?;
                     *self.last_error.lock().expect("error") =
                         Some("plugin scope was disposed during apply".into());
                     let _ = self.transition_if_alive(FiberState::Failed);
                     return Err(CoreError::PluginApply(
                         "plugin scope was disposed during apply".into(),
                     ));
-                }
-                let Some(fresh) = self.resolve_provider_ids(&registry, &deps) else {
-                    self.abandon_loading_to_pending(Some(&effect_scope), true);
-                    self.mark_ready_for_handle_if_preparing(initial_mount);
-                    return Ok(());
-                };
-                if fresh != providers {
-                    self.abandon_loading_to_pending(Some(&effect_scope), true);
-                    self.mark_ready_for_handle_if_preparing(initial_mount);
-                    return Ok(());
                 }
                 if let Err(error) =
                     self.try_commit_active(effect_scope.clone(), providers, initial_mount)
@@ -276,7 +338,20 @@ impl FiberInner {
                 if self.should_revoke_abandoned_mount() || self.disposed.load(Ordering::Acquire) {
                     return Err(self.revoke_abandoned_mount().await);
                 }
-                self.abandon_loading_to_pending(Some(&effect_scope), false);
+                if let Err(cleanup) = self
+                    .abandon_loading_to_pending(Some(&effect_scope), false)
+                    .await
+                {
+                    let mut errors = match cleanup {
+                        CoreError::DisposeFailed { errors } => errors,
+                        other => vec![other.to_string()],
+                    };
+                    errors.insert(0, format!("plugin apply: {error}"));
+                    let failure = CoreError::DisposeFailed { errors };
+                    *self.last_error.lock().expect("error") = Some(failure.to_string());
+                    self.mark_ready_for_handle_if_preparing(initial_mount);
+                    return Err(failure);
+                }
                 *self.last_error.lock().expect("error") = Some(error.to_string());
                 let _ = self.transition_if_alive(FiberState::Failed);
                 self.mark_ready_for_handle_if_preparing(initial_mount);

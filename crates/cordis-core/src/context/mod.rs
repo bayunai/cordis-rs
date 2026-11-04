@@ -262,14 +262,17 @@ impl Context {
         let template = self.clone();
         let callback = Arc::new(move |services: Services, child: EffectScope| {
             let registry = template.registry().expect("live injection context");
-            registry.register_effect(
+            if let Err(error) = registry.register_effect(
                 child.id(),
                 child.name().to_string(),
                 child.parent_id(),
                 Some(template.clone()),
                 None,
                 &child,
-            );
+            ) {
+                return Box::pin(async move { Err(error) })
+                    as std::pin::Pin<Box<dyn Future<Output = Result<(), CoreError>> + Send>>;
+            }
             let context = EffectContext {
                 context: Context {
                     inner: Arc::new(ContextInner {
@@ -313,7 +316,7 @@ impl Context {
             Some(self.clone()),
             None,
             &scope,
-        );
+        )?;
         Ok(EffectContext {
             context: Context {
                 inner: Arc::new(ContextInner {

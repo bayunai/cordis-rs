@@ -12,7 +12,6 @@ use crate::{
     logger::{LogExporter, Logger},
 };
 use std::{future::Future, sync::Arc};
-use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 /// `inject()` 或 `effect()` 回调中拥有资源的 Context。
@@ -213,6 +212,7 @@ impl EffectContext {
         self.context.parallel(key, payload).await
     }
 
+    /// 注册同步清理；实际执行在消费者排空后，不保证在 `dispose()` 返回前发生。
     pub fn on_dispose(&self, callback: impl FnOnce() + Send + 'static) {
         self.context.inner.scope.on_dispose(callback);
     }
@@ -226,16 +226,19 @@ impl EffectContext {
         self.context.inner.scope.on_dispose_async(disposer)
     }
 
+    /// 本 Scope 的独立令牌；受控释放在消费者排空后才发出取消信号。
     pub fn cancellation_token(&self) -> CancellationToken {
         self.context.inner.scope.cancellation()
     }
 
-    /// 释放当前 Effect 及其全部子资源（fire-and-forget；异步 disposer 上收至父 Scope）。
+    /// 请求释放当前 Effect 树，立即拒绝新工作；消费者排空后才取消任务并执行清理。
+    /// 此调用不等待；清理错误上收至父 Scope，之后可用 `dispose_wait` 加入同一轮结果。
     pub fn dispose(&self) {
         self.context.inner.scope.dispose();
     }
 
-    /// 释放并等待本 Effect 树上的受控任务与异步 disposer（不上收；无超时）。
+    /// 请求释放并等待消费者、回调、受控任务和清理完整结束（无超时）。
+    /// 取消等待不取消内部协调器；反向等待当前生命周期回调时报 `LifecycleReentrant`。
     pub async fn dispose_wait(&self) -> Result<(), CoreError> {
         self.context.inner.scope.dispose_wait().await
     }
@@ -250,19 +253,15 @@ impl EffectContext {
         }
         let cancellation = self.cancellation_token();
         let future = task(cancellation);
-        let handle: JoinHandle<()> =
-            self.context
-                .inner
-                .scope
-                .runtime_handle()
-                .spawn(USER_LIFECYCLE_CALLBACK.scope(
-                    LifecycleFrame {
-                        scope: self.context.inner.scope.clone(),
-                    },
-                    future,
-                ));
-        self.context.inner.scope.push_task(handle);
-        Ok(())
+        self.context
+            .inner
+            .scope
+            .spawn_task(USER_LIFECYCLE_CALLBACK.scope(
+                LifecycleFrame {
+                    scope: self.context.inner.scope.clone(),
+                },
+                future,
+            ))
     }
 
     pub fn logger(&self) -> Result<Logger, CoreError> {

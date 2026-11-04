@@ -257,6 +257,9 @@ impl Registry {
         let mut globals = Vec::new();
         let mut locals = Vec::new();
         for listener in listeners {
+            if listener.context.is_disposed() {
+                continue;
+            }
             let matches_mode = matches!(
                 (&listener.kind, mode),
                 (EventHandlerKind::Observe(_), EventMode::Observe)

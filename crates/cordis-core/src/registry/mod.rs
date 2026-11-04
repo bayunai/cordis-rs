@@ -3,6 +3,7 @@
 //! 聚合节点、provider、注入与调度；子模块：`node` 上下文节点，`provider` 注册撤销，
 //! `injection` 响应式注入收敛，`scheduler` 后台重算调度。
 
+pub(crate) mod dependency;
 pub(crate) mod injection;
 pub(crate) mod provider;
 pub(crate) mod scheduler;
@@ -44,6 +45,7 @@ use tokio_util::sync::CancellationToken;
 
 pub(crate) struct RegistryState {
     pub(crate) providers: HashMap<ProviderKey, ProviderRecord>,
+    pub(crate) bindings: HashMap<u64, dependency::DependencyBinding>,
     pub(crate) injections: HashMap<InjectionId, InjectionRecord>,
     pub(crate) listeners: HashMap<&'static str, Vec<EventListener>>,
     pub(crate) effects: HashMap<u64, EffectRecord>,
@@ -60,6 +62,7 @@ pub(crate) struct Registry {
     pub(crate) next_id: AtomicU64,
     pub(crate) dirty: AtomicBool,
     pub(crate) recomputing: AtomicBool,
+    pub(crate) pending_jobs: AtomicU64,
     pub(crate) recompute_epoch: AtomicU64,
     pub(crate) wake: Notify,
     pub(crate) quiescent: Notify,
@@ -99,6 +102,7 @@ impl Registry {
         Arc::new(Self {
             state: Mutex::new(RegistryState {
                 providers: HashMap::new(),
+                bindings: HashMap::new(),
                 injections: HashMap::new(),
                 listeners: HashMap::new(),
                 effects: HashMap::new(),
@@ -112,6 +116,7 @@ impl Registry {
             next_id: AtomicU64::new(1),
             dirty: AtomicBool::new(false),
             recomputing: AtomicBool::new(false),
+            pending_jobs: AtomicU64::new(0),
             recompute_epoch: AtomicU64::new(0),
             wake: Notify::new(),
             quiescent: Notify::new(),

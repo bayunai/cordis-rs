@@ -112,16 +112,23 @@ impl Registry {
             tokio::pin!(notified);
             notified.as_mut().enable();
 
-            if !self.dirty.load(Ordering::Acquire) && !self.recomputing.load(Ordering::Acquire) {
+            if !self.dirty.load(Ordering::Acquire)
+                && !self.recomputing.load(Ordering::Acquire)
+                && self.pending_jobs.load(Ordering::Acquire) == 0
+            {
                 let _guard = self.recompute_lock.lock().await;
-                if !self.dirty.load(Ordering::Acquire) && !self.recomputing.load(Ordering::Acquire)
+                if !self.dirty.load(Ordering::Acquire)
+                    && !self.recomputing.load(Ordering::Acquire)
+                    && self.pending_jobs.load(Ordering::Acquire) == 0
                 {
                     return;
                 }
             }
             if self.scheduler_stopped.load(Ordering::Acquire) {
                 let _guard = self.recompute_lock.lock().await;
-                if !self.dirty.load(Ordering::Acquire) && !self.recomputing.load(Ordering::Acquire)
+                if !self.dirty.load(Ordering::Acquire)
+                    && !self.recomputing.load(Ordering::Acquire)
+                    && self.pending_jobs.load(Ordering::Acquire) == 0
                 {
                     return;
                 }
@@ -188,28 +195,55 @@ impl Registry {
             // 锁外：用户 sync cleanup / unload wait / inject / Plugin::apply。
             for scope in batch.stale_scopes {
                 scope.dispose();
+                self.spawn_recompute_job(async move {
+                    let _ = scope.dispose_wait().await;
+                });
             }
-            for fiber in batch.unload {
-                let _ = fiber.unload_to_pending_wait().await;
+            let unloads = batch
+                .unload
+                .into_iter()
+                .filter_map(|fiber| {
+                    fiber
+                        .start_lifecycle(crate::fiber::LifecycleOp::Unload)
+                        .ok()
+                })
+                .collect::<Vec<_>>();
+            for completion in unloads {
+                self.spawn_recompute_job(async move {
+                    let _ = completion.wait().await;
+                });
             }
             for injection in batch.ready {
                 let registry = self.clone();
-                IN_RECOMPUTE_USER
-                    .scope((), async move {
-                        registry.run_injection(injection).await;
-                    })
-                    .await;
+                self.spawn_recompute_job(async move {
+                    IN_RECOMPUTE_USER
+                        .scope((), registry.run_injection(injection))
+                        .await;
+                });
             }
             for fiber in batch.activate {
                 let registry = self.clone();
-                IN_RECOMPUTE_USER
-                    .scope((), async move {
-                        registry.run_plugin_fiber(fiber).await;
-                    })
-                    .await;
+                self.spawn_recompute_job(async move {
+                    IN_RECOMPUTE_USER
+                        .scope((), registry.run_plugin_fiber(fiber))
+                        .await;
+                });
             }
+            tokio::task::yield_now().await;
             // unload 后 Pending 可能已就绪且未 mark_dirty；下一轮再取批即可。
         }
+    }
+
+    fn spawn_recompute_job(
+        self: &Arc<Self>,
+        job: impl std::future::Future<Output = ()> + Send + 'static,
+    ) {
+        self.pending_jobs.fetch_add(1, Ordering::AcqRel);
+        let registry = self.clone();
+        tokio::spawn(async move {
+            let _guard = RecomputeJobGuard(registry);
+            job.await;
+        });
     }
 
     /// 仅识别需 unload / 可 activate 的 Fiber；禁止在此 await。
@@ -252,7 +286,15 @@ impl Registry {
                 provider_ids(&state, &fiber.context, &deps)
             };
             let state = *fiber.state.lock().expect("state");
-            if state == FiberState::Active && resolved != providers {
+            if state == FiberState::Active
+                && (resolved != providers
+                    || fiber
+                        .ownership
+                        .lock()
+                        .expect("ownership")
+                        .live_scope()
+                        .is_some_and(|scope| scope.is_disposed()))
+            {
                 unload.push(fiber);
                 continue;
             }
@@ -267,5 +309,15 @@ impl Registry {
     async fn run_plugin_fiber(self: &Arc<Self>, fiber: Arc<FiberInner>) {
         // Failed is stored on the fiber; Pending Ok is intentional when deps race.
         let _ = fiber.try_activate().await;
+    }
+}
+
+struct RecomputeJobGuard(Arc<Registry>);
+
+impl Drop for RecomputeJobGuard {
+    fn drop(&mut self) {
+        self.0.mark_dirty();
+        self.0.pending_jobs.fetch_sub(1, Ordering::AcqRel);
+        self.0.quiescent.notify_waiters();
     }
 }

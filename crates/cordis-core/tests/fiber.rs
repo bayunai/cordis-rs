@@ -240,11 +240,11 @@ async fn provider_rebind_waits_for_old_plugin_effect_before_reactivation() {
     cancelled_rx.await.expect("old effect cancellation");
     wait_until(|| fiber.state() == FiberState::Unloading).await;
 
+    assert_eq!(apply_count.load(Ordering::SeqCst), 1);
+    let _ = release_tx.send(());
+    provider.dispose_wait().await.unwrap();
     let replacement = root.effect_named("replacement").unwrap();
     replacement.provide(NUMBER, Number(2)).unwrap();
-    assert_eq!(apply_count.load(Ordering::SeqCst), 1);
-
-    let _ = release_tx.send(());
     runtime.settle().await;
     wait_until(|| fiber.state() == FiberState::Active).await;
     assert_eq!(apply_count.load(Ordering::SeqCst), 2);
@@ -528,9 +528,10 @@ async fn provider_replaced_during_loading_reactivates_with_fresh() {
     });
     entered_rx.await.expect("entered apply");
     provider.dispose();
+    let _ = gate_tx.send(());
+    provider.dispose_wait().await.unwrap();
     let neu = root.effect_named("provider2").unwrap();
     neu.provide(NUMBER, Number(99)).unwrap();
-    let _ = gate_tx.send(());
     let mut fiber = tokio::time::timeout(std::time::Duration::from_secs(2), mount)
         .await
         .expect("mount timed out")
@@ -841,11 +842,18 @@ async fn provider_recompute_marks_failed_when_async_dispose_errors() {
     assert_eq!(apply_count.load(Ordering::SeqCst), 1);
 
     provider.dispose();
+    provider
+        .dispose_wait()
+        .await
+        .expect_err("dependent cleanup failure");
     let replacement = root.effect_named("replacement").unwrap();
     replacement.provide(NUMBER, Number(2)).unwrap();
     wait_until(|| fiber.state() == FiberState::Failed).await;
     assert_eq!(apply_count.load(Ordering::SeqCst), 1);
-    runtime.shutdown().await.expect("shutdown");
+    runtime
+        .shutdown()
+        .await
+        .expect_err("dependent cleanup remains visible");
 }
 
 #[tokio::test]

@@ -161,6 +161,7 @@ impl Runtime {
         registry.start_scheduler()?;
         let handle = tokio::runtime::Handle::current();
         let root_scope = EffectScope::root(handle.clone());
+        root_scope.attach_registry(&registry);
         let logger = LoggerService::new();
         Ok(Self {
             inner: Arc::new(RuntimeInner {
@@ -282,6 +283,12 @@ impl Runtime {
                 for scope in fiber.scopes_awaited_by_unmount() {
                     if frame_scope.is_same_tree_as(&scope) {
                         return Err(CoreError::UnmountReentrant);
+                    }
+                    match self.inner.registry.check_lifecycle_wait(&scope) {
+                        Err(CoreError::LifecycleReentrant { .. }) => {
+                            return Err(CoreError::UnmountReentrant);
+                        }
+                        result => result?,
                     }
                 }
             }
