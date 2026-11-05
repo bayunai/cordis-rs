@@ -1,14 +1,14 @@
-//! 按 PluginKey 归组、挂载索引与统一卸载。
+//! 按 PluginDefinitionId 归组、挂载索引与统一卸载。
 //!
 //! 维护同 Key 的 Fiber 索引与 unmount 流程；Plugin 契约定义在 `plugin/mod`。
 
 use crate::{
     CoreError,
     fiber::{FiberInner, FiberStateChange},
-    plugin::PluginKey,
+    plugin::{PluginDefinition, PluginDefinitionId},
     registry::Registry,
 };
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex};
 use tokio::{
     sync::{Notify, broadcast},
     task::JoinHandle,
@@ -60,8 +60,9 @@ impl UnmountCompletion {
     }
 }
 
-pub(crate) struct PluginGroup {
-    pub(crate) fibers: Vec<Weak<FiberInner>>,
+pub(crate) struct DefinitionGroup {
+    pub(crate) definition: PluginDefinition,
+    pub(crate) fibers: Vec<u64>,
     pub(crate) unmounting: bool,
     pub(crate) unmount_completion: Option<Arc<UnmountCompletion>>,
 }
@@ -75,50 +76,64 @@ impl Registry {
         let _ = self.fiber_state_events.send(change);
     }
 
-    pub(crate) fn register_plugin_fiber(
+    pub(crate) fn register_fiber(
         self: &Arc<Self>,
         fiber: Arc<FiberInner>,
     ) -> Result<(), CoreError> {
-        let key = fiber.plugin_key;
-        {
-            let mut state = self.state.lock().map_err(|_| CoreError::ContextDisposed)?;
-            if state
-                .plugin_index
-                .get(&key)
-                .is_some_and(|group| group.unmounting)
-            {
-                return Err(CoreError::PluginUnmounting { plugin: key });
-            }
-            state.plugin_fibers.insert(fiber.id, Arc::downgrade(&fiber));
-            let group = state
-                .plugin_index
-                .entry(key)
-                .or_insert_with(|| PluginGroup {
-                    fibers: Vec::new(),
-                    unmounting: false,
-                    unmount_completion: None,
+        let key = fiber.definition.id();
+        let mut state = self.state.lock().map_err(|_| CoreError::ContextDisposed)?;
+        let weak = Arc::downgrade(&fiber);
+        // Lock order is Registry then parent resources, matching diagnostics.
+        fiber.parent_scope.register_owned(
+            || {
+                if state
+                    .plugin_index
+                    .get(&key)
+                    .is_some_and(|group| group.unmounting)
+                {
+                    return Err(CoreError::PluginUnmounting { plugin: key });
+                }
+                state.fibers.insert(fiber.id, fiber.clone());
+                let group = state
+                    .plugin_index
+                    .entry(key)
+                    .or_insert_with(|| DefinitionGroup {
+                        definition: fiber.definition.clone(),
+                        fibers: Vec::new(),
+                        unmounting: false,
+                        unmount_completion: None,
+                    });
+                group.fibers.push(fiber.id);
+                let dependencies = fiber.dependencies.lock().expect("dependencies");
+                let unavailable_dependencies =
+                    crate::registry::dependency_diagnostics(&state, &fiber.context, &dependencies)
+                        .1;
+                self.publish_fiber_state(FiberStateChange {
+                    fiber_id: fiber.id,
+                    definition_id: key,
+                    parent_fiber_id: fiber.parent_fiber_id,
+                    previous: None,
+                    current: crate::FiberState::Pending,
+                    unavailable_dependencies,
                 });
-            group.fibers.push(Arc::downgrade(&fiber));
-        }
-        // 此处仅完成分组占位与卸载冲突检查。Fiber 保持 Preparing 时 scheduler
-        // 不会调度它；首次生命周期完成后由 `finish_lifecycle()` 统一标脏。
-        Ok(())
+                Ok(())
+            },
+            move || {
+                if let Some(fiber) = weak.upgrade() {
+                    fiber.dispose_now();
+                }
+            },
+        )
     }
 
-    pub(crate) fn unregister_plugin_fiber(&self, id: u64) {
+    pub(crate) fn unregister_fiber(&self, id: u64) {
         if let Ok(mut state) = self.state.lock() {
-            let key = state
-                .plugin_fibers
-                .get(&id)
-                .and_then(Weak::upgrade)
-                .map(|fiber| fiber.plugin_key);
-            state.plugin_fibers.remove(&id);
+            let key = state.fibers.get(&id).map(|fiber| fiber.definition.id());
+            state.fibers.remove(&id);
             if let Some(key) = key
                 && let Some(group) = state.plugin_index.get_mut(&key)
             {
-                group
-                    .fibers
-                    .retain(|weak| weak.upgrade().is_some_and(|fiber| fiber.id != id));
+                group.fibers.retain(|fiber_id| *fiber_id != id);
                 if group.fibers.is_empty() && !group.unmounting {
                     state.plugin_index.remove(&key);
                 }
@@ -126,41 +141,41 @@ impl Registry {
         }
     }
 
-    pub(crate) fn plugin_fibers_for_key(
+    pub(crate) fn fibers_for_definition(
         &self,
-        key: PluginKey,
+        key: PluginDefinitionId,
     ) -> Result<Vec<Arc<FiberInner>>, CoreError> {
         let state = self.state.lock().map_err(|_| CoreError::ContextDisposed)?;
         let Some(group) = state.plugin_index.get(&key) else {
             return Ok(Vec::new());
         };
-        Ok(group.fibers.iter().filter_map(Weak::upgrade).collect())
+        Ok(group
+            .fibers
+            .iter()
+            .filter_map(|id| state.fibers.get(id).cloned())
+            .collect())
     }
 
     pub(crate) fn begin_plugin_unmount(
         &self,
-        key: PluginKey,
+        key: PluginDefinitionId,
     ) -> Result<(Vec<Arc<FiberInner>>, Arc<UnmountCompletion>), CoreError> {
         let mut state = self.state.lock().map_err(|_| CoreError::ContextDisposed)?;
-        let group = state
-            .plugin_index
-            .entry(key)
-            .or_insert_with(|| PluginGroup {
-                fibers: Vec::new(),
-                unmounting: false,
-                unmount_completion: None,
-            });
+        let Some(group) = state.plugin_index.get_mut(&key) else {
+            let completion = UnmountCompletion::new();
+            completion.finish(Ok(0));
+            return Ok((Vec::new(), completion));
+        };
         if group.unmounting {
             return Err(CoreError::PluginUnmounting { plugin: key });
         }
         group.unmounting = true;
         let completion = UnmountCompletion::new();
         group.unmount_completion = Some(completion.clone());
-        group.fibers.retain(|weak| weak.strong_count() > 0);
-        let fibers = group
-            .fibers
+        let ids = group.fibers.clone();
+        let fibers = ids
             .iter()
-            .filter_map(Weak::upgrade)
+            .filter_map(|id| state.fibers.get(id).cloned())
             .filter(|fiber| fiber.needs_unmount_wait())
             .collect();
         Ok((fibers, completion))
@@ -168,7 +183,7 @@ impl Registry {
 
     pub(crate) fn finish_plugin_unmount(
         &self,
-        key: PluginKey,
+        key: PluginDefinitionId,
         completion: &Arc<UnmountCompletion>,
     ) {
         if let Ok(mut state) = self.state.lock()

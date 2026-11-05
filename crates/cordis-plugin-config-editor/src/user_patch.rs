@@ -23,7 +23,7 @@ pub struct UserPatchDocument {
     pub patches: Vec<UserPatch>,
 }
 
-/// 单条覆盖；`id` 为 Include 文件内局部路径（不含根 Include 前缀）。
+/// 单条覆盖；`id` 为 Include 所属 EntryTree 内的单段 ID（不含 Include 前缀）。
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct UserPatch {
     pub id: String,

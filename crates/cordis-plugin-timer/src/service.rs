@@ -7,7 +7,7 @@ use crate::{
     },
 };
 use async_trait::async_trait;
-use cordis_core::{Context, CoreError, EffectContext, Plugin, PluginKey, ServiceKey};
+use cordis_core::{Context, CoreError, EffectContext, Plugin, ServiceKey};
 use std::time::Duration;
 
 /// Timer 能力服务 Key。
@@ -22,10 +22,6 @@ pub struct TimerPlugin;
 
 #[async_trait]
 impl Plugin for TimerPlugin {
-    fn key(&self) -> PluginKey {
-        PluginKey::new("cordis.timer")
-    }
-
     async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
         ctx.provide(TIMER, TimerService)?;
         Ok(())

@@ -69,21 +69,21 @@ async fn checked_provider_rebuilds_injection_across_unavailable_ready_flip() {
         })
         .unwrap();
 
-    wait_injection(&injection, InjectionState::Pending).await;
+    wait_injection(&injection, FiberState::Pending).await;
     ready.store(true, Ordering::SeqCst);
     provider.refresh().unwrap();
-    wait_injection(&injection, InjectionState::Active).await;
+    wait_injection(&injection, FiberState::Active).await;
     assert_eq!(runs.load(Ordering::SeqCst), 1);
 
     ready.store(false, Ordering::SeqCst);
     provider.refresh().unwrap();
-    wait_injection(&injection, InjectionState::Pending).await;
+    wait_injection(&injection, FiberState::Pending).await;
 
     // 不等待中间调度：revision 必须使 Ready→Unavailable→Ready 仍触发重建。
     ready.store(true, Ordering::SeqCst);
     provider.refresh().unwrap();
     wait_until(|| runs.load(Ordering::SeqCst) == 2).await;
-    assert_eq!(injection.state(), InjectionState::Active);
+    assert_eq!(injection.state(), FiberState::Active);
     runtime.shutdown().await.unwrap();
 }
 
@@ -129,12 +129,11 @@ async fn checked_provider_handle_fails_after_owner_scope_is_disposed() {
 async fn provider_from_loading_plugin_is_only_available_after_plugin_becomes_active() {
     struct SelfProviding;
 
+    static SELFPROVIDING_DEFINITION: std::sync::LazyLock<cordis_core::PluginDefinition> =
+        std::sync::LazyLock::new(|| cordis_core::PluginDefinition::named("test.self-providing@1"));
+
     #[async_trait]
     impl Plugin for SelfProviding {
-        fn key(&self) -> cordis_core::PluginKey {
-            cordis_core::PluginKey::new("test.self-providing@1")
-        }
-
         async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
             ctx.provide(NUMBER, Number(7))?;
             assert!(matches!(
@@ -147,7 +146,10 @@ async fn provider_from_loading_plugin_is_only_available_after_plugin_becomes_act
 
     let runtime = runtime();
     let root = runtime.root();
-    let _fiber = root.plugin(Arc::new(SelfProviding)).await.unwrap();
+    let _fiber = root
+        .plugin(&SELFPROVIDING_DEFINITION, Arc::new(SelfProviding))
+        .await
+        .unwrap();
     assert_eq!(root.get(NUMBER).unwrap().0, 7);
     runtime.shutdown().await.unwrap();
 }
@@ -191,12 +193,13 @@ async fn checked_provider_drives_plugin_pending_unload_and_reactivation() {
         runs: Arc<AtomicUsize>,
     }
 
+    static CONSUMER_DEFINITION: std::sync::LazyLock<cordis_core::PluginDefinition> =
+        std::sync::LazyLock::new(|| {
+            cordis_core::PluginDefinition::named("test.checked-provider-consumer@1")
+        });
+
     #[async_trait]
     impl Plugin for Consumer {
-        fn key(&self) -> cordis_core::PluginKey {
-            cordis_core::PluginKey::new("test.checked-provider-consumer@1")
-        }
-
         fn inject(&self) -> Vec<cordis_core::ServiceId> {
             vec![NUMBER.id()]
         }
@@ -218,7 +221,10 @@ async fn checked_provider_drives_plugin_pending_unload_and_reactivation() {
         .unwrap();
     let runs = Arc::new(AtomicUsize::new(0));
     let fiber = root
-        .plugin(Arc::new(Consumer { runs: runs.clone() }))
+        .plugin(
+            &CONSUMER_DEFINITION,
+            Arc::new(Consumer { runs: runs.clone() }),
+        )
         .await
         .unwrap();
     assert_eq!(fiber.state(), FiberState::Pending);

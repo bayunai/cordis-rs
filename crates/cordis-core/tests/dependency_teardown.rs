@@ -2,7 +2,7 @@
 
 use async_trait::async_trait;
 use cordis_core::{
-    Context, CoreError, EffectContext, Plugin, PluginKey, Runtime, ServiceId, ServiceKey,
+    Context, CoreError, EffectContext, Plugin, PluginDefinition, Runtime, ServiceId, ServiceKey,
 };
 use std::{
     future::Future,
@@ -18,7 +18,8 @@ static RESOURCE: ServiceKey<Resource> = ServiceKey::new("test.teardown.resource@
 static LEFT: ServiceKey<Resource> = ServiceKey::new("test.teardown.left@1");
 static RIGHT: ServiceKey<Resource> = ServiceKey::new("test.teardown.right@1");
 static INDEPENDENT: ServiceKey<Resource> = ServiceKey::new("test.teardown.independent@1");
-static PROVIDER_KEY: PluginKey = PluginKey::new("test.teardown.provider");
+static PROVIDER_KEY: std::sync::LazyLock<PluginDefinition> =
+    std::sync::LazyLock::new(|| PluginDefinition::named("test.teardown.provider"));
 
 #[derive(Default)]
 struct ResourceState {
@@ -168,9 +169,6 @@ struct Provider {
 
 #[async_trait]
 impl Plugin for Provider {
-    fn key(&self) -> PluginKey {
-        PROVIDER_KEY
-    }
     async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
         let state = Arc::new(ResourceState::default());
         self.generations.lock().unwrap().push(state.clone());
@@ -184,11 +182,11 @@ struct Consumer {
     gates: Arc<Gates>,
 }
 
+static CONSUMER_DEFINITION: std::sync::LazyLock<cordis_core::PluginDefinition> =
+    std::sync::LazyLock::new(|| cordis_core::PluginDefinition::named("test.teardown.consumer"));
+
 #[async_trait]
 impl Plugin for Consumer {
-    fn key(&self) -> PluginKey {
-        PluginKey::new("test.teardown.consumer")
-    }
     fn inject(&self) -> Vec<ServiceId> {
         vec![RESOURCE.id()]
     }
@@ -213,16 +211,22 @@ async fn check_plugin_exit(exit: ProviderExit) {
         let root = runtime.root();
         let generations = Arc::new(Mutex::new(Vec::new()));
         let mut provider = root
-            .plugin(Arc::new(Provider {
-                generations: generations.clone(),
-            }))
+            .plugin(
+                &PROVIDER_KEY,
+                Arc::new(Provider {
+                    generations: generations.clone(),
+                }),
+            )
             .await
             .unwrap();
         let gates = Gates::new();
         let consumer = root
-            .plugin(Arc::new(Consumer {
-                gates: gates.clone(),
-            }))
+            .plugin(
+                &CONSUMER_DEFINITION,
+                Arc::new(Consumer {
+                    gates: gates.clone(),
+                }),
+            )
             .await
             .unwrap();
         runtime.settle().await;
@@ -240,7 +244,10 @@ async fn check_plugin_exit(exit: ProviderExit) {
                         }))
                         .await
                 }
-                ProviderExit::Unmount => operation_runtime.unmount(PROVIDER_KEY).await.map(|_| ()),
+                ProviderExit::Unmount => operation_runtime
+                    .unmount(PROVIDER_KEY.id())
+                    .await
+                    .map(|_| ()),
                 ProviderExit::Shutdown => operation_runtime.shutdown().await,
             };
             (result, provider)

@@ -57,7 +57,7 @@ impl FromStr for ConfigRevision {
 /// 受信任快照：Catalog Schema 原样，配置可含明文秘密。不得原样发给浏览器。
 #[derive(Clone, Debug)]
 pub struct EntryConfigSnapshot {
-    /// 包含 Group / Include 前缀的完整 Entry 路径。
+    /// 仅包含 Include 前缀的完整 Entry 路径。
     pub path: EntryId,
     pub factory: String,
     /// Catalog 登记的 Schema，未经秘密投影。
@@ -145,11 +145,9 @@ pub(crate) async fn commit_owned(
     commit_tree_locked(tree, target, Some((full, prepared)), required)
         .await
         .map_err(|error| match error {
-            // Factory 构造、比较及 PluginKey 预检也不能通过错误回显配置。
+            // Factory 构造和比较也不能通过错误回显配置。
             LoaderControlError::Loader(
-                crate::LoaderError::FactoryPanic { .. }
-                | crate::LoaderError::PluginBuild { .. }
-                | crate::LoaderError::PluginPanic { .. },
+                crate::LoaderError::FactoryPanic { .. } | crate::LoaderError::PluginBuild { .. },
             ) => LoaderControlError::ConfigValidation,
             other => other,
         })?;
@@ -231,22 +229,5 @@ fn ensure_available(tree: &Arc<RuntimeTree>, local: &str) -> Result<(), LoaderCo
 }
 
 fn find(entries: &[EntryOptions], path: &str) -> Result<EntryOptions, LoaderControlError> {
-    let (head, tail) = path
-        .split_once(':')
-        .map_or((path, None), |(a, b)| (a, Some(b)));
-    if head.is_empty() {
-        return Err(LoaderControlError::InvalidConfigPath);
-    }
-    let entry = entries
-        .iter()
-        .find(|e| e.id == head)
-        .ok_or_else(|| LoaderControlError::EntryNotFound { path: path.into() })?;
-    if let Some(tail) = tail {
-        if !entry.group {
-            return Err(LoaderControlError::EntryNotFound { path: path.into() });
-        }
-        find(&entry.children()?, tail)
-    } else {
-        Ok(entry.clone())
-    }
+    crate::loader::find_entry(entries, path)
 }

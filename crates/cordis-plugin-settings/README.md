@@ -40,8 +40,8 @@
 须在已配置路径的 `ConfigEditorPlugin` 之后（编辑范围只配 ConfigEditor）：
 
 ```rust
-root.plugin(Arc::new(SettingsPlugin)).await?;
+root.plugin(&cordis_plugin_settings::PLUGIN_DEFINITION, Arc::new(SettingsPlugin)).await?;
 let settings = root.get(SETTINGS)?;
 ```
 
-PluginKey：`cordis.settings`。
+共享定义的展示名称：`cordis.settings`。

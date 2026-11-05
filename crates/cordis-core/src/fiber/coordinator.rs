@@ -177,6 +177,12 @@ impl FiberInner {
             completion
         };
 
+        let initial_mount = matches!(
+            &op,
+            LifecycleOp::Activate {
+                initial_mount: true
+            }
+        );
         let fiber = self.clone();
         let completion_for_task = completion.clone();
         let supervisor = self.parent_scope.runtime_handle().spawn(async move {
@@ -195,6 +201,17 @@ impl FiberInner {
                         reason: format!("lifecycle worker: {error}"),
                     })
                 }
+            };
+            if initial_mount {
+                fiber.mark_ready_for_handle_if_preparing(true);
+            }
+            let result = if fiber.handoff_abandoned() {
+                match fiber.dispose_wait_inner().await {
+                    Ok(()) => Err(CoreError::FiberDisposed),
+                    Err(error) => Err(error),
+                }
+            } else {
+                result
             };
             fiber.finish_lifecycle(completion_for_task, result);
             guard.finished = true;
@@ -239,6 +256,11 @@ impl FiberInner {
             *slot = None;
         }
         let state = *self.state.lock().expect("state");
+        if state == crate::FiberState::Failed
+            && let Err(error) = &result
+        {
+            *self.last_error.lock().expect("error") = Some(error.to_string());
+        }
         if matches!(
             state,
             crate::fiber::FiberState::Loading | crate::fiber::FiberState::Unloading
@@ -265,7 +287,7 @@ impl FiberInner {
             }
             LifecycleOp::Replace { plugin, metadata } => {
                 self.unload_effect_to_pending().await?;
-                *self.plugin.lock().expect("plugin") = plugin;
+                *self.body.lock().expect("plugin") = super::InstanceBody::Plugin(plugin);
                 *self.dependencies.lock().expect("deps") = metadata.dependencies;
                 self.resolved_providers.lock().expect("providers").clear();
                 *self.last_error.lock().expect("error") = None;
@@ -288,7 +310,7 @@ impl FiberInner {
 }
 
 #[cfg(test)]
-use crate::plugin::PluginKey;
+use crate::plugin::PluginDefinitionId;
 
 #[cfg(test)]
 pub(crate) struct ReadyForHandleGate {
@@ -297,7 +319,7 @@ pub(crate) struct ReadyForHandleGate {
 }
 
 #[cfg(test)]
-static READY_GATES: Mutex<Option<(&'static str, ReadyGateSlots)>> = Mutex::new(None);
+static READY_GATES: Mutex<Option<(PluginDefinitionId, ReadyGateSlots)>> = Mutex::new(None);
 
 #[cfg(test)]
 struct ReadyGateSlots {
@@ -307,11 +329,11 @@ struct ReadyGateSlots {
 
 #[cfg(test)]
 impl FiberInner {
-    pub(crate) fn arm_ready_for_handle_gate(key: PluginKey) -> ReadyForHandleGate {
+    pub(crate) fn arm_ready_for_handle_gate(key: PluginDefinitionId) -> ReadyForHandleGate {
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = tokio::sync::oneshot::channel();
         *READY_GATES.lock().expect("gates") = Some((
-            key.as_str(),
+            key,
             ReadyGateSlots {
                 entered: Some(entered_tx),
                 release: Some(release_rx),
@@ -328,7 +350,7 @@ impl FiberInner {
         let Some((key, mut slots)) = slots else {
             return;
         };
-        if key != self.plugin_key.as_str() {
+        if key != self.definition.id() {
             *READY_GATES.lock().expect("gates") = Some((key, slots));
             return;
         }
@@ -347,7 +369,7 @@ mod lifecycle_completion_tests {
     use crate::{
         Context, Runtime, ServiceKey,
         fiber::{EffectOwnership, FiberState, ownership::FiberRelease},
-        plugin::{Plugin, PluginKey},
+        plugin::{Plugin, PluginDefinition},
     };
     use async_trait::async_trait;
     use std::{
@@ -362,10 +384,6 @@ mod lifecycle_completion_tests {
 
     #[async_trait]
     impl Plugin for NoopPlugin {
-        fn key(&self) -> PluginKey {
-            PluginKey::new("test.coordinator-abort")
-        }
-
         async fn apply(&self, _ctx: &Context) -> Result<(), CoreError> {
             Ok(())
         }
@@ -374,7 +392,10 @@ mod lifecycle_completion_tests {
     async fn mounted_fiber(runtime: &Runtime) -> crate::Fiber {
         runtime
             .root()
-            .plugin(Arc::new(NoopPlugin))
+            .plugin(
+                &PluginDefinition::named("test.coordinator-abort"),
+                Arc::new(NoopPlugin),
+            )
             .await
             .expect("mount noop plugin")
     }
@@ -473,10 +494,11 @@ mod lifecycle_completion_tests {
 
         let scope = inner.parent_scope.child_named("worker-abort-loading");
         let effect_id = scope.id();
-        let context =
-            inner
-                .context
-                .with_scope_and_log_source(scope.clone(), inner.id, inner.plugin_key);
+        let context = inner.context.with_scope_and_log_source(
+            scope.clone(),
+            inner.id,
+            inner.definition.clone(),
+        );
         let registry = inner.registry.upgrade().expect("registry");
         registry
             .register_effect(

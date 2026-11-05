@@ -1,10 +1,10 @@
 //! DB 插件：内存库，模拟后续可换成 SQLite / PostgreSQL 的存储面。
 
 use async_trait::async_trait;
-use cordis_core::{Context, CoreError, Plugin, PluginKey};
+use cordis_core::{Context, CoreError, Plugin};
 use std::sync::{Arc, Mutex};
 
-use crate::keys::{DB, KEY_DB};
+use crate::keys::DB;
 
 /// 对外契约：日志落库 / 查询。换 SQLite/PG 时尽量保持这些方法稳定。
 #[derive(Clone, Debug)]
@@ -51,10 +51,6 @@ pub struct DbPlugin;
 
 #[async_trait]
 impl Plugin for DbPlugin {
-    fn key(&self) -> PluginKey {
-        KEY_DB
-    }
-
     async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
         let logger = ctx.logger()?;
         logger.info("sys: db apply (memory)");

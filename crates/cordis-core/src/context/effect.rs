@@ -3,7 +3,8 @@
 //! 在 `inject` / `effect` 回调中提供 provide、事件监听与受控任务等 API；
 //! 资源所有权归 `effect` 模块的 EffectScope，本文件只暴露 Context 侧门面。
 
-use super::{Context, InjectionHandle};
+use super::Context;
+use crate::FiberHandle;
 use crate::{
     ConfigKey, CoreError, ProviderAvailability, ProviderHandle, ServiceId, ServiceKey, Services,
     callback_context::{LifecycleFrame, USER_LIFECYCLE_CALLBACK},
@@ -17,7 +18,7 @@ use tokio_util::sync::CancellationToken;
 /// `inject()` 或 `effect()` 回调中拥有资源的 Context。
 #[derive(Clone)]
 pub struct EffectContext {
-    pub(super) context: Context,
+    pub(crate) context: Context,
 }
 
 impl EffectContext {
@@ -62,11 +63,7 @@ impl EffectContext {
         self.context.config(key)
     }
 
-    pub fn inject<I, F, Fut>(
-        &self,
-        dependencies: I,
-        callback: F,
-    ) -> Result<InjectionHandle, CoreError>
+    pub fn inject<I, F, Fut>(&self, dependencies: I, callback: F) -> Result<FiberHandle, CoreError>
     where
         I: IntoIterator<Item = ServiceId>,
         F: Fn(Services, EffectContext) -> Fut + Send + Sync + 'static,

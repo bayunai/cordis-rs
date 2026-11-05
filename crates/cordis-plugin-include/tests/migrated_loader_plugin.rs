@@ -1,7 +1,5 @@
 use async_trait::async_trait;
-use cordis_core::{
-    ConfigKey, Context, CoreError, Fiber, FiberState, Plugin, PluginKey, Runtime, ServiceKey,
-};
+use cordis_core::{ConfigKey, Context, CoreError, Fiber, FiberState, Plugin, Runtime, ServiceKey};
 use cordis_loader::{
     EntryOptions, EntryUpdate, ExtensionCatalog, ExtensionFactory, ExtensionsConfig, InjectConfig,
     InjectionDescriptor, IsolateValue, IsolationDescriptor, LOADER, Loader, LoaderControlError,
@@ -35,9 +33,6 @@ struct TestPlugin {
 }
 #[async_trait]
 impl Plugin for TestPlugin {
-    fn key(&self) -> PluginKey {
-        PluginKey::new(self.id)
-    }
     fn inject(&self) -> Vec<cordis_core::ServiceId> {
         self.needs_dep.then_some(DEP.id()).into_iter().collect()
     }
@@ -82,7 +77,9 @@ impl ExtensionFactory for Factory {
 fn catalog(factories: Vec<Factory>) -> ExtensionCatalog {
     let mut catalog = ExtensionCatalog::new();
     for factory in factories {
-        catalog.register(factory).unwrap();
+        catalog
+            .register(&cordis_core::PluginDefinition::anonymous(), factory)
+            .unwrap();
     }
     catalog
 }
@@ -99,13 +96,19 @@ async fn mount_file(
     cordis: impl AsRef<std::path::Path>,
 ) -> (Runtime, Fiber, Loader) {
     catalog
-        .register(cordis_plugin_include::IncludeFactory)
+        .register(
+            &cordis_plugin_include::PLUGIN_DEFINITION,
+            cordis_plugin_include::IncludeFactory,
+        )
         .unwrap();
     let entry = cordis_plugin_include::include_root_entry("include", cordis).unwrap();
     let runtime = Runtime::new().unwrap();
     let root = runtime.root();
     let fiber = root
-        .plugin(Arc::new(LoaderPlugin::new(catalog)))
+        .plugin(
+            &cordis_loader::PLUGIN_DEFINITION,
+            Arc::new(LoaderPlugin::new(catalog)),
+        )
         .await
         .unwrap();
     let loader = (*root.get(LOADER).unwrap()).clone();
@@ -176,10 +179,6 @@ struct CountPlugin {
 
 #[async_trait]
 impl Plugin for CountPlugin {
-    fn key(&self) -> PluginKey {
-        PluginKey::new("demo.count")
-    }
-
     async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
         ctx.provide(VALUE, self.n.to_string())?;
         Ok(())
@@ -199,45 +198,6 @@ impl ExtensionFactory for CountFactory {
 }
 
 #[derive(Clone, serde::Deserialize, serde::Serialize, JsonSchema)]
-struct KeySwitchConfig {
-    #[serde(default)]
-    alt: bool,
-}
-
-struct KeySwitchFactory;
-
-struct KeySwitchPlugin {
-    alt: bool,
-}
-
-#[async_trait]
-impl Plugin for KeySwitchPlugin {
-    fn key(&self) -> PluginKey {
-        if self.alt {
-            PluginKey::new("demo.key.alt")
-        } else {
-            PluginKey::new("demo.key.main")
-        }
-    }
-
-    async fn apply(&self, _: &Context) -> Result<(), CoreError> {
-        Ok(())
-    }
-}
-
-impl ExtensionFactory for KeySwitchFactory {
-    type Config = KeySwitchConfig;
-    fn id(&self) -> &'static str {
-        "demo.key"
-    }
-    fn prepare(&self, config: KeySwitchConfig) -> Result<PreparedExtension, LoaderError> {
-        Ok(PreparedExtension::ordinary(move || {
-            Ok(Arc::new(KeySwitchPlugin { alt: config.alt }))
-        }))
-    }
-}
-
-#[derive(Clone, serde::Deserialize, serde::Serialize, JsonSchema)]
 struct FailConfig {
     #[serde(default)]
     fail: bool,
@@ -251,10 +211,6 @@ struct FailPlugin {
 
 #[async_trait]
 impl Plugin for FailPlugin {
-    fn key(&self) -> PluginKey {
-        PluginKey::new("demo.fail")
-    }
-
     async fn apply(&self, _: &Context) -> Result<(), CoreError> {
         if self.fail {
             Err(CoreError::ProviderCheck("intentional apply failure".into()))
@@ -320,7 +276,7 @@ async fn disabling_provider_returns_consumer_to_pending_then_recovers() {
             .await_idle()
             .await
             .unwrap()
-            .entry("include:app:consumer")
+            .entry("include:consumer")
             .unwrap()
             .state,
         Some(FiberState::Active)
@@ -330,7 +286,7 @@ async fn disabling_provider_returns_consumer_to_pending_then_recovers() {
         .subtree("include")
         .unwrap()
         .update(
-            "app:provider",
+            "provider",
             EntryUpdate {
                 disabled: Some(true),
                 ..Default::default()
@@ -341,9 +297,9 @@ async fn disabling_provider_returns_consumer_to_pending_then_recovers() {
         .await
         .unwrap();
     let snapshot = loader.await_idle().await.unwrap();
-    assert!(!snapshot.entry("include:app:provider").unwrap().enabled);
+    assert!(!snapshot.entry("include:provider").unwrap().enabled);
     assert_eq!(
-        snapshot.entry("include:app:consumer").unwrap().state,
+        snapshot.entry("include:consumer").unwrap().state,
         Some(FiberState::Pending)
     );
 
@@ -351,7 +307,7 @@ async fn disabling_provider_returns_consumer_to_pending_then_recovers() {
         .subtree("include")
         .unwrap()
         .update(
-            "app:provider",
+            "provider",
             EntryUpdate {
                 disabled: Some(false),
                 ..Default::default()
@@ -363,11 +319,11 @@ async fn disabling_provider_returns_consumer_to_pending_then_recovers() {
         .unwrap();
     let snapshot = loader.await_idle().await.unwrap();
     assert_eq!(
-        snapshot.entry("include:app:provider").unwrap().state,
+        snapshot.entry("include:provider").unwrap().state,
         Some(FiberState::Active)
     );
     assert_eq!(
-        snapshot.entry("include:app:consumer").unwrap().state,
+        snapshot.entry("include:consumer").unwrap().state,
         Some(FiberState::Active)
     );
     runtime.shutdown().await.unwrap();
@@ -424,7 +380,7 @@ async fn persistent_create_move_and_conflict_use_paths() {
             .await_idle()
             .await
             .unwrap()
-            .entry("include:one:child")
+            .entry("include:child")
             .unwrap()
             .state
             .is_none()
@@ -446,12 +402,7 @@ async fn persistent_create_move_and_conflict_use_paths() {
     loader
         .subtree("include")
         .unwrap()
-        .update(
-            "one:child",
-            EntryUpdate::default(),
-            Some(Some("two")),
-            Some(0),
-        )
+        .update("child", EntryUpdate::default(), Some(Some("two")), Some(0))
         .await
         .unwrap();
     assert!(
@@ -459,7 +410,7 @@ async fn persistent_create_move_and_conflict_use_paths() {
             .await_idle()
             .await
             .unwrap()
-            .entry("include:two:child")
+            .entry("include:child")
             .is_some()
     );
     assert!(
@@ -533,7 +484,9 @@ async fn config_only_replace_keeps_fiber_ids() {
             record: None,
         },
     ]);
-    catalog.register(CountFactory).unwrap();
+    catalog
+        .register(&cordis_core::PluginDefinition::anonymous(), CountFactory)
+        .unwrap();
     catalog
         .register_isolation(IsolationDescriptor::new("value", VALUE))
         .unwrap();
@@ -555,15 +508,15 @@ async fn config_only_replace_keeps_fiber_ids() {
     .await;
     let before = loader.await_idle().await.unwrap();
     let root_id = fiber_id(&before, "root");
-    let provider_id = fiber_id(&before, "app:provider");
-    let count_id = fiber_id(&before, "app:count");
+    let provider_id = fiber_id(&before, "provider");
+    let count_id = fiber_id(&before, "count");
     let app_id = fiber_id(&before, "app");
 
     loader
         .subtree("include")
         .unwrap()
         .update(
-            "app:count",
+            "count",
             EntryUpdate {
                 config: Some(toml::Value::try_from(CountConfig { n: 2 }).unwrap()),
                 ..Default::default()
@@ -576,11 +529,11 @@ async fn config_only_replace_keeps_fiber_ids() {
     let after = loader.await_idle().await.unwrap();
     assert_eq!(fiber_id(&after, "root"), root_id);
     assert_eq!(fiber_id(&after, "app"), app_id);
-    assert_eq!(fiber_id(&after, "app:provider"), provider_id);
-    assert_eq!(fiber_id(&after, "app:count"), count_id);
+    assert_eq!(fiber_id(&after, "provider"), provider_id);
+    assert_eq!(fiber_id(&after, "count"), count_id);
     assert_eq!(
         &*loader
-            .entry_context("include:app:count")
+            .entry_context("include:count")
             .unwrap()
             .get(VALUE)
             .unwrap(),
@@ -713,142 +666,15 @@ async fn factory_changed_on_reload_is_zero_runtime_change() {
 }
 
 #[tokio::test]
-async fn plugin_key_changed_on_config_update_is_zero_runtime_change() {
-    let mut catalog = ExtensionCatalog::new();
-    catalog.register(KeySwitchFactory).unwrap();
-    let (runtime, _loader_fiber, loader, _dir, _) = mount_with_file(
-        catalog,
-        vec![
-            EntryOptions::new("keyed", "demo.key")
-                .with_config(toml::Value::try_from(KeySwitchConfig { alt: false }).unwrap()),
-        ],
-    )
-    .await;
-    let before = loader.await_idle().await.unwrap();
-    let keyed_id = fiber_id(&before, "keyed");
-
-    let error = loader
-        .subtree("include")
-        .unwrap()
-        .update(
-            "keyed",
-            EntryUpdate {
-                config: Some(toml::Value::try_from(KeySwitchConfig { alt: true }).unwrap()),
-                ..Default::default()
-            },
-            None,
-            None,
-        )
-        .await
-        .unwrap_err();
-    assert!(
-        matches!(
-            error,
-            LoaderControlError::Loader(LoaderError::PluginKeyChanged { .. })
-        ),
-        "unexpected error: {error:?}"
-    );
-    let after = loader.await_idle().await.unwrap();
-    assert_eq!(fiber_id(&after, "keyed"), keyed_id);
-    assert_eq!(
-        after.entry("include:keyed").unwrap().state,
-        Some(FiberState::Active)
-    );
-    assert_eq!(
-        loader
-            .subtree("include")
-            .unwrap()
-            .entries()
-            .unwrap()
-            .extensions[0]
-            .config,
-        toml::Value::try_from(KeySwitchConfig { alt: false }).unwrap()
-    );
-    runtime.shutdown().await.unwrap();
-}
-
-#[tokio::test]
-async fn plugin_key_changed_during_group_rebuild_is_zero_runtime_change() {
-    let mut catalog = ExtensionCatalog::new();
-    catalog.register(KeySwitchFactory).unwrap();
-    catalog
-        .register_injection(InjectionDescriptor::intercepted("dep", DEP, LABEL))
-        .unwrap();
-    let mut initial = EntryOptions::group(
-        "app",
-        vec![
-            EntryOptions::new("keyed", "demo.key")
-                .with_config(toml::Value::try_from(KeySwitchConfig { alt: false }).unwrap()),
-        ],
-    )
-    .unwrap();
-    initial.inject = Some(InjectConfig::Map(
-        [(
-            "dep".into(),
-            toml::Value::Table(toml::toml! { label = "before" }),
-        )]
-        .into(),
-    ));
-    let (runtime, _loader_fiber, loader, _dir, cordis) =
-        mount_with_file(catalog, vec![initial]).await;
-    let before = loader.await_idle().await.unwrap();
-    let keyed_id = fiber_id(&before, "app:keyed");
-
-    let mut target = EntryOptions::group(
-        "app",
-        vec![
-            EntryOptions::new("keyed", "demo.key")
-                .with_config(toml::Value::try_from(KeySwitchConfig { alt: true }).unwrap()),
-        ],
-    )
-    .unwrap();
-    target.inject = Some(InjectConfig::Map(
-        [(
-            "dep".into(),
-            toml::Value::Table(toml::toml! { label = "after" }),
-        )]
-        .into(),
-    ));
-    fs::write(&cordis, toml::to_string(&config(vec![target])).unwrap()).unwrap();
-
-    let error = loader
-        .subtree("include")
-        .unwrap()
-        .reload()
-        .await
-        .unwrap_err();
-    assert!(
-        matches!(
-            error,
-            LoaderControlError::Loader(LoaderError::PluginKeyChanged { .. })
-        ),
-        "unexpected error: {error:?}"
-    );
-    let after = loader.await_idle().await.unwrap();
-    assert_eq!(fiber_id(&after, "app:keyed"), keyed_id);
-    assert_eq!(
-        loader
-            .subtree("include")
-            .unwrap()
-            .entries()
-            .unwrap()
-            .extensions[0]
-            .children()
-            .unwrap()[0]
-            .config,
-        toml::Value::try_from(KeySwitchConfig { alt: false }).unwrap()
-    );
-    runtime.shutdown().await.unwrap();
-}
-
-#[tokio::test]
 async fn lifecycle_failure_keeps_unrelated_active_without_committing_desired_or_file() {
     let mut catalog = catalog(vec![Factory {
         id: "demo.value",
         needs_dep: false,
         record: None,
     }]);
-    catalog.register(FailFactory).unwrap();
+    catalog
+        .register(&cordis_core::PluginDefinition::anonymous(), FailFactory)
+        .unwrap();
     let (runtime, _loader_fiber, loader, _dir, cordis) = mount_with_file(
         catalog,
         vec![
@@ -917,7 +743,9 @@ async fn lifecycle_failure_keeps_unrelated_active_without_committing_desired_or_
 #[tokio::test]
 async fn initial_failure_keeps_loader_and_later_entries_then_can_be_repaired() {
     let mut catalog = dep_catalog();
-    catalog.register(FailFactory).unwrap();
+    catalog
+        .register(&cordis_core::PluginDefinition::anonymous(), FailFactory)
+        .unwrap();
     let (runtime, fiber, loader, _dir, _) = mount_with_file(
         catalog,
         vec![
@@ -986,7 +814,9 @@ async fn initial_failure_keeps_loader_and_later_entries_then_can_be_repaired() {
 #[tokio::test]
 async fn initial_failed_entry_can_be_disabled_and_removed() {
     let mut catalog = dep_catalog();
-    catalog.register(FailFactory).unwrap();
+    catalog
+        .register(&cordis_core::PluginDefinition::anonymous(), FailFactory)
+        .unwrap();
     let (runtime, _loader_fiber, loader, _dir, _) = mount_with_file(
         catalog,
         vec![
@@ -1031,9 +861,6 @@ async fn failed_provider_leaves_consumer_pending_without_stopping_unrelated_entr
     struct BrokenProvider;
     #[async_trait]
     impl Plugin for BrokenProvider {
-        fn key(&self) -> PluginKey {
-            PluginKey::new("broken.provider")
-        }
         async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
             ctx.provide(DEP, ())?;
             Err(CoreError::PluginApply(
@@ -1052,7 +879,12 @@ async fn failed_provider_leaves_consumer_pending_without_stopping_unrelated_entr
         }
     }
     let mut catalog = dep_catalog();
-    catalog.register(BrokenProviderFactory).unwrap();
+    catalog
+        .register(
+            &cordis_core::PluginDefinition::anonymous(),
+            BrokenProviderFactory,
+        )
+        .unwrap();
     let (runtime, _fiber, loader, _dir, _) = mount_with_file(
         catalog,
         vec![
@@ -1083,7 +915,9 @@ async fn failed_provider_leaves_consumer_pending_without_stopping_unrelated_entr
 #[tokio::test]
 async fn failed_reload_mounts_later_entries_and_retries_without_committing_declaration() {
     let mut catalog = dep_catalog();
-    catalog.register(FailFactory).unwrap();
+    catalog
+        .register(&cordis_core::PluginDefinition::anonymous(), FailFactory)
+        .unwrap();
     let (runtime, _loader_fiber, loader, _dir, file) = mount_with_file(catalog, vec![]).await;
     let target = config(vec![
         EntryOptions::new("broken", "demo.fail")
@@ -1153,7 +987,9 @@ async fn failed_reload_mounts_later_entries_and_retries_without_committing_decla
 #[tokio::test]
 async fn failed_external_reload_is_visible_and_retried_until_fixed() {
     let mut catalog = ExtensionCatalog::new();
-    catalog.register(FailFactory).unwrap();
+    catalog
+        .register(&cordis_core::PluginDefinition::anonymous(), FailFactory)
+        .unwrap();
     let initial = EntryOptions::new("flaky", "demo.fail")
         .with_config(toml::Value::try_from(FailConfig { fail: false }).unwrap());
     let (runtime, _loader_fiber, loader, _dir, cordis) =
@@ -1232,7 +1068,10 @@ async fn reload_remounts_entry_after_runtime_unmount() {
     let before_id = fiber_id(&before, "value");
 
     assert_eq!(
-        runtime.unmount(PluginKey::new("demo.value")).await.unwrap(),
+        runtime
+            .unmount(before.entry("include:value").unwrap().definition_id)
+            .await
+            .unwrap(),
         1
     );
     let disposed = loader.await_idle().await.unwrap();
@@ -1256,7 +1095,9 @@ async fn reload_remounts_entry_after_runtime_unmount() {
 #[tokio::test]
 async fn failed_create_is_visible_without_committing_and_reload_cleans_it_before_later_success() {
     let mut catalog = ExtensionCatalog::new();
-    catalog.register(FailFactory).unwrap();
+    catalog
+        .register(&cordis_core::PluginDefinition::anonymous(), FailFactory)
+        .unwrap();
     let (runtime, _loader_fiber, loader, _dir, _) = mount_with_file(catalog, vec![]).await;
 
     let failed = EntryOptions::new("flaky", "demo.fail")
@@ -1331,7 +1172,7 @@ async fn group_disabled_keeps_group_fiber_and_toggles_children() {
     let before = loader.await_idle().await.unwrap();
     let group_id = fiber_id(&before, "group");
     assert_eq!(
-        before.entry("include:group:child").unwrap().state,
+        before.entry("include:child").unwrap().state,
         Some(FiberState::Active)
     );
 
@@ -1352,14 +1193,8 @@ async fn group_disabled_keeps_group_fiber_and_toggles_children() {
     let disabled = loader.await_idle().await.unwrap();
     assert_eq!(fiber_id(&disabled, "group"), group_id);
     assert!(disabled.entry("include:group").unwrap().state.is_some());
-    assert!(!disabled.entry("include:group:child").unwrap().enabled);
-    assert!(
-        disabled
-            .entry("include:group:child")
-            .unwrap()
-            .state
-            .is_none()
-    );
+    assert!(!disabled.entry("include:child").unwrap().enabled);
+    assert!(disabled.entry("include:child").unwrap().state.is_none());
     assert_eq!(&*record.lock().unwrap(), &["demo.value"]);
 
     loader
@@ -1379,7 +1214,7 @@ async fn group_disabled_keeps_group_fiber_and_toggles_children() {
     let enabled = loader.await_idle().await.unwrap();
     assert_eq!(fiber_id(&enabled, "group"), group_id);
     assert_eq!(
-        enabled.entry("include:group:child").unwrap().state,
+        enabled.entry("include:child").unwrap().state,
         Some(FiberState::Active)
     );
     runtime.shutdown().await.unwrap();
@@ -1392,11 +1227,14 @@ async fn group_inject_change_rebuilds_subtree_only() {
         .register_injection(InjectionDescriptor::intercepted("dep", DEP, LABEL))
         .unwrap();
     catalog
-        .register(Factory {
-            id: "demo.sibling",
-            needs_dep: false,
-            record: None,
-        })
+        .register(
+            &cordis_core::PluginDefinition::anonymous(),
+            Factory {
+                id: "demo.sibling",
+                needs_dep: false,
+                record: None,
+            },
+        )
         .unwrap();
 
     let mut group = EntryOptions::group(
@@ -1421,8 +1259,8 @@ async fn group_inject_change_rebuilds_subtree_only() {
     .await;
     let before = loader.await_idle().await.unwrap();
     let sibling_id = fiber_id(&before, "sibling");
-    let provider_id = fiber_id(&before, "app:provider");
-    let label_id = fiber_id(&before, "app:label");
+    let provider_id = fiber_id(&before, "provider");
+    let label_id = fiber_id(&before, "label");
 
     loader
         .subtree("include")
@@ -1446,11 +1284,11 @@ async fn group_inject_change_rebuilds_subtree_only() {
         .unwrap();
     let after = loader.await_idle().await.unwrap();
     assert_eq!(fiber_id(&after, "sibling"), sibling_id);
-    assert_ne!(fiber_id(&after, "app:provider"), provider_id);
-    assert_ne!(fiber_id(&after, "app:label"), label_id);
+    assert_ne!(fiber_id(&after, "provider"), provider_id);
+    assert_ne!(fiber_id(&after, "label"), label_id);
     assert_eq!(
         &*loader
-            .entry_context("include:app:label")
+            .entry_context("include:label")
             .unwrap()
             .get(VALUE)
             .unwrap(),
@@ -1478,8 +1316,8 @@ async fn isolate_change_rebuilds_affected_subtree_only() {
     .await;
     let before = loader.await_idle().await.unwrap();
     let sibling_id = fiber_id(&before, "sibling");
-    let provider_id = fiber_id(&before, "app:provider");
-    let consumer_id = fiber_id(&before, "app:consumer");
+    let provider_id = fiber_id(&before, "provider");
+    let consumer_id = fiber_id(&before, "consumer");
     let app_id = fiber_id(&before, "app");
 
     loader
@@ -1499,14 +1337,14 @@ async fn isolate_change_rebuilds_affected_subtree_only() {
     let after = loader.await_idle().await.unwrap();
     assert_eq!(fiber_id(&after, "sibling"), sibling_id);
     assert_ne!(fiber_id(&after, "app"), app_id);
-    assert_ne!(fiber_id(&after, "app:provider"), provider_id);
-    assert_ne!(fiber_id(&after, "app:consumer"), consumer_id);
+    assert_ne!(fiber_id(&after, "provider"), provider_id);
+    assert_ne!(fiber_id(&after, "consumer"), consumer_id);
     assert_eq!(
-        after.entry("include:app:provider").unwrap().state,
+        after.entry("include:provider").unwrap().state,
         Some(FiberState::Active)
     );
     assert_eq!(
-        after.entry("include:app:consumer").unwrap().state,
+        after.entry("include:consumer").unwrap().state,
         Some(FiberState::Active)
     );
     runtime.shutdown().await.unwrap();
@@ -1542,7 +1380,7 @@ async fn named_isolate_labels_are_pruned_after_reload() {
     loader.subtree("include").unwrap().reload().await.unwrap();
     let mid = loader.await_idle().await.unwrap();
     assert_eq!(
-        mid.entry("include:b:consumer").unwrap().state,
+        mid.entry("include:consumer").unwrap().state,
         Some(FiberState::Pending)
     );
 
@@ -1562,11 +1400,11 @@ async fn named_isolate_labels_are_pruned_after_reload() {
     loader.subtree("include").unwrap().reload().await.unwrap();
     let after = loader.await_idle().await.unwrap();
     assert_eq!(
-        after.entry("include:a:provider").unwrap().state,
+        after.entry("include:provider").unwrap().state,
         Some(FiberState::Active)
     );
     assert_eq!(
-        after.entry("include:b:consumer").unwrap().state,
+        after.entry("include:consumer").unwrap().state,
         Some(FiberState::Active)
     );
     runtime.shutdown().await.unwrap();

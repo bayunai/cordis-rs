@@ -1,5 +1,5 @@
 //! 依赖图与资源归属共同决定循环等待；候选绑定参与消费分支判定。
-use cordis_core::{CoreError, InjectionState, Runtime, ServiceKey};
+use cordis_core::{CoreError, FiberState, Runtime, ServiceKey};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -46,7 +46,7 @@ async fn transitive_consumer_drains_before_its_ancestor_provider() {
             })
             .unwrap();
         runtime.settle().await;
-        assert_eq!(nested.state(), InjectionState::Active);
+        assert_eq!(nested.state(), FiberState::Active);
         b.on_dispose(move || {
             assert!(c_done.load(Ordering::SeqCst));
         });
@@ -69,7 +69,7 @@ async fn all_candidate_dependencies_participate_in_consumer_branch_exemption() {
         // X also consumes B, so X may clean up before C; B must then wait for both.
         let consumer = b.inject([B.id(), C.id()], |_, _| async { Ok(()) }).unwrap();
         runtime.settle().await;
-        assert_eq!(consumer.state(), InjectionState::Active);
+        assert_eq!(consumer.state(), FiberState::Active);
         runtime.shutdown().await.unwrap();
     })
     .await
@@ -116,7 +116,7 @@ async fn broad_provider_owner_cannot_introduce_a_cycle_between_resource_branches
             })
             .unwrap();
         runtime.settle().await;
-        assert_eq!(nested.state(), InjectionState::Failed);
+        assert_eq!(nested.state(), FiberState::Failed);
         assert!(!ran.load(Ordering::SeqCst));
         runtime.shutdown().await.unwrap();
     })
@@ -141,10 +141,10 @@ async fn failed_injection_keeps_both_startup_and_cleanup_diagnostics() {
     tokio::time::timeout(Duration::from_secs(5), runtime.settle())
         .await
         .unwrap();
-    assert_eq!(consumer.state(), InjectionState::Failed);
+    assert_eq!(consumer.state(), FiberState::Failed);
     let snapshot = runtime.diagnostics();
     let failure = snapshot
-        .inject_fibers
+        .fibers
         .iter()
         .find_map(|entry| entry.last_error.as_ref())
         .unwrap();

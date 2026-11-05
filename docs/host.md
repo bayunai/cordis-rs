@@ -7,9 +7,9 @@ Loader 根树只在内存中；根文件和嵌套文件均由显式登记的 Inc
 ```rust
 let host = CordisHost::new()?;
 let mut catalog = build_catalog()?;
-catalog.register(cordis_plugin_include::IncludeFactory)?;
+catalog.register(&cordis_plugin_include::PLUGIN_DEFINITION, cordis_plugin_include::IncludeFactory)?;
 let plugin = LoaderPlugin::new(catalog);
-let _loader_fiber = host.root().plugin(Arc::new(plugin)).await?;
+let _loader_fiber = host.root().plugin(&cordis_loader::PLUGIN_DEFINITION, Arc::new(plugin)).await?;
 let loader = host.root().get(LOADER)?;
 loader.create(cordis_plugin_include::include_root_entry("include", "cordis.toml")?, None, None).await?;
 ```
@@ -58,15 +58,17 @@ disabled = true
 ```
 
 普通条目使用 `id`、`name`、`config`、`disabled` 与可选 `inject` / `isolate`。Group 必须使用保留
-`name = "cordis:group"` 和 `group = true`，其 `config` 是子条目数组。路径以 `:` 拼接，以上
-示例的导出器路径为 `include:infrastructure:reports:exporter`；文件内 ID 仍是原来的局部 ID。
+`name = "cordis:group"` 和 `group = true`，其 `config` 是子条目数组。Group 组织父子关系，但不增加地址前缀：以上示例的 Group 地址为 `include:infrastructure`、`include:reports`，数据库与导出器地址分别为 `include:database`、`include:exporter`。
+
+每个 ID 必须非空且不能包含 `:`；同一树内的所有条目共用一个 ID 空间，跨 Group 的重名也会在预检时拒绝。地址由所属 Include 树的前缀加树内 ID 构成；只有跨 Include 边界才增加一个 `:` 段。不同来源树可使用相同局部 ID，例如 `include:worker` 与 `include:reports:worker`。不会解析旧 Group 前缀地址或建立别名。
 
 **Group vs Include：**
 
 | | Group | Include（`cordis-plugin-include`） |
 | --- | --- | --- |
 | 子项存放 | 内联在父条目 `config` 数组 | 独立 v3 TOML／JSON／YAML 文档 |
-| 注册 | Loader 内建 | Catalog 显式 `register(IncludeFactory)` |
+| 注册 | Loader 内建 | Catalog 显式 `register(&definition, IncludeFactory)` |
+| 地址 | 不增加前缀；成员 ID 在所属树内唯一 | 子树地址增加 Include 载体前缀 |
 | 持久化 | 由所属树来源决定；内存树不落盘 | 只写回 Include 自己的文件 |
 | 重载 | 重载所属来源树 | `loader.subtree("include:reports")?.reload()` |
 
@@ -81,14 +83,14 @@ disabled = true
 Include 使用专用的 `PreparedExtension::tree()` 来源树载体结果，不修改 Core 生命周期接口。
 完整输入 Schema 供管理界面使用；`ConfigRef`、revision 和写入端不进入 TOML 或 Schema。
 普通插件不声明空热配置；只有 `PreparedExtension::volatile()` 创建热绑定。
-所有根树和 Include 子树的 `update/reload` 都经过相同的预检与局部 reconcile。
+根树和 Include 子树的普通配置更新／reload 都经过相同的预检与局部 reconcile；移动的两侧提交规则见下文管理 API。
 仅普通配置相同、热配置变化且原 Fiber 仍 Active、上下文未变化时，才原地提交；
 所有生命周期操作成功后再提交热值，提交前再次核对 Fiber 身份与绑定。
-失败时目标配置与文件 revision 不提交；已经发生的生命周期操作或热提交不回滚。
-写回失败沿用 `Persist`，明确报告已生效、未保存。
+普通配置更新／reload 的生命周期失败不提交目标配置与文件 revision；已经发生的生命周期操作或热提交不回滚。
+这些操作的写回失败使用 `Persist`，明确报告已生效、未保存。
 
-热配置 revision 从零开始，仅实际值变化递增。替换、禁用恢复、移动或 Group 重建为新实例
-创建新引用；无关条目不受影响。`await_idle()` 仅等待 Loader 完成提交，不等待订阅者。
+热配置 revision 从零开始，仅实际值变化递增。替换、禁用恢复、完整移动重挂或 Group 重建为新实例
+创建新引用；同树换 Group 保持条目地址，但不保证 Fiber ID 或热引用保持不变；无关条目不受影响。`await_idle()` 仅等待 Loader 完成提交，不等待订阅者。
 不自动监听文件；将来监听/HMR 插件可复用显式 reload 路径。
 
 本次 Factory API 直接收敛为 `prepare()` 与 `PreparedExtension`；工作区内调用方已迁移，
@@ -165,8 +167,41 @@ Group **只**组织 EntryTree / 生命周期 / 父子 Context，**不再** `exte
 `subtree("include")` / `subtree("include:reports")` 仍可用于 `reload` 或局部路径 CRUD。
 内存根没有来源可 reload。来源的读取、版本检查、写入预检及持久化均为异步操作；Loader 在所属树的操作锁内等待完成。
 Include 将文件事务放入阻塞任务，文件 I/O 不占用 Tokio 异步工作线程。
-`update` 可以同树内移动条目，移动按「旧路径后序释放 → 新路径前序挂载」处理（不做隐式原地迁移）。
-**跨树移动一律拒绝**（`CrossTreeMove`）。
+`Loader::update` 的 `parent: Option<Option<&str>>` 明确区分：
+
+| `parent` | 全局 `Loader::update` | `LoaderSubtree::update` |
+| --- | --- | --- |
+| `None` | 保持当前父级 | 保持当前父级 |
+| `Some(None)` | 移到 Loader 内存根树顶层，可跨来源 | 移到当前子树顶层 |
+| `Some(Some(parent))` | 目标 Group 完整地址，或 Include 载体地址所指树根 | 当前树内的目标 Group ID；不能跨 Include 边界 |
+
+`update` 支持同树换 Group，也支持移动到其他 Include 的树根或 Group。`parent` 是目标 Group 的完整地址；目标为 Include 载体时表示该来源树顶层。同树换 Group 保持地址，因为 Group 不参与地址前缀；父上下文改变时按旧归属后序释放、目标归属前序挂载，Fiber ID 可以变化。仅调整同一父项下的排序不重挂载。
+
+跨 Include 移动将条目及其 Group 内属于同一树的成员一并转入目标树，源树移除、目标树插入；移动后使用目标来源前缀。嵌套 Include 仍是独立来源树，不将其文件内容展开成目标树成员。不能移动到自身或自身后代，目标树任何 Group 内已存在相同 ID 时也拒绝。
+
+移动在任何运行时变更前对两侧完整候选树、目标 ID、Factory、配置、服务声明、来源版本和写回能力进行预检。运行时协调提交后先写目标来源，目标写入成功后才写源来源；目标失败时不写源。任一阶段失败都不回滚已经发生的生命周期或文件变更，错误包含源、目标各自的运行时与持久化状态。两份文件不是一个原子事务，不能把失败解释为未执行；调用方须按返回的实际状态重新读取快照及文件，再显式处理。取消调用方等待不会取消已接受的移动协调。
+
+移动的运行时或写回阶段失败返回 `LoaderControlError::Move`：
+
+```rust
+LoaderControlError::Move {
+    snapshot: Box<LoaderSnapshot>,
+    origin: MovePersistence,
+    destination: MovePersistence,
+    lifecycle_errors: Vec<LoaderError>,
+}
+```
+
+`snapshot` 是实际运行状态，`lifecycle_errors` 列出生命周期阶段的失败；`origin` 和 `destination` 分别描述源、目标持久化：
+
+| `MovePersistence` | 含义 |
+| --- | --- |
+| `NotRequired` | 该侧无需独立写回，例如 Loader 内存根或同树移动的源侧 |
+| `Written { source_id }` | 已完成该来源写回 |
+| `Failed { source_id, error: Box<SourceError> }` | 已尝试写回但失败，保留具体来源错误 |
+| `NotAttempted { source_id }` | 因前序阶段失败而未尝试该来源写回 |
+
+同树移动也使用 `Move` 报告运行时或持久化失败：`origin` 为 `NotRequired`，`destination` 描述所属来源的一次写回。预检阶段直接返回对应配置或来源错误，尚未进入移动提交。不要只检查快照中的路径判断文件是否已经保存。
 
 Loader reconcile 是**局部**的：仅创建、删除、移动、启停或配置/`inject`/`isolate` 变化的 Entry/子树
 参与生命周期；无关 Entry 保留原 Fiber ID、Context 与服务。普通 Entry 仅 `config` 变化且
@@ -257,7 +292,7 @@ Factory 校验的完整验证器。远程、动态、循环引用、改变作用
 `cordis-plugin-include` 不是 Loader builtin。应用须：
 
 ```rust
-catalog.register(IncludeFactory)?;
+catalog.register(&cordis_plugin_include::PLUGIN_DEFINITION, IncludeFactory)?;
 ```
 
 ```toml
@@ -277,7 +312,7 @@ Include 支持 TOML／JSON／YAML、显式 initial 和 patches，不提供自动
 应用读取某一条目视图上的服务时使用路径：
 
 ```rust
-let database = loader.entry_context("include:infrastructure:database")?.get(DATABASE)?;
+let database = loader.entry_context("include:database")?.get(DATABASE)?;
 ```
 
 同一服务域（或同一命名 isolate 槽）内的兄弟条目共享可见性，因此也可以从任一同域
@@ -285,18 +320,18 @@ let database = loader.entry_context("include:infrastructure:database")?.get(DATA
 
 文件来源的变更先完成文件版本及写回往返检查、树预检与 reconcile，再委托 Include 原子写回。
 不把有效树反向拆成基础层，也不另存用户 patch。预检失败（未知 Factory、
-`FactoryChanged`、`PluginKeyChanged`、无效 inject/isolate、非 v3 等）零运行时变更。生命周期失败
-不回滚已触及节点、不提交 `desired`/revision、不由 Loader 发起写回；无关 Entry 继续运行。
+`FactoryChanged`、无效 inject/isolate、非 v3 等）零运行时变更。普通配置更新／reload 的生命周期失败
+不回滚已触及节点、不提交 `desired`/revision、不由 Loader 发起写回；移动提交则保留目标声明并继续结算持久化，失败用上文 `Move` 报告。无关 Entry 继续运行。
 本轮继续尝试其他独立条目，逐项记录业务生命周期错误，控制调用返回首个错误；有失败时不提交待更新热值。
 内存根通过 `create()` 登记且完整预检通过的声明会保留，业务挂载失败由调用返回并标记为 Failed。
 Include 子树初次加载同样保留通过预检的初始声明，不撤销树控制面或无关插件。
-根 `entries()` 返回通过 `create()` 登记的声明或后续成功更新的声明；失败更新不提交新目标。
+根 `entries()` 返回通过 `create()` 登记的声明或后续已提交的声明；普通配置失败更新不提交新目标，已提交的移动保留目标归属与声明。
 来源子树 `entries()` 返回初始加载或后续成功提交的声明，
 两者都不代表全部条目已 Active。
 配置、Factory 预检和内部协调错误仍明确报错；父挂载上下文无效时停止其后代挂载，不转挂到根节点。
 失败后的 `LoaderSnapshot` 仍包含实际已插入的 Failed/Pending 节点，即使该次 reconcile
 尚未来得及提交目标排序；对同一外部配置再次 `reload()` 会重试失败的启用 Entry。
-来源被外部修改时返回明确冲突；写回失败返回带已生效 `LoaderSnapshot` 的 `Persist`。
+来源被外部修改时返回明确冲突；普通配置更新的写回失败返回带已生效 `LoaderSnapshot` 的 `Persist`，移动失败使用 `Move`。
 `await_idle()` 等待 Loader 自己的本次 reconcile，以及 EntryTree 受管 Fiber 的 Loading / Unloading 收敛；不等待 Runtime 上与本 Loader 无关的工作，也不等待仍缺依赖的 Pending。
 它返回实际状态，包括 Failed/Pending；业务生命周期错误由发起变更的返回值、条目诊断及日志报告。
 Loader 关闭及内部协调错误仍返回错误。应用可另外检查自身必需条目的 Active 状态，决定是否继续启动。

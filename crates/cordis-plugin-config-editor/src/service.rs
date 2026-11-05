@@ -7,7 +7,7 @@ use crate::{
     user_patch::UserPatchStore,
 };
 use async_trait::async_trait;
-use cordis_core::{Context, CoreError, Plugin, PluginKey, ServiceId, ServiceKey};
+use cordis_core::{Context, CoreError, Plugin, ServiceId, ServiceKey};
 use cordis_loader::{ConfigRevision, EntryConfigSnapshot, LOADER, Loader, LoaderControlError};
 use std::sync::Arc;
 
@@ -118,10 +118,6 @@ impl ConfigEditorPlugin {
 
 #[async_trait]
 impl Plugin for ConfigEditorPlugin {
-    fn key(&self) -> PluginKey {
-        PluginKey::new("cordis.config-editor")
-    }
-
     fn inject(&self) -> Vec<ServiceId> {
         vec![LOADER.id()]
     }

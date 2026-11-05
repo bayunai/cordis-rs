@@ -20,7 +20,7 @@ use axum::{
     routing::{get, post},
 };
 use cordis_core::{
-    Context, CoreError, EventKey, Fiber, FiberStateSnapshot, Plugin, PluginKey, Runtime, ServiceKey,
+    Context, CoreError, EventKey, Fiber, FiberState, Plugin, PluginDefinition, Runtime, ServiceKey,
 };
 use cordis_plugin_logger_console::ConsoleLoggerPlugin;
 use futures_util::stream::Stream;
@@ -29,7 +29,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     convert::Infallible,
     sync::{
-        Arc, Mutex,
+        Arc, LazyLock, Mutex,
         atomic::{AtomicU32, AtomicU64, Ordering},
     },
     time::Duration,
@@ -52,9 +52,12 @@ static GREETING: ServiceKey<Greeting> = ServiceKey::new("demo.greeting@1");
 static COUNTER: ServiceKey<Counter> = ServiceKey::new("demo.counter@1");
 static NOTE: EventKey<String> = EventKey::new("demo.note@1");
 
-static KEY_NOTE: PluginKey = PluginKey::new("demo.note");
-static KEY_GREETER: PluginKey = PluginKey::new("demo.greeter");
-static KEY_COUNTER: PluginKey = PluginKey::new("demo.counter");
+static DEFINITION_NOTE: LazyLock<PluginDefinition> =
+    LazyLock::new(|| PluginDefinition::named("demo.note"));
+static DEFINITION_GREETER: LazyLock<PluginDefinition> =
+    LazyLock::new(|| PluginDefinition::named("demo.greeter"));
+static DEFINITION_COUNTER: LazyLock<PluginDefinition> =
+    LazyLock::new(|| PluginDefinition::named("demo.counter"));
 
 // --- Plugins -----------------------------------------------------------------
 
@@ -64,9 +67,6 @@ struct NotePlugin {
 
 #[async_trait]
 impl Plugin for NotePlugin {
-    fn key(&self) -> PluginKey {
-        KEY_NOTE
-    }
     async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
         let logger = ctx.logger()?;
         let label = self.label.clone();
@@ -92,9 +92,6 @@ struct GreeterPlugin {
 
 #[async_trait]
 impl Plugin for GreeterPlugin {
-    fn key(&self) -> PluginKey {
-        KEY_GREETER
-    }
     async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
         let logger = ctx.logger()?;
         let text = format!("hello from {}", self.name);
@@ -116,9 +113,6 @@ struct CounterPlugin {
 
 #[async_trait]
 impl Plugin for CounterPlugin {
-    fn key(&self) -> PluginKey {
-        KEY_COUNTER
-    }
     fn inject(&self) -> Vec<cordis_core::ServiceId> {
         vec![NOTE_SERVICE.id(), GREETING.id()]
     }
@@ -211,42 +205,45 @@ struct ErrJson {
     error: String,
 }
 
-fn snapshot_name(s: FiberStateSnapshot) -> &'static str {
+fn snapshot_name(s: FiberState) -> &'static str {
     match s {
-        FiberStateSnapshot::Pending => "Pending",
-        FiberStateSnapshot::Loading => "Loading",
-        FiberStateSnapshot::Active => "Active",
-        FiberStateSnapshot::Failed => "Failed",
-        FiberStateSnapshot::Unloading => "Unloading",
-        FiberStateSnapshot::Disposed => "Disposed",
+        FiberState::Pending => "Pending",
+        FiberState::Loading => "Loading",
+        FiberState::Active => "Active",
+        FiberState::Failed => "Failed",
+        FiberState::Unloading => "Unloading",
+        FiberState::Disposed => "Disposed",
     }
 }
 
-fn plugin_state(runtime: &Runtime, key: &PluginKey) -> String {
+fn plugin_state(runtime: &Runtime, definition: &PluginDefinition) -> String {
     runtime
         .diagnostics()
-        .plugin_registry
+        .fibers
         .iter()
-        .find(|g| g.plugin_key == key.as_str())
-        .and_then(|g| g.fibers.first())
-        .map(|f| snapshot_name(f.state).to_string())
+        .find(|fiber| fiber.definition_id == definition.id())
+        .map(|fiber| snapshot_name(fiber.state).to_string())
         .unwrap_or_else(|| "off".into())
 }
 
 fn build_state(app: &AppState) -> StateJson {
-    let registry = app
-        .runtime
-        .diagnostics()
-        .plugin_registry
+    let snapshot = app.runtime.diagnostics();
+    let registry = snapshot
+        .definitions
         .iter()
-        .map(|g| GroupJson {
-            key: g.plugin_key.to_string(),
-            fibers: g
+        .map(|definition| GroupJson {
+            key: format!(
+                "{} #{}",
+                definition.name.as_deref().unwrap_or("匿名"),
+                definition.definition_id
+            ),
+            fibers: snapshot
                 .fibers
                 .iter()
-                .map(|f| FiberJson {
-                    id: f.id,
-                    state: snapshot_name(f.state).into(),
+                .filter(|fiber| fiber.definition_id == definition.definition_id)
+                .map(|fiber| FiberJson {
+                    id: fiber.id,
+                    state: snapshot_name(fiber.state).into(),
                 })
                 .collect(),
         })
@@ -256,9 +253,9 @@ fn build_state(app: &AppState) -> StateJson {
         note_gen: app.note_gen.load(Ordering::SeqCst),
         greeter_name: app.greeter_name.lock().expect("name").clone(),
         plugins: PluginsJson {
-            note: plugin_state(&app.runtime, &KEY_NOTE),
-            greeter: plugin_state(&app.runtime, &KEY_GREETER),
-            counter: plugin_state(&app.runtime, &KEY_COUNTER),
+            note: plugin_state(&app.runtime, &DEFINITION_NOTE),
+            greeter: plugin_state(&app.runtime, &DEFINITION_GREETER),
+            counter: plugin_state(&app.runtime, &DEFINITION_COUNTER),
         },
         registry,
     }
@@ -304,9 +301,12 @@ async fn api_mount(
             }
             let ver = app.note_gen.fetch_add(1, Ordering::SeqCst) + 1;
             let fiber = root
-                .plugin(Arc::new(NotePlugin {
-                    label: format!("v{ver}"),
-                }))
+                .plugin(
+                    &DEFINITION_NOTE,
+                    Arc::new(NotePlugin {
+                        label: format!("v{ver}"),
+                    }),
+                )
                 .await
                 .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
             *slot = Some(fiber);
@@ -320,7 +320,10 @@ async fn api_mount(
             let name = if seq % 2 == 1 { "Alice" } else { "Bob" };
             *app.greeter_name.lock().expect("name") = name.into();
             let fiber = root
-                .plugin(Arc::new(GreeterPlugin { name: name.into() }))
+                .plugin(
+                    &DEFINITION_GREETER,
+                    Arc::new(GreeterPlugin { name: name.into() }),
+                )
                 .await
                 .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
             *slot = Some(fiber);
@@ -331,9 +334,12 @@ async fn api_mount(
                 return Err(err(StatusCode::CONFLICT, "counter already mounted"));
             }
             let fiber = root
-                .plugin(Arc::new(CounterPlugin {
-                    ticks: app.ticks.clone(),
-                }))
+                .plugin(
+                    &DEFINITION_COUNTER,
+                    Arc::new(CounterPlugin {
+                        ticks: app.ticks.clone(),
+                    }),
+                )
                 .await
                 .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
             *slot = Some(fiber);
@@ -385,7 +391,7 @@ async fn api_unmount(
                     .await
                     .map_err(|e| err(StatusCode::BAD_REQUEST, e.to_string()))?;
             } else {
-                let _ = app.runtime.unmount(KEY_COUNTER).await;
+                let _ = app.runtime.unmount(DEFINITION_COUNTER.id()).await;
             }
         }
         other => {
@@ -442,7 +448,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let runtime = Runtime::new()?;
     let _console = runtime
         .root()
-        .plugin(Arc::new(ConsoleLoggerPlugin::default()))
+        .plugin(
+            &cordis_plugin_logger_console::PLUGIN_DEFINITION,
+            Arc::new(ConsoleLoggerPlugin::default()),
+        )
         .await?;
     let sse = Arc::new(SseLogExporter::default());
     runtime.root().register_log_exporter(sse.clone())?;

@@ -1,6 +1,6 @@
 //! cargo run -p cordis-plugin-include --example volatile_config
 use async_trait::async_trait;
-use cordis_core::{Context, CoreError, Plugin, PluginKey, Runtime, ServiceKey};
+use cordis_core::{Context, CoreError, Plugin, Runtime, ServiceKey};
 use cordis_loader::{
     ConfigRef, EntryOptions, EntryUpdate, ExtensionCatalog, ExtensionFactory, ExtensionsConfig,
     LOADER, LoaderError, LoaderPlugin, PreparedExtension,
@@ -49,9 +49,6 @@ impl ExtensionFactory for Factory {
 
 #[async_trait]
 impl Plugin for Gateway {
-    fn key(&self) -> PluginKey {
-        PluginKey::new("example.gateway")
-    }
     async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
         ctx.provide(LIMITS, self.live.clone())?;
         println!("apply: {}", self.address);
@@ -89,12 +86,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
     };
     fs::write(&cordis, toml::to_string(&initial)?)?;
     let mut catalog = ExtensionCatalog::new();
-    catalog.register(Factory)?;
-    catalog.register(IncludeFactory)?;
+    catalog.register(
+        &cordis_core::PluginDefinition::named("example.gateway"),
+        Factory,
+    )?;
+    catalog.register(&cordis_plugin_include::PLUGIN_DEFINITION, IncludeFactory)?;
     let runtime = Runtime::new()?;
     let mut loader_fiber = runtime
         .root()
-        .plugin(Arc::new(LoaderPlugin::new(catalog)))
+        .plugin(
+            &cordis_loader::PLUGIN_DEFINITION,
+            Arc::new(LoaderPlugin::new(catalog)),
+        )
         .await?;
     let loader = runtime.root().get(LOADER)?;
     loader

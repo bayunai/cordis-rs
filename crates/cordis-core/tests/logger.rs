@@ -3,7 +3,7 @@
 use async_trait::async_trait;
 use cordis_core::{
     ConfigKey, Context, CoreError, LOG_BUFFER_CAPACITY, LOGGER_CONFIG, LogExporter, LogLevel,
-    LogRecord, LoggerConfig, Plugin, PluginKey, Runtime, ServiceKey,
+    LogRecord, LoggerConfig, Plugin, Runtime, ServiceKey,
 };
 use std::sync::{Arc, Mutex};
 
@@ -152,12 +152,11 @@ struct LoggingPlugin {
     records: Arc<Mutex<Vec<LogRecord>>>,
 }
 
+static LOGGINGPLUGIN_DEFINITION: std::sync::LazyLock<cordis_core::PluginDefinition> =
+    std::sync::LazyLock::new(|| cordis_core::PluginDefinition::named("demo.logger.plugin"));
+
 #[async_trait]
 impl Plugin for LoggingPlugin {
-    fn key(&self) -> PluginKey {
-        PluginKey::new("demo.logger.plugin")
-    }
-
     async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
         ctx.register_log_exporter(Arc::new(CaptureExporter::all(self.records.clone())))?;
         ctx.logger()?.info("from-apply");
@@ -168,14 +167,17 @@ impl Plugin for LoggingPlugin {
 }
 
 #[tokio::test]
-async fn plugin_apply_and_effect_attach_fiber_and_plugin_key() {
+async fn plugin_apply_and_effect_attach_fiber_and_definition() {
     let runtime = Runtime::new().unwrap();
     let records = Arc::new(Mutex::new(Vec::new()));
     let mut fiber = runtime
         .root()
-        .plugin(Arc::new(LoggingPlugin {
-            records: records.clone(),
-        }))
+        .plugin(
+            &LOGGINGPLUGIN_DEFINITION,
+            Arc::new(LoggingPlugin {
+                records: records.clone(),
+            }),
+        )
         .await
         .unwrap();
     let fiber_id = fiber.id();
@@ -183,10 +185,8 @@ async fn plugin_apply_and_effect_attach_fiber_and_plugin_key() {
     assert!(captured.len() >= 2);
     for record in &captured {
         assert_eq!(record.fiber_id, Some(fiber_id));
-        assert_eq!(
-            record.plugin_key,
-            Some(PluginKey::new("demo.logger.plugin"))
-        );
+        assert_eq!(record.definition_id, Some(LOGGINGPLUGIN_DEFINITION.id()));
+        assert_eq!(record.plugin_name.as_deref(), Some("demo.logger.plugin"));
         assert_eq!(record.target, "demo.logger.plugin");
     }
     fiber.dispose_wait().await.unwrap();

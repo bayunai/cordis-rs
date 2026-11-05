@@ -30,15 +30,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Console / Timer 为 Host 显式能力，保留 Fiber 直至 shutdown；不进入 Loader builtin。
     let _console_fiber = host
         .root()
-        .plugin(Arc::new(ConsoleLoggerPlugin::new(ConsoleLoggerConfig {
-            colors: cordis_plugin_logger_console::ColorMode::Auto,
-            ..ConsoleLoggerConfig::default()
-        })))
+        .plugin(
+            &cordis_plugin_logger_console::PLUGIN_DEFINITION,
+            Arc::new(ConsoleLoggerPlugin::new(ConsoleLoggerConfig {
+                colors: cordis_plugin_logger_console::ColorMode::Auto,
+                ..ConsoleLoggerConfig::default()
+            })),
+        )
         .await?;
-    let _timer_fiber = host.root().plugin(Arc::new(TimerPlugin)).await?;
+    let _timer_fiber = host
+        .root()
+        .plugin(
+            &cordis_plugin_timer::PLUGIN_DEFINITION,
+            Arc::new(TimerPlugin),
+        )
+        .await?;
     // Loader 先就绪，根配置由应用显式创建的 Include 读取。
     let loader = LoaderPlugin::new(host::build_catalog()?);
-    let _loader_fiber = host.root().plugin(Arc::new(loader)).await?;
+    let _loader_fiber = host
+        .root()
+        .plugin(&cordis_loader::PLUGIN_DEFINITION, Arc::new(loader))
+        .await?;
 
     // 真实应用在此运行 HTTP、窗口事件循环或后台任务。
     let loader = host.root().get(cordis_loader::LOADER)?;

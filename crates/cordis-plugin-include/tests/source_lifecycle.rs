@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use cordis_core::{Context, CoreError, Fiber, FiberState, Plugin, PluginKey, Runtime};
+use cordis_core::{Context, CoreError, Fiber, FiberState, Plugin, Runtime};
 use cordis_loader::{
     ConfigRef, EntryOptions, EntryUpdate, ExtensionCatalog, ExtensionFactory, ExtensionsConfig,
     LOADER, Loader, LoaderError, LoaderPlugin, PreparedExtension,
@@ -64,9 +64,6 @@ impl ExtensionFactory for Factory {
 }
 #[async_trait]
 impl Plugin for Instance {
-    fn key(&self) -> PluginKey {
-        PluginKey::new("test")
-    }
     async fn apply(&self, _: &Context) -> Result<(), CoreError> {
         self.counts.applies.fetch_add(1, Ordering::SeqCst);
         if *self.value.get().value == 99 {
@@ -107,12 +104,22 @@ impl Harness {
         fs::write(dir.path().join("home.patches.toml"), "version = 1\n").unwrap();
         let counts = Arc::new(Counts::default());
         let mut catalog = ExtensionCatalog::new();
-        catalog.register(IncludeFactory).unwrap();
-        catalog.register(Factory(counts.clone())).unwrap();
+        catalog
+            .register(&cordis_plugin_include::PLUGIN_DEFINITION, IncludeFactory)
+            .unwrap();
+        catalog
+            .register(
+                &cordis_core::PluginDefinition::anonymous(),
+                Factory(counts.clone()),
+            )
+            .unwrap();
         let runtime = Runtime::new().unwrap();
         let loader_fiber = runtime
             .root()
-            .plugin(Arc::new(LoaderPlugin::new(catalog)))
+            .plugin(
+                &cordis_loader::PLUGIN_DEFINITION,
+                Arc::new(LoaderPlugin::new(catalog)),
+            )
             .await
             .unwrap();
         let loader = (*runtime.root().get(LOADER).unwrap()).clone();
@@ -121,16 +128,22 @@ impl Harness {
         loader.create(entry, None, None).await.unwrap();
         let editor_fiber = runtime
             .root()
-            .plugin(Arc::new(ConfigEditorPlugin::new(ConfigEditorConfig::new(
-                Vec::new(),
-                dir.path().join("user.patches.toml"),
-                dir.path().join("home.patches.toml"),
-            ))))
+            .plugin(
+                &cordis_plugin_config_editor::PLUGIN_DEFINITION,
+                Arc::new(ConfigEditorPlugin::new(ConfigEditorConfig::new(
+                    Vec::new(),
+                    dir.path().join("user.patches.toml"),
+                    dir.path().join("home.patches.toml"),
+                ))),
+            )
             .await
             .unwrap();
         let settings_fiber = runtime
             .root()
-            .plugin(Arc::new(SettingsPlugin))
+            .plugin(
+                &cordis_plugin_settings::PLUGIN_DEFINITION,
+                Arc::new(SettingsPlugin),
+            )
             .await
             .unwrap();
         let settings = (*runtime.root().get(SETTINGS).unwrap()).clone();

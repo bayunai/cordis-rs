@@ -1,4 +1,4 @@
-//! 插件插拔 Demo：多个独立 PluginKey，演示挂载、依赖激活、热替换与统一卸载。
+//! 插件插拔 Demo：多个独立 PluginDefinition，演示挂载、依赖激活、热替换与统一卸载。
 //!
 //! ```bash
 //! cargo run -p cordis-core --example plugin_hotplug
@@ -6,11 +6,11 @@
 
 use async_trait::async_trait;
 use cordis_core::{
-    Context, CoreError, EventKey, FiberState, Plugin, PluginKey, Runtime, ServiceKey,
+    Context, CoreError, EventKey, FiberState, Plugin, PluginDefinition, Runtime, ServiceKey,
 };
 use cordis_plugin_logger_console::ConsoleLoggerPlugin;
 use std::sync::{
-    Arc,
+    Arc, LazyLock,
     atomic::{AtomicU64, Ordering},
 };
 
@@ -30,9 +30,12 @@ static GREETING: ServiceKey<Greeting> = ServiceKey::new("demo.greeting@1");
 static COUNTER: ServiceKey<Counter> = ServiceKey::new("demo.counter@1");
 static NOTE: EventKey<String> = EventKey::new("demo.note@1");
 
-static KEY_NOTE: PluginKey = PluginKey::new("demo.note");
-static KEY_GREETER: PluginKey = PluginKey::new("demo.greeter");
-static KEY_COUNTER: PluginKey = PluginKey::new("demo.counter");
+static DEFINITION_NOTE: LazyLock<PluginDefinition> =
+    LazyLock::new(|| PluginDefinition::named("demo.note"));
+static DEFINITION_GREETER: LazyLock<PluginDefinition> =
+    LazyLock::new(|| PluginDefinition::named("demo.greeter"));
+static DEFINITION_COUNTER: LazyLock<PluginDefinition> =
+    LazyLock::new(|| PluginDefinition::named("demo.counter"));
 
 // --- Plugins -----------------------------------------------------------------
 
@@ -43,10 +46,6 @@ struct NotePlugin {
 
 #[async_trait]
 impl Plugin for NotePlugin {
-    fn key(&self) -> PluginKey {
-        KEY_NOTE
-    }
-
     async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
         let logger = ctx.logger()?;
         logger.info(format!("[{}] note apply", self.label));
@@ -71,10 +70,6 @@ struct GreeterPlugin {
 
 #[async_trait]
 impl Plugin for GreeterPlugin {
-    fn key(&self) -> PluginKey {
-        KEY_GREETER
-    }
-
     async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
         let logger = ctx.logger()?;
         let text = format!("hello from {}", self.name);
@@ -96,10 +91,6 @@ struct CounterPlugin {
 
 #[async_trait]
 impl Plugin for CounterPlugin {
-    fn key(&self) -> PluginKey {
-        KEY_COUNTER
-    }
-
     fn inject(&self) -> Vec<cordis_core::ServiceId> {
         vec![NOTE_SERVICE.id(), GREETING.id()]
     }
@@ -148,15 +139,21 @@ impl Plugin for CounterPlugin {
 fn log_registry(runtime: &Runtime, title: &str) {
     let logger = runtime.root().logger().expect("logger");
     logger.info(format!("--- {title} ---"));
-    for group in &runtime.diagnostics().plugin_registry {
-        let states: Vec<_> = group
+    let snapshot = runtime.diagnostics();
+    for definition in &snapshot.definitions {
+        let states: Vec<_> = snapshot
             .fibers
             .iter()
-            .map(|f| format!("{}:{:?}", f.id, f.state))
+            .filter(|fiber| fiber.definition_id == definition.definition_id)
+            .map(|fiber| format!("{}:{:?}", fiber.id, fiber.state))
             .collect();
-        logger.info(format!("  {} → [{}]", group.plugin_key, states.join(", ")));
+        logger.info(format!(
+            "  {} → [{}]",
+            definition.definition_id,
+            states.join(", ")
+        ));
     }
-    if runtime.diagnostics().plugin_registry.is_empty() {
+    if snapshot.definitions.is_empty() {
         logger.info("  (empty)");
     }
 }
@@ -166,19 +163,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let runtime = Runtime::new()?;
     let root = runtime.root();
     let _console = root
-        .plugin(Arc::new(ConsoleLoggerPlugin::default()))
+        .plugin(
+            &cordis_plugin_logger_console::PLUGIN_DEFINITION,
+            Arc::new(ConsoleLoggerPlugin::default()),
+        )
         .await?;
     let logger = root.logger()?;
     let ticks = Arc::new(AtomicU64::new(0));
 
     // 1) 先挂 Note；Counter 依赖未齐，保持 Pending。
-    let mut note = root.plugin(Arc::new(NotePlugin { label: "v1" })).await?;
+    let mut note = root
+        .plugin(&DEFINITION_NOTE, Arc::new(NotePlugin { label: "v1" }))
+        .await?;
     logger.info(format!("note state: {:?}", note.state()));
 
     let mut counter = root
-        .plugin(Arc::new(CounterPlugin {
-            ticks: ticks.clone(),
-        }))
+        .plugin(
+            &DEFINITION_COUNTER,
+            Arc::new(CounterPlugin {
+                ticks: ticks.clone(),
+            }),
+        )
         .await?;
     runtime.settle().await;
     logger.info(format!(
@@ -190,9 +195,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 2) 挂 Greeter → Counter 依赖齐，应变为 Active。
     let mut greeter = root
-        .plugin(Arc::new(GreeterPlugin {
-            name: "Alice".into(),
-        }))
+        .plugin(
+            &DEFINITION_GREETER,
+            Arc::new(GreeterPlugin {
+                name: "Alice".into(),
+            }),
+        )
         .await?;
     runtime.settle().await;
     logger.info(format!("counter after greeter: {:?}", counter.state()));
@@ -202,7 +210,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     root.emit(NOTE, &"manual ping".into())?;
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
-    // 3) 同 Key 热替换 Note（v1 → v2）。
+    // 3) 同 Definition 热替换 Note（v1 → v2）。
     note.replace(Arc::new(NotePlugin { label: "v2" })).await?;
     runtime.settle().await;
     root.emit(NOTE, &"after note replace".into())?;
@@ -225,7 +233,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 5) 再插一版 Greeter，Counter 重新 Active。
     greeter = root
-        .plugin(Arc::new(GreeterPlugin { name: "Bob".into() }))
+        .plugin(
+            &DEFINITION_GREETER,
+            Arc::new(GreeterPlugin { name: "Bob".into() }),
+        )
         .await?;
     runtime.settle().await;
     logger.info(format!(
@@ -234,8 +245,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ));
     assert_eq!(counter.state(), FiberState::Active);
 
-    // 6) Runtime 级按 Key 卸载 Counter（与 dispose_wait 等价收口）。
-    let n = runtime.unmount(KEY_COUNTER).await?;
+    // 6) Runtime 级按 Definition ID 卸载 Counter（与 dispose_wait 等价收口）。
+    let n = runtime.unmount(DEFINITION_COUNTER.id()).await?;
     logger.info(format!("unmount counter fibers: {n}"));
     log_registry(&runtime, "counter unmounted");
 

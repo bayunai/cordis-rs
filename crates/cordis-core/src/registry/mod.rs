@@ -1,41 +1,34 @@
 //! 内部单一协调枢纽，不是公开 API。
 //!
-//! 聚合节点、provider、注入与调度；子模块：`node` 上下文节点，`provider` 注册撤销，
-//! `injection` 响应式注入收敛，`scheduler` 后台重算调度。
+//! 聚合服务、统一 Fiber 与调度；`dependency` 管理执行绑定，
+//! `provider` 管理服务注册，`scheduler` 负责后台依赖重算。
 
 pub(crate) mod dependency;
-pub(crate) mod injection;
 pub(crate) mod provider;
 pub(crate) mod scheduler;
 
-pub(crate) use injection::InjectionPhase;
 pub(crate) use provider::ProviderKey;
 
-pub(crate) type InjectionId = u64;
 pub(crate) type ListenerId = u64;
 
 use crate::{
     ConfigId, Context, ServiceId,
     diagnostics::{
-        EffectSnapshot, FiberStateSnapshot, InjectFiberSnapshot, IsolationSnapshot,
-        PluginRegistryFiberSnapshot, PluginRegistrySnapshot, ProviderSnapshot, RuntimeSnapshot,
-        UnavailableDependencySnapshot,
+        EffectSnapshot, IsolationSnapshot, PluginDefinitionSnapshot, ProviderSnapshot,
+        RuntimeSnapshot, UnavailableDependencySnapshot,
     },
     event::listener::{EventContract, EventListener},
-    fiber::{FiberInner, FiberState, FiberStateChange},
+    fiber::{FiberInner, FiberStateChange},
     isolation::RuntimeToken,
-    plugin::{PluginKey, group::PluginGroup},
-    registry::{
-        injection::InjectionRecord,
-        provider::{EffectRecord, ProviderRecord},
-    },
+    plugin::{PluginDefinitionId, group::DefinitionGroup},
+    registry::provider::{EffectRecord, ProviderRecord},
     service::resolver::{ProviderResolution, effective_availability, resolve_provider_state},
 };
 use std::{
     any::TypeId,
     collections::{HashMap, HashSet},
     sync::{
-        Arc, Mutex, Weak,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
@@ -46,11 +39,10 @@ use tokio_util::sync::CancellationToken;
 pub(crate) struct RegistryState {
     pub(crate) providers: HashMap<ProviderKey, ProviderRecord>,
     pub(crate) bindings: HashMap<u64, dependency::DependencyBinding>,
-    pub(crate) injections: HashMap<InjectionId, InjectionRecord>,
     pub(crate) listeners: HashMap<&'static str, Vec<EventListener>>,
     pub(crate) effects: HashMap<u64, EffectRecord>,
-    pub(crate) plugin_fibers: HashMap<u64, Weak<FiberInner>>,
-    pub(crate) plugin_index: HashMap<PluginKey, PluginGroup>,
+    pub(crate) fibers: HashMap<u64, Arc<FiberInner>>,
+    pub(crate) plugin_index: HashMap<PluginDefinitionId, DefinitionGroup>,
     pub(crate) service_types: HashMap<ServiceId, TypeId>,
     pub(crate) config_types: HashMap<ConfigId, TypeId>,
     pub(crate) event_contracts: HashMap<&'static str, EventContract>,
@@ -103,10 +95,9 @@ impl Registry {
             state: Mutex::new(RegistryState {
                 providers: HashMap::new(),
                 bindings: HashMap::new(),
-                injections: HashMap::new(),
                 listeners: HashMap::new(),
                 effects: HashMap::new(),
-                plugin_fibers: HashMap::new(),
+                fibers: HashMap::new(),
                 plugin_index: HashMap::new(),
                 service_types: HashMap::new(),
                 config_types: HashMap::new(),
@@ -215,27 +206,6 @@ impl Registry {
                 availability: effective_availability(&state, provider),
             })
             .collect();
-        let inject_fibers = state
-            .injections
-            .iter()
-            .map(|(id, injection)| {
-                let (missing, unavailable) =
-                    dependency_diagnostics(&state, &injection.context, &injection.dependencies);
-                InjectFiberSnapshot {
-                    id: *id,
-                    context_depth: injection.context.context_depth(),
-                    phase: FiberStateSnapshot::from(injection.phase),
-                    dependencies: injection
-                        .dependencies
-                        .iter()
-                        .map(|key| key.as_str())
-                        .collect(),
-                    missing_dependencies: missing.iter().map(|service| service.as_str()).collect(),
-                    unavailable_dependencies: unavailable,
-                    last_error: injection.last_error.clone(),
-                }
-            })
-            .collect();
         let effects = state
             .effects
             .iter()
@@ -252,50 +222,29 @@ impl Registry {
                 cleanup_count: effect.scope.cleanup_count(),
             })
             .collect();
-        let plugin_fiber_arcs = state
-            .plugin_fibers
-            .values()
-            .filter_map(Weak::upgrade)
-            .collect::<Vec<_>>();
-        let mut plugin_registry: Vec<PluginRegistrySnapshot> = state
+        let plugin_fiber_arcs = state.fibers.values().cloned().collect::<Vec<_>>();
+        let mut definitions = state
             .plugin_index
             .iter()
-            .map(|(key, group)| PluginRegistrySnapshot {
-                plugin_key: key.as_str(),
+            .map(|(id, group)| PluginDefinitionSnapshot {
+                definition_id: *id,
+                name: group.definition.shared_name(),
                 unmounting: group.unmounting,
-                fibers: group
-                    .fibers
-                    .iter()
-                    .filter_map(Weak::upgrade)
-                    .map(|fiber| {
-                        let state = match *fiber.state.lock().expect("state") {
-                            FiberState::Pending => FiberStateSnapshot::Pending,
-                            FiberState::Loading => FiberStateSnapshot::Loading,
-                            FiberState::Active => FiberStateSnapshot::Active,
-                            FiberState::Failed => FiberStateSnapshot::Failed,
-                            FiberState::Unloading => FiberStateSnapshot::Unloading,
-                            FiberState::Disposed => FiberStateSnapshot::Disposed,
-                        };
-                        PluginRegistryFiberSnapshot {
-                            id: fiber.id,
-                            state,
-                        }
-                    })
-                    .collect(),
+                fiber_ids: group.fibers.clone(),
             })
-            .collect();
-        plugin_registry.sort_by_key(|item| item.plugin_key);
+            .collect::<Vec<_>>();
+        definitions.sort_by_key(|definition| definition.definition_id);
+
         drop(state);
-        let plugin_fibers = plugin_fiber_arcs
+        let fibers = plugin_fiber_arcs
             .iter()
             .map(|fiber| fiber.snapshot())
             .collect();
         RuntimeSnapshot {
             isolations,
             providers,
-            plugin_fibers,
-            plugin_registry,
-            inject_fibers,
+            fibers,
+            definitions,
             effects,
         }
     }

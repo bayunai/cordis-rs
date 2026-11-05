@@ -4,7 +4,7 @@
 资源归属、事件与运行时诊断。它不是 HTTP 框架、数据库抽象或动态插件加载器；这些能力应由
 应用或独立扩展实现。
 
-> 当前版本为 [`0.2.0`](CHANGELOG.md#020---2026-09-20)，公共 API 尚未稳定。升级 `0.x` 版本前请阅读变更说明并自行评估破坏性变更。
+> 最近发布版本为 [`0.2.0`](CHANGELOG.md#020---2026-09-20)。本文展示当前工作区的未发布 API；接入前请阅读 [Definition 与 Fiber 迁移说明](docs/migration-plugin-definitions.md)。公共 API 尚未稳定。
 
 ## 适用场景
 
@@ -32,35 +32,34 @@
 
 ## 快速开始
 
-在应用的 `Cargo.toml` 中以 Git 依赖接入当前未发布版本：
+在应用的 `Cargo.toml` 中通过本地路径接入当前工作区的未发布版本：
 
 ```toml
 [dependencies]
 async-trait = "0.1"
-cordis-core = { git = "https://github.com/bayunai/cordis-rs", tag = "v0.2.0" }
+cordis-core = { path = "/path/to/cordis-rs/crates/cordis-core" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
-> `tag` 应替换为你实际审计并固定的发布标签；不建议依赖浮动分支。
+> 将 `path` 替换为本地 checkout 的绝对路径。正式发布后再改用包含本次 API 的固定发布版本。
 
 ```rust
 use async_trait::async_trait;
-use cordis_core::{Context, CoreError, Plugin, Runtime, ServiceKey};
-use std::sync::Arc;
+use cordis_core::{Context, CoreError, Plugin, PluginDefinition, Runtime, ServiceKey};
+use std::sync::{Arc, LazyLock};
 
 #[derive(Debug)]
 struct Clock;
 
 static CLOCK: ServiceKey<Clock> = ServiceKey::new("example.clock@1");
 
+static CLOCK_DEFINITION: LazyLock<PluginDefinition> =
+    LazyLock::new(|| PluginDefinition::named("example.clock"));
+
 struct ClockPlugin;
 
 #[async_trait]
 impl Plugin for ClockPlugin {
-    fn key(&self) -> cordis_core::PluginKey {
-        cordis_core::PluginKey::new("example.clock")
-    }
-
     async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
         ctx.provide(CLOCK, Clock)?;
         Ok(())
@@ -78,7 +77,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(())
     })?;
 
-    let mut plugin = root.plugin(Arc::new(ClockPlugin)).await?;
+    let mut plugin = root.plugin(&CLOCK_DEFINITION, Arc::new(ClockPlugin)).await?;
     runtime.settle().await;
     plugin.dispose_wait().await?;
     runtime.shutdown().await?;
@@ -88,7 +87,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## 示例与文档
 
-Loader Factory 统一使用 `prepare()` 返回预备结果，通过 `catalog.register()` 登记。
+Loader Factory 统一使用 `prepare()` 返回预备结果，通过 `catalog.register(&definition, factory)` 登记。
 普通插件使用 `PreparedExtension::ordinary()`，热配置使用 `volatile()`，Include 等来源树载体
 使用 `tree()`；普通插件无需定义空热配置。文件编解码由 Include 负责。
 
@@ -98,9 +97,10 @@ Loader Factory 统一使用 `prepare()` 返回预备结果，通过 `catalog.reg
 - [`reactive`](examples/reactive.rs)：最小服务注入与响应式重算。
 - [`plugin_hotplug`](examples/plugin_hotplug.rs)：插件替换与卸载。
 - [`plugin_web`](examples/plugin_web.rs)：将运行时能力接入 HTTP 示例。
-- [`plugin_stack`](examples/plugin_stack/main.rs)：Include 文件树局部 reconcile 网页 Demo（`include:side` + `include:app/{db,log-store,http}`）。
+- [`plugin_stack`](examples/plugin_stack/main.rs)：Include 文件树局部 reconcile 网页 Demo（`include:side` 与 `app` Group 内的 `include:db`、`include:log-store`、`include:http`）。
 - [`host_bootstrap`](crates/cordis-host/examples/host_bootstrap/main.rs)：可复制的 Host 模板，包含入口、静态 Catalog、插件目录与 TOML 扩展清单。
 - [架构与边界](docs/architecture.md)
+- [Definition 与 Fiber 接入迁移](docs/migration-plugin-definitions.md)
 - [Host 编排](docs/host.md)
 - [配置控制面拆分](docs/config-surface.md)
 - [Include 文件配置树与迁移](docs/include.md)
@@ -117,7 +117,7 @@ cargo run -p cordis-host --example host_bootstrap
 应用入口先通过 `LoaderPlugin::new(catalog)` 显式挂载空 Loader，再调用
 `loader.create(include_root_entry("include", "cordis.toml")?, None, None).await?` 登记根文件。
 启动与运行期共用 `create()`；Loader 根树只保存在内存，文件编辑
-使用 `loader.subtree("include")` 的局部路径，服务读取使用 `loader.entry_context("include:父:子")`。
+使用 `loader.subtree("include")` 的树内 ID，服务读取使用 `loader.entry_context("include:worker")`。Group 不增加地址前缀；嵌套 Include 才增加前缀，例如 `include:reports:importer`。
 应用与受信任插件通过 `ctx.get(LOADER)` 取得管理服务。Factory 与可配置 inject 均为静态、
 强类型目录，并公开 JSON Schema 供管理界面生成表单。详情见[Host 文档](docs/host.md)。
 
@@ -132,7 +132,9 @@ cargo run -p cordis-host --example host_bootstrap
 - Loader EntryTree 中：顶层条目共享 Loader 根服务域；服务隔离由条目 `isolate` 声明驱动（见 Host 文档）；
   普通 Entry 默认不是服务边界。嵌套文件树由可选的 `cordis-plugin-include` 附着为独立
   `RuntimeTree`（须 Catalog 显式注册）。详见[Host 文档](docs/host.md)。
-- `Plugin` 用 `PluginKey` 标识，并由 Fiber 管理加载、替换、卸载与依赖变更后的重启。
+- Entry ID 在所属树内唯一，包括所有 Group 成员；空 ID 和包含 `:` 的 ID 均拒绝。Group 内移动保持地址，同一 Include 内的组结构不参与地址拼接。跨 Include 移动改变来源前缀，并按目标、源的顺序持久化；失败报告两侧状态，不回滚已发生的运行时或文件变更。
+- `PluginDefinition` 显式提供身份与可选名称，`Plugin` 只声明依赖与执行逻辑。`plugin(&definition, plugin)` 返回拥有型 `Fiber`，Drop 会卸载；`inject()` 返回可克隆的非拥有型 `FiberHandle`，Drop 不影响运行。
+- `PluginDefinition::clone()` 共享身份；重复调用 `named()` 即使同名也创建不同身份，Definition 可跨 Runtime 使用。`Failed` 只通过显式 `restart()` 或插件 `replace()` 恢复，依赖变化不自动重试。
 - `Effect` 统一归属插件的任务、监听器和清理回调；长期任务使用 `spawn`，一次性异步清理使用
   `on_dispose_async`。
 - 受控退出必须调用 `Runtime::shutdown()`；仅 Drop 不会启动尚未执行的异步清理。

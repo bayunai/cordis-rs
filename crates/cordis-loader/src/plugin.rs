@@ -10,7 +10,7 @@ use crate::{
     tree::{RuntimeTree, aggregate_snapshot},
 };
 use async_trait::async_trait;
-use cordis_core::{Context, CoreError, Fiber, FiberState, Plugin, PluginKey};
+use cordis_core::{Context, CoreError, Fiber, FiberState, Plugin, PluginDefinitionId};
 use std::{
     collections::HashMap,
     sync::{
@@ -27,7 +27,7 @@ pub(crate) struct RuntimeEntry {
     pub(crate) group: bool,
     pub(crate) enabled: bool,
     pub(crate) fiber: Option<Fiber>,
-    pub(crate) plugin_key: Option<PluginKey>,
+    pub(crate) definition_id: PluginDefinitionId,
     pub(crate) context: Context,
     /// 普通 Entry 的工厂 id；Group 为 `None`。
     pub(crate) factory: Option<String>,
@@ -58,6 +58,7 @@ impl LoaderPlugin {
             alive: AtomicBool::new(true),
             events,
             change_revision: AtomicU64::new(0),
+            batching_snapshot: Mutex::new(false),
             state_progress: Notify::new(),
             config_operations: tokio::sync::Mutex::new(()),
         });
@@ -68,10 +69,6 @@ impl LoaderPlugin {
 
 #[async_trait]
 impl Plugin for LoaderPlugin {
-    fn key(&self) -> PluginKey {
-        PluginKey::new("cordis.loader")
-    }
-
     async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
         let inner = self
             .initial_state(ctx.clone())
@@ -109,6 +106,7 @@ pub(crate) struct LoaderInner {
     pub(crate) alive: AtomicBool,
     pub(crate) events: broadcast::Sender<LoaderEvent>,
     change_revision: AtomicU64,
+    pub(crate) batching_snapshot: Mutex<bool>,
     state_progress: Notify,
 }
 
@@ -152,6 +150,10 @@ impl LoaderInner {
 
     /// 发布运行树快照失效通知；消费者必须重新读取完整快照。
     pub(crate) fn publish_snapshot_changed(&self) {
+        let batching = self.batching_snapshot.lock().expect("snapshot batch");
+        if *batching {
+            return;
+        }
         let revision = self.change_revision.fetch_add(1, Ordering::AcqRel) + 1;
         let _ = self.events.send(LoaderEvent::SnapshotChanged { revision });
     }

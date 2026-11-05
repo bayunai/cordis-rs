@@ -1,6 +1,4 @@
-//! [`Plugin`] trait：Core 的挂载契约；公开 [`PluginKey`]。
-//!
-//! 配置、Schema、发现与热更新属 Host；子模块 `group` 负责按 Key 归组与统一卸载。
+//! 插件定义身份与实例执行契约；配置构造由宿主和 Loader 负责。
 
 pub(crate) mod group;
 
@@ -9,63 +7,83 @@ use async_trait::async_trait;
 use std::{
     fmt,
     panic::{AssertUnwindSafe, catch_unwind},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
-/// 稳定的插件身份；同 Runtime 内按 Key 归组 Fiber。
-#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct PluginKey(&'static str);
+static NEXT_DEFINITION: AtomicU64 = AtomicU64::new(1);
 
-impl PluginKey {
-    pub const fn new(id: &'static str) -> Self {
-        Self(id)
-    }
+/// 进程内插件定义身份；不用于持久配置或跨进程寻址。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct PluginDefinitionId(u64);
 
-    pub const fn as_str(self) -> &'static str {
+impl PluginDefinitionId {
+    pub const fn as_u64(self) -> u64 {
         self.0
     }
 }
 
-impl fmt::Display for PluginKey {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(formatter)
+impl fmt::Display for PluginDefinitionId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
     }
 }
 
-impl fmt::Debug for PluginKey {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.debug_tuple("PluginKey").field(&self.0).finish()
+#[derive(Debug)]
+struct Definition {
+    id: PluginDefinitionId,
+    name: Option<Arc<str>>,
+}
+
+/// 不可变插件定义句柄；克隆共享身份，同名新定义仍具有独立身份。
+#[derive(Clone, Debug)]
+pub struct PluginDefinition(Arc<Definition>);
+
+impl PluginDefinition {
+    pub fn named(name: impl Into<Arc<str>>) -> Self {
+        Self::new(Some(name.into()))
+    }
+    pub fn anonymous() -> Self {
+        Self::new(None)
+    }
+    fn new(name: Option<Arc<str>>) -> Self {
+        let id = NEXT_DEFINITION
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .expect("plugin definition identity exhausted");
+        Self(Arc::new(Definition {
+            id: PluginDefinitionId(id),
+            name,
+        }))
+    }
+    pub fn id(&self) -> PluginDefinitionId {
+        self.0.id
+    }
+    pub fn name(&self) -> Option<&str> {
+        self.0.name.as_deref()
+    }
+    pub(crate) fn shared_name(&self) -> Option<Arc<str>> {
+        self.0.name.clone()
     }
 }
 
-/// 已在用户边界读取并通过 panic 隔离的 Plugin 静态元数据。
 pub(crate) struct PluginMetadata {
-    pub(crate) key: PluginKey,
     pub(crate) dependencies: Vec<ServiceId>,
 }
 
 pub(crate) fn read_metadata(plugin: &dyn Plugin) -> Result<PluginMetadata, CoreError> {
-    let key = catch_unwind(AssertUnwindSafe(|| plugin.key()))
-        .map_err(|payload| CoreError::PluginApply(format_panic_message("plugin key", payload)))?;
     let dependencies = catch_unwind(AssertUnwindSafe(|| plugin.inject())).map_err(|payload| {
         CoreError::PluginApply(format_panic_message("plugin inject", payload))
     })?;
-    Ok(PluginMetadata { key, dependencies })
+    Ok(PluginMetadata { dependencies })
 }
 
-/// 可挂载到 Context 的极简插件实例。
-///
-/// 宿主负责校验配置并据此构造新的、配置不可变的插件实例；Core 只负责挂载与
-/// Fiber 生命周期，不保存 JSON、Schema 或可变插件配置。配置变更应由宿主构造
-/// 新实例后调用 [`crate::Fiber::replace`]，而不是修改已挂载实例后 `restart()`。
+/// 插件实例的执行内容；身份由挂载时传入的 PluginDefinition 决定。
 #[async_trait]
 pub trait Plugin: Send + Sync {
-    /// 稳定插件身份；`Runtime::unmount` / Fiber 归组按此 Key。
-    fn key(&self) -> PluginKey;
-
-    /// 插件级依赖声明；未齐时 Fiber 保持 [`crate::FiberState::Pending`]。
     fn inject(&self) -> Vec<ServiceId> {
         Vec::new()
     }
-
     async fn apply(&self, ctx: &Context) -> Result<(), CoreError>;
 }

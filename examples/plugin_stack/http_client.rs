@@ -4,11 +4,11 @@
 //! 或响应正文（正文仅经 HTTP API 返回页面）。
 
 use async_trait::async_trait;
-use cordis_core::{Context, CoreError, Logger, Plugin, PluginKey};
+use cordis_core::{Context, CoreError, Logger, Plugin};
 use reqwest::Client;
 use std::time::Duration;
 
-use crate::keys::{HTTP, KEY_HTTP};
+use crate::keys::HTTP;
 use crate::url_redact::redact_url;
 
 /// Loader 可替换配置；仅改 label 时应走 `Fiber::replace` 且保留 Fiber ID。
@@ -92,10 +92,6 @@ pub struct HttpPlugin {
 
 #[async_trait]
 impl Plugin for HttpPlugin {
-    fn key(&self) -> PluginKey {
-        KEY_HTTP
-    }
-
     async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
         let logger = ctx.logger()?;
         let client = Client::builder()

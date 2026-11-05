@@ -23,13 +23,18 @@ async fn stale_parent_detach_preserves_recreated_descendants_and_is_idempotent()
     )
     .unwrap();
     let mut catalog = ExtensionCatalog::new();
-    catalog.register(IncludeFactory).unwrap();
+    catalog
+        .register(&cordis_plugin_include::PLUGIN_DEFINITION, IncludeFactory)
+        .unwrap();
     let runtime = Runtime::new().unwrap();
     let entry = EntryOptions::new("include", "cordis:include")
         .with_config(toml::Value::try_from(IncludeConfig::new(&root)).unwrap());
     let _fiber = runtime
         .root()
-        .plugin(Arc::new(LoaderPlugin::new(catalog)))
+        .plugin(
+            &cordis_loader::PLUGIN_DEFINITION,
+            Arc::new(LoaderPlugin::new(catalog)),
+        )
         .await
         .unwrap();
     let loader = runtime.root().get(LOADER).unwrap();

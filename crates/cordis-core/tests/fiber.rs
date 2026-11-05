@@ -32,7 +32,7 @@ async fn settle_does_not_hang_under_concurrent_wake() {
             .expect("settle/job timed out")
             .expect("job join");
     }
-    wait_injection(&handle, InjectionState::Pending).await;
+    wait_injection(&handle, FiberState::Pending).await;
 }
 
 #[tokio::test]
@@ -46,11 +46,11 @@ async fn fiber_restart_and_replace_wait_for_tasks() {
         finished: Arc<AtomicBool>,
         value: usize,
     }
+    static TASKFUL_DEFINITION: std::sync::LazyLock<cordis_core::PluginDefinition> =
+        std::sync::LazyLock::new(|| cordis_core::PluginDefinition::named("test.taskful"));
+
     #[async_trait]
     impl Plugin for Taskful {
-        fn key(&self) -> cordis_core::PluginKey {
-            cordis_core::PluginKey::new("test.taskful")
-        }
         async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
             ctx.provide(NUMBER, Number(self.value))?;
             let finished = self.finished.clone();
@@ -65,10 +65,13 @@ async fn fiber_restart_and_replace_wait_for_tasks() {
     }
 
     let mut fiber = root
-        .plugin(Arc::new(Taskful {
-            finished: flag,
-            value: 1,
-        }))
+        .plugin(
+            &TASKFUL_DEFINITION,
+            Arc::new(Taskful {
+                finished: flag,
+                value: 1,
+            }),
+        )
         .await
         .unwrap();
     assert_eq!(root.get(NUMBER).unwrap().0, 1);
@@ -99,12 +102,11 @@ async fn fiber_restart_and_replace_wait_for_tasks() {
 async fn fiber_state_subscription_reports_ordered_lifecycle_transitions() {
     struct NoopPlugin;
 
+    static NOOPPLUGIN_DEFINITION: std::sync::LazyLock<cordis_core::PluginDefinition> =
+        std::sync::LazyLock::new(|| cordis_core::PluginDefinition::named("test.lifecycle-events"));
+
     #[async_trait]
     impl Plugin for NoopPlugin {
-        fn key(&self) -> cordis_core::PluginKey {
-            cordis_core::PluginKey::new("test.lifecycle-events")
-        }
-
         async fn apply(&self, _ctx: &Context) -> Result<(), CoreError> {
             Ok(())
         }
@@ -113,7 +115,10 @@ async fn fiber_state_subscription_reports_ordered_lifecycle_transitions() {
     let runtime = runtime();
     let root = runtime.root();
     let mut states = runtime.subscribe_fiber_states();
-    let mut fiber = root.plugin(Arc::new(NoopPlugin)).await.unwrap();
+    let mut fiber = root
+        .plugin(&NOOPPLUGIN_DEFINITION, Arc::new(NoopPlugin))
+        .await
+        .unwrap();
 
     let expected = [
         (None, FiberState::Pending),
@@ -123,7 +128,8 @@ async fn fiber_state_subscription_reports_ordered_lifecycle_transitions() {
     for (previous, current) in expected {
         let change = states.recv().await.unwrap();
         assert_eq!(change.fiber_id, fiber.id());
-        assert_eq!(change.plugin_key.as_str(), "test.lifecycle-events");
+        assert_eq!(change.definition_id, NOOPPLUGIN_DEFINITION.id());
+        assert_eq!(change.parent_fiber_id, None);
         assert_eq!(change.previous, previous);
         assert_eq!(change.current, current);
     }
@@ -151,12 +157,11 @@ async fn fiber_state_subscription_reports_ordered_lifecycle_transitions() {
 async fn state_subscriber_reports_lag_and_diagnostics_remain_available() {
     struct NoopPlugin;
 
+    static NOOPPLUGIN_DEFINITION: std::sync::LazyLock<cordis_core::PluginDefinition> =
+        std::sync::LazyLock::new(|| cordis_core::PluginDefinition::named("test.lifecycle-lag"));
+
     #[async_trait]
     impl Plugin for NoopPlugin {
-        fn key(&self) -> cordis_core::PluginKey {
-            cordis_core::PluginKey::new("test.lifecycle-lag")
-        }
-
         async fn apply(&self, _ctx: &Context) -> Result<(), CoreError> {
             Ok(())
         }
@@ -165,7 +170,10 @@ async fn state_subscriber_reports_lag_and_diagnostics_remain_available() {
     let runtime = runtime();
     let root = runtime.root();
     let mut states = runtime.subscribe_fiber_states();
-    let mut fiber = root.plugin(Arc::new(NoopPlugin)).await.unwrap();
+    let mut fiber = root
+        .plugin(&NOOPPLUGIN_DEFINITION, Arc::new(NoopPlugin))
+        .await
+        .unwrap();
     for _ in 0..300 {
         fiber.restart().await.unwrap();
     }
@@ -174,10 +182,9 @@ async fn state_subscriber_reports_lag_and_diagnostics_remain_available() {
     assert!(
         runtime
             .diagnostics()
-            .plugin_fibers
+            .fibers
             .iter()
-            .any(|item| item.id == fiber.id()
-                && item.state == cordis_core::FiberStateSnapshot::Active)
+            .any(|item| item.id == fiber.id() && item.state == cordis_core::FiberState::Active)
     );
     fiber.dispose();
 }
@@ -190,12 +197,13 @@ async fn provider_rebind_waits_for_old_plugin_effect_before_reactivation() {
         release: Arc<Mutex<Option<oneshot::Receiver<()>>>>,
     }
 
+    static GATEDDEPENDENTPLUGIN_DEFINITION: std::sync::LazyLock<cordis_core::PluginDefinition> =
+        std::sync::LazyLock::new(|| {
+            cordis_core::PluginDefinition::named("test.rebind-waits-for-unload")
+        });
+
     #[async_trait]
     impl Plugin for GatedDependentPlugin {
-        fn key(&self) -> cordis_core::PluginKey {
-            cordis_core::PluginKey::new("test.rebind-waits-for-unload")
-        }
-
         fn inject(&self) -> Vec<cordis_core::ServiceId> {
             vec![NUMBER.id()]
         }
@@ -227,11 +235,14 @@ async fn provider_rebind_waits_for_old_plugin_effect_before_reactivation() {
     let (release_tx, release_rx) = oneshot::channel();
     let apply_count = Arc::new(AtomicUsize::new(0));
     let mut fiber = root
-        .plugin(Arc::new(GatedDependentPlugin {
-            apply_count: apply_count.clone(),
-            cancelled: Arc::new(Mutex::new(Some(cancelled_tx))),
-            release: Arc::new(Mutex::new(Some(release_rx))),
-        }))
+        .plugin(
+            &GATEDDEPENDENTPLUGIN_DEFINITION,
+            Arc::new(GatedDependentPlugin {
+                apply_count: apply_count.clone(),
+                cancelled: Arc::new(Mutex::new(Some(cancelled_tx))),
+                release: Arc::new(Mutex::new(Some(release_rx))),
+            }),
+        )
         .await
         .unwrap();
     assert_eq!(apply_count.load(Ordering::SeqCst), 1);
@@ -268,11 +279,11 @@ async fn concurrent_mount_and_scheduler_apply_once() {
         gate: Arc<Mutex<Option<oneshot::Receiver<()>>>>,
     }
 
+    static GATEDPLUGIN_DEFINITION: std::sync::LazyLock<cordis_core::PluginDefinition> =
+        std::sync::LazyLock::new(|| cordis_core::PluginDefinition::named("test.gatedplugin"));
+
     #[async_trait]
     impl Plugin for GatedPlugin {
-        fn key(&self) -> cordis_core::PluginKey {
-            cordis_core::PluginKey::new("test.gatedplugin")
-        }
         async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
             self.apply_count.fetch_add(1, Ordering::SeqCst);
             if let Some(tx) = self.entered.lock().expect("entered").take() {
@@ -290,11 +301,14 @@ async fn concurrent_mount_and_scheduler_apply_once() {
     let mount_root = root.clone();
     let mount = tokio::spawn(async move {
         mount_root
-            .plugin(Arc::new(GatedPlugin {
-                apply_count: count,
-                entered: entered_tx,
-                gate: gate_rx,
-            }))
+            .plugin(
+                &GATEDPLUGIN_DEFINITION,
+                Arc::new(GatedPlugin {
+                    apply_count: count,
+                    entered: entered_tx,
+                    gate: gate_rx,
+                }),
+            )
             .await
     });
     entered_rx.await.expect("entered apply");
@@ -319,11 +333,11 @@ async fn concurrent_mount_and_scheduler_apply_once() {
     assert_eq!(root.get(NUMBER).unwrap().0, 7);
     let snap = runtime.diagnostics();
     let plugin = snap
-        .plugin_fibers
+        .fibers
         .iter()
         .find(|item| item.id == fiber.id())
         .expect("plugin fiber");
-    assert_eq!(plugin.state, cordis_core::FiberStateSnapshot::Active);
+    assert_eq!(plugin.state, cordis_core::FiberState::Active);
     assert_eq!(
         snap.effects
             .iter()
@@ -353,11 +367,13 @@ async fn initial_mount_not_preempted_by_inflight_scheduler() {
         apply_count: Arc<AtomicUsize>,
     }
 
+    static COUNTINGDEPPLUGIN_DEFINITION: std::sync::LazyLock<cordis_core::PluginDefinition> =
+        std::sync::LazyLock::new(|| {
+            cordis_core::PluginDefinition::named("test.initial-mount-no-preempt")
+        });
+
     #[async_trait]
     impl Plugin for CountingDepPlugin {
-        fn key(&self) -> cordis_core::PluginKey {
-            cordis_core::PluginKey::new("test.initial-mount-no-preempt")
-        }
         fn inject(&self) -> Vec<cordis_core::ServiceId> {
             vec![NUMBER.id()]
         }
@@ -387,9 +403,12 @@ async fn initial_mount_not_preempted_by_inflight_scheduler() {
         let provider = root.effect_named("provider").unwrap();
         provider.provide(NUMBER, Number(1)).unwrap();
         let result = root
-            .plugin(Arc::new(CountingDepPlugin {
-                apply_count: count.clone(),
-            }))
+            .plugin(
+                &COUNTINGDEPPLUGIN_DEFINITION,
+                Arc::new(CountingDepPlugin {
+                    apply_count: count.clone(),
+                }),
+            )
             .await;
         match result {
             Ok(fiber) => {
@@ -431,11 +450,11 @@ async fn provider_revoked_during_loading_does_not_stick_active() {
         gate: Arc<Mutex<Option<oneshot::Receiver<()>>>>,
     }
 
+    static GATEDDEPPLUGIN_DEFINITION: std::sync::LazyLock<cordis_core::PluginDefinition> =
+        std::sync::LazyLock::new(|| cordis_core::PluginDefinition::named("test.gateddepplugin"));
+
     #[async_trait]
     impl Plugin for GatedDepPlugin {
-        fn key(&self) -> cordis_core::PluginKey {
-            cordis_core::PluginKey::new("test.gateddepplugin")
-        }
         fn inject(&self) -> Vec<cordis_core::ServiceId> {
             vec![NUMBER.id()]
         }
@@ -453,10 +472,13 @@ async fn provider_revoked_during_loading_does_not_stick_active() {
     let mount_root = root.clone();
     let mount = tokio::spawn(async move {
         mount_root
-            .plugin(Arc::new(GatedDepPlugin {
-                entered: entered_tx,
-                gate: gate_rx,
-            }))
+            .plugin(
+                &GATEDDEPPLUGIN_DEFINITION,
+                Arc::new(GatedDepPlugin {
+                    entered: entered_tx,
+                    gate: gate_rx,
+                }),
+            )
             .await
     });
     entered_rx.await.expect("entered apply");
@@ -494,11 +516,11 @@ async fn provider_replaced_during_loading_reactivates_with_fresh() {
         seen: Arc<AtomicUsize>,
     }
 
+    static GATEDDEPPLUGIN_DEFINITION: std::sync::LazyLock<cordis_core::PluginDefinition> =
+        std::sync::LazyLock::new(|| cordis_core::PluginDefinition::named("test.gateddepplugin"));
+
     #[async_trait]
     impl Plugin for GatedDepPlugin {
-        fn key(&self) -> cordis_core::PluginKey {
-            cordis_core::PluginKey::new("test.gateddepplugin")
-        }
         fn inject(&self) -> Vec<cordis_core::ServiceId> {
             vec![NUMBER.id()]
         }
@@ -519,11 +541,14 @@ async fn provider_replaced_during_loading_reactivates_with_fresh() {
     let mount_root = root.clone();
     let mount = tokio::spawn(async move {
         mount_root
-            .plugin(Arc::new(GatedDepPlugin {
-                entered: entered_tx,
-                gate: gate_rx,
-                seen: seen_apply,
-            }))
+            .plugin(
+                &GATEDDEPPLUGIN_DEFINITION,
+                Arc::new(GatedDepPlugin {
+                    entered: entered_tx,
+                    gate: gate_rx,
+                    seen: seen_apply,
+                }),
+            )
             .await
     });
     entered_rx.await.expect("entered apply");
@@ -559,11 +584,11 @@ async fn restart_during_parent_dispose_keeps_disposed() {
         finished: Arc<AtomicBool>,
     }
 
+    static SLOWDISPOSEPLUGIN_DEFINITION: std::sync::LazyLock<cordis_core::PluginDefinition> =
+        std::sync::LazyLock::new(|| cordis_core::PluginDefinition::named("test.slowdisposeplugin"));
+
     #[async_trait]
     impl Plugin for SlowDisposePlugin {
-        fn key(&self) -> cordis_core::PluginKey {
-            cordis_core::PluginKey::new("test.slowdisposeplugin")
-        }
         async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
             let finished = self.finished.clone();
             let effect = ctx.effect()?;
@@ -577,7 +602,10 @@ async fn restart_during_parent_dispose_keeps_disposed() {
     }
 
     let fiber = parent
-        .plugin(Arc::new(SlowDisposePlugin { finished: flag }))
+        .plugin(
+            &SLOWDISPOSEPLUGIN_DEFINITION,
+            Arc::new(SlowDisposePlugin { finished: flag }),
+        )
         .await
         .unwrap();
     assert_eq!(fiber.state(), FiberState::Active);
@@ -597,11 +625,10 @@ async fn restart_during_parent_dispose_keeps_disposed() {
     assert!(fiber.is_disposed());
     let snap = runtime.diagnostics();
     assert!(
-        snap.plugin_fibers
+        snap.fibers
             .iter()
-            .all(|item| item.id != fiber.id()
-                || item.state == cordis_core::FiberStateSnapshot::Disposed)
-            || snap.plugin_fibers.iter().all(|item| item.id != fiber.id())
+            .all(|item| item.id != fiber.id() || item.state == cordis_core::FiberState::Disposed)
+            || snap.fibers.iter().all(|item| item.id != fiber.id())
     );
     runtime.shutdown().await.expect("shutdown");
 }
@@ -623,11 +650,11 @@ async fn replace_during_parent_dispose_keeps_disposed_and_skips_new_plugin() {
         release: Arc<Mutex<Option<oneshot::Receiver<()>>>>,
     }
 
+    static SLOWDISPOSEPLUGIN_DEFINITION: std::sync::LazyLock<cordis_core::PluginDefinition> =
+        std::sync::LazyLock::new(|| cordis_core::PluginDefinition::named("test.slowdisposeplugin"));
+
     #[async_trait]
     impl Plugin for SlowDisposePlugin {
-        fn key(&self) -> cordis_core::PluginKey {
-            cordis_core::PluginKey::new("test.slowdisposeplugin")
-        }
         async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
             let cancelled = self.cancelled.clone();
             let release = self.release.clone();
@@ -652,10 +679,6 @@ async fn replace_during_parent_dispose_keeps_disposed_and_skips_new_plugin() {
 
     #[async_trait]
     impl Plugin for ReplacementPlugin {
-        fn key(&self) -> cordis_core::PluginKey {
-            // 同 Key 才能进入 dispose_wait；跨 Key 由专门用例覆盖。
-            cordis_core::PluginKey::new("test.slowdisposeplugin")
-        }
         async fn apply(&self, _ctx: &Context) -> Result<(), CoreError> {
             self.applied.fetch_add(1, Ordering::SeqCst);
             Ok(())
@@ -663,10 +686,13 @@ async fn replace_during_parent_dispose_keeps_disposed_and_skips_new_plugin() {
     }
 
     let fiber = parent
-        .plugin(Arc::new(SlowDisposePlugin {
-            cancelled: cancelled_tx,
-            release: release_rx,
-        }))
+        .plugin(
+            &SLOWDISPOSEPLUGIN_DEFINITION,
+            Arc::new(SlowDisposePlugin {
+                cancelled: cancelled_tx,
+                release: release_rx,
+            }),
+        )
         .await
         .unwrap();
     wait_until(|| fiber.state() == FiberState::Active).await;
@@ -698,9 +724,10 @@ async fn replace_during_parent_dispose_keeps_disposed_and_skips_new_plugin() {
 
 #[tokio::test]
 async fn fiber_restart_stops_on_async_dispose_failure() {
-    use cordis_core::PluginKey;
+    use cordis_core::PluginDefinition;
 
-    static KEY: PluginKey = PluginKey::new("test.async.dispose.restart");
+    static KEY: std::sync::LazyLock<PluginDefinition> =
+        std::sync::LazyLock::new(|| PluginDefinition::named("test.async.dispose.restart"));
     let runtime = runtime();
     let root = runtime.root();
     let apply_count = Arc::new(AtomicUsize::new(0));
@@ -711,9 +738,6 @@ async fn fiber_restart_stops_on_async_dispose_failure() {
 
     #[async_trait]
     impl Plugin for FlakyDisposePlugin {
-        fn key(&self) -> PluginKey {
-            KEY
-        }
         async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
             self.apply_count.fetch_add(1, Ordering::SeqCst);
             let effect = ctx.effect()?;
@@ -725,9 +749,12 @@ async fn fiber_restart_stops_on_async_dispose_failure() {
     }
 
     let mut fiber = root
-        .plugin(Arc::new(FlakyDisposePlugin {
-            apply_count: apply_count.clone(),
-        }))
+        .plugin(
+            &KEY,
+            Arc::new(FlakyDisposePlugin {
+                apply_count: apply_count.clone(),
+            }),
+        )
         .await
         .unwrap();
     assert_eq!(apply_count.load(Ordering::SeqCst), 1);
@@ -740,9 +767,10 @@ async fn fiber_restart_stops_on_async_dispose_failure() {
 
 #[tokio::test]
 async fn fiber_replace_stops_on_async_dispose_failure() {
-    use cordis_core::PluginKey;
+    use cordis_core::PluginDefinition;
 
-    static KEY: PluginKey = PluginKey::new("test.async.dispose.replace");
+    static KEY: std::sync::LazyLock<PluginDefinition> =
+        std::sync::LazyLock::new(|| PluginDefinition::named("test.async.dispose.replace"));
     let runtime = runtime();
     let root = runtime.root();
     let apply_count = Arc::new(AtomicUsize::new(0));
@@ -753,9 +781,6 @@ async fn fiber_replace_stops_on_async_dispose_failure() {
 
     #[async_trait]
     impl Plugin for FlakyDisposePlugin {
-        fn key(&self) -> PluginKey {
-            KEY
-        }
         async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
             self.apply_count.fetch_add(1, Ordering::SeqCst);
             let effect = ctx.effect()?;
@@ -772,9 +797,6 @@ async fn fiber_replace_stops_on_async_dispose_failure() {
 
     #[async_trait]
     impl Plugin for ReplacementPlugin {
-        fn key(&self) -> PluginKey {
-            KEY
-        }
         async fn apply(&self, _ctx: &Context) -> Result<(), CoreError> {
             self.apply_count.fetch_add(1, Ordering::SeqCst);
             Ok(())
@@ -782,9 +804,12 @@ async fn fiber_replace_stops_on_async_dispose_failure() {
     }
 
     let mut fiber = root
-        .plugin(Arc::new(FlakyDisposePlugin {
-            apply_count: apply_count.clone(),
-        }))
+        .plugin(
+            &KEY,
+            Arc::new(FlakyDisposePlugin {
+                apply_count: apply_count.clone(),
+            }),
+        )
         .await
         .unwrap();
     let error = fiber
@@ -801,9 +826,10 @@ async fn fiber_replace_stops_on_async_dispose_failure() {
 
 #[tokio::test]
 async fn provider_recompute_marks_failed_when_async_dispose_errors() {
-    use cordis_core::PluginKey;
+    use cordis_core::PluginDefinition;
 
-    static KEY: PluginKey = PluginKey::new("test.async.dispose.provider");
+    static KEY: std::sync::LazyLock<PluginDefinition> =
+        std::sync::LazyLock::new(|| PluginDefinition::named("test.async.dispose.provider"));
     let runtime = runtime();
     let root = runtime.root();
     let apply_count = Arc::new(AtomicUsize::new(0));
@@ -816,9 +842,6 @@ async fn provider_recompute_marks_failed_when_async_dispose_errors() {
 
     #[async_trait]
     impl Plugin for DependentPlugin {
-        fn key(&self) -> PluginKey {
-            KEY
-        }
         fn inject(&self) -> Vec<cordis_core::ServiceId> {
             vec![NUMBER.id()]
         }
@@ -833,9 +856,12 @@ async fn provider_recompute_marks_failed_when_async_dispose_errors() {
     }
 
     let fiber = root
-        .plugin(Arc::new(DependentPlugin {
-            apply_count: apply_count.clone(),
-        }))
+        .plugin(
+            &KEY,
+            Arc::new(DependentPlugin {
+                apply_count: apply_count.clone(),
+            }),
+        )
         .await
         .unwrap();
     assert_eq!(fiber.state(), FiberState::Active);
@@ -858,9 +884,10 @@ async fn provider_recompute_marks_failed_when_async_dispose_errors() {
 
 #[tokio::test]
 async fn cancelled_restart_coordinator_converges_without_second_restart() {
-    use cordis_core::PluginKey;
+    use cordis_core::PluginDefinition;
 
-    static KEY: PluginKey = PluginKey::new("test.cancelled-restart");
+    static KEY: std::sync::LazyLock<PluginDefinition> =
+        std::sync::LazyLock::new(|| PluginDefinition::named("test.cancelled-restart"));
     let runtime = runtime();
     let root = runtime.root();
     let (cancelled_tx, mut cancelled_rx) = oneshot::channel::<()>();
@@ -875,10 +902,6 @@ async fn cancelled_restart_coordinator_converges_without_second_restart() {
 
     #[async_trait]
     impl Plugin for GatedDisposePlugin {
-        fn key(&self) -> PluginKey {
-            KEY
-        }
-
         async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
             let cancelled = self.cancelled.clone();
             let release = self.release.clone();
@@ -898,10 +921,13 @@ async fn cancelled_restart_coordinator_converges_without_second_restart() {
     }
 
     let mut fiber = root
-        .plugin(Arc::new(GatedDisposePlugin {
-            cancelled: cancelled_tx,
-            release: release_rx,
-        }))
+        .plugin(
+            &KEY,
+            Arc::new(GatedDisposePlugin {
+                cancelled: cancelled_tx,
+                release: release_rx,
+            }),
+        )
         .await
         .unwrap();
     let mut restart = Box::pin(fiber.restart());
@@ -925,9 +951,10 @@ async fn cancelled_restart_coordinator_converges_without_second_restart() {
 
 #[tokio::test]
 async fn cancelled_replace_coordinator_converges_to_new_plugin() {
-    use cordis_core::PluginKey;
+    use cordis_core::PluginDefinition;
 
-    static KEY: PluginKey = PluginKey::new("test.cancelled-replace");
+    static KEY: std::sync::LazyLock<PluginDefinition> =
+        std::sync::LazyLock::new(|| PluginDefinition::named("test.cancelled-replace"));
     let runtime = runtime();
     let root = runtime.root();
     let (gate_tx, gate_rx) = oneshot::channel::<()>();
@@ -946,9 +973,6 @@ async fn cancelled_replace_coordinator_converges_to_new_plugin() {
 
     #[async_trait]
     impl Plugin for OldPlugin {
-        fn key(&self) -> PluginKey {
-            KEY
-        }
         async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
             let gate = self.gate.clone();
             let release = self.release.clone();
@@ -969,9 +993,6 @@ async fn cancelled_replace_coordinator_converges_to_new_plugin() {
 
     #[async_trait]
     impl Plugin for NewPlugin {
-        fn key(&self) -> PluginKey {
-            KEY
-        }
         async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
             self.applies.fetch_add(1, Ordering::SeqCst);
             ctx.provide(NUMBER, Number(42))?;
@@ -980,10 +1001,13 @@ async fn cancelled_replace_coordinator_converges_to_new_plugin() {
     }
 
     let mut fiber = root
-        .plugin(Arc::new(OldPlugin {
-            gate: gate_tx,
-            release: release_rx,
-        }))
+        .plugin(
+            &KEY,
+            Arc::new(OldPlugin {
+                gate: gate_tx,
+                release: release_rx,
+            }),
+        )
         .await
         .unwrap();
     let mut replace = Box::pin(fiber.replace(Arc::new(NewPlugin {
@@ -998,14 +1022,16 @@ async fn cancelled_replace_coordinator_converges_to_new_plugin() {
     wait_until(|| fiber.state() == FiberState::Active).await;
     assert_eq!(apply_count.load(Ordering::SeqCst), 1);
     assert_eq!(root.get(NUMBER).unwrap().0, 42);
+    assert_eq!(fiber.definition().id(), KEY.id());
     runtime.shutdown().await.expect("shutdown");
 }
 
 #[tokio::test]
 async fn cancelled_initial_plugin_mount_revokes_fiber() {
-    use cordis_core::PluginKey;
+    use cordis_core::PluginDefinition;
 
-    static KEY: PluginKey = PluginKey::new("test.cancelled-initial-mount");
+    static KEY: std::sync::LazyLock<PluginDefinition> =
+        std::sync::LazyLock::new(|| PluginDefinition::named("test.cancelled-initial-mount"));
     let runtime = runtime();
     let root = runtime.root();
     let (entered_tx, entered_rx) = oneshot::channel::<()>();
@@ -1022,9 +1048,6 @@ async fn cancelled_initial_plugin_mount_revokes_fiber() {
 
     #[async_trait]
     impl Plugin for GatedApplyPlugin {
-        fn key(&self) -> PluginKey {
-            KEY
-        }
         async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
             self.applies.fetch_add(1, Ordering::SeqCst);
             if let Some(tx) = self.entered.lock().expect("entered").take() {
@@ -1049,11 +1072,14 @@ async fn cancelled_initial_plugin_mount_revokes_fiber() {
     let mount = tokio::spawn({
         let root = root.clone();
         async move {
-            root.plugin(Arc::new(GatedApplyPlugin {
-                entered: entered_tx,
-                release: release_rx,
-                applies: mount_applies,
-            }))
+            root.plugin(
+                &KEY,
+                Arc::new(GatedApplyPlugin {
+                    entered: entered_tx,
+                    release: release_rx,
+                    applies: mount_applies,
+                }),
+            )
             .await
         }
     });
@@ -1065,9 +1091,9 @@ async fn cancelled_initial_plugin_mount_revokes_fiber() {
     wait_until(|| {
         runtime
             .diagnostics()
-            .plugin_registry
+            .definitions
             .iter()
-            .all(|group| group.plugin_key != KEY.as_str())
+            .all(|group| group.definition_id != KEY.id())
     })
     .await;
     assert_eq!(apply_count.load(Ordering::SeqCst), 1);
@@ -1075,9 +1101,9 @@ async fn cancelled_initial_plugin_mount_revokes_fiber() {
     assert!(
         runtime
             .diagnostics()
-            .plugin_fibers
+            .fibers
             .iter()
-            .all(|fiber| fiber.plugin_key != KEY.as_str())
+            .all(|fiber| fiber.definition_id != KEY.id())
     );
     runtime.shutdown().await.expect("shutdown");
 }
@@ -1086,9 +1112,10 @@ async fn cancelled_initial_plugin_mount_revokes_fiber() {
 async fn cancelled_initial_mount_before_apply_revokes_without_apply() {
     // 覆盖「abandon 已置位且 apply 尚未开始」：见 `activate::initial_mount_revoke_tests`。
     // 此处用门控 apply 验证调用方取消后不提交服务（温和：等 apply 返回再撤销）。
-    use cordis_core::PluginKey;
+    use cordis_core::PluginDefinition;
 
-    static KEY: PluginKey = PluginKey::new("test.cancelled-initial-before-apply");
+    static KEY: std::sync::LazyLock<PluginDefinition> =
+        std::sync::LazyLock::new(|| PluginDefinition::named("test.cancelled-initial-before-apply"));
     let runtime = runtime();
     let root = runtime.root();
     let (entered_tx, entered_rx) = oneshot::channel::<()>();
@@ -1104,9 +1131,6 @@ async fn cancelled_initial_mount_before_apply_revokes_without_apply() {
     }
     #[async_trait]
     impl Plugin for GatePlugin {
-        fn key(&self) -> PluginKey {
-            KEY
-        }
         async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
             self.applies.fetch_add(1, Ordering::SeqCst);
             if let Some(tx) = self.entered.lock().expect("entered").take() {
@@ -1125,11 +1149,14 @@ async fn cancelled_initial_mount_before_apply_revokes_without_apply() {
     let mount = tokio::spawn({
         let root = root.clone();
         async move {
-            root.plugin(Arc::new(GatePlugin {
-                entered: entered_tx,
-                release: release_rx,
-                applies: applies_for_mount,
-            }))
+            root.plugin(
+                &KEY,
+                Arc::new(GatePlugin {
+                    entered: entered_tx,
+                    release: release_rx,
+                    applies: applies_for_mount,
+                }),
+            )
             .await
         }
     });
@@ -1141,9 +1168,9 @@ async fn cancelled_initial_mount_before_apply_revokes_without_apply() {
     wait_until(|| {
         runtime
             .diagnostics()
-            .plugin_registry
+            .definitions
             .iter()
-            .all(|group| group.plugin_key != KEY.as_str())
+            .all(|group| group.definition_id != KEY.id())
     })
     .await;
     assert_eq!(apply_count.load(Ordering::SeqCst), 1);
@@ -1153,9 +1180,10 @@ async fn cancelled_initial_mount_before_apply_revokes_without_apply() {
 
 #[tokio::test]
 async fn unload_registers_pending_wait_for_concurrent_unmount_reentry() {
-    use cordis_core::PluginKey;
+    use cordis_core::PluginDefinition;
 
-    static KEY: PluginKey = PluginKey::new("test.unload-pending-wait-reentry");
+    static KEY: std::sync::LazyLock<PluginDefinition> =
+        std::sync::LazyLock::new(|| PluginDefinition::named("test.unload-pending-wait-reentry"));
     let runtime = runtime();
     let root = runtime.root();
     let runtime_clone = runtime.clone();
@@ -1173,9 +1201,6 @@ async fn unload_registers_pending_wait_for_concurrent_unmount_reentry() {
     }
     #[async_trait]
     impl Plugin for GatedUnloadPlugin {
-        fn key(&self) -> PluginKey {
-            KEY
-        }
         async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
             let runtime = self.runtime.clone();
             let seen = self.seen.clone();
@@ -1193,7 +1218,7 @@ async fn unload_registers_pending_wait_for_concurrent_unmount_reentry() {
                     if let Some(rx) = receiver {
                         let _ = rx.await;
                     }
-                    match runtime.unmount(KEY).await {
+                    match runtime.unmount(KEY.id()).await {
                         Err(CoreError::UnmountReentrant) => {
                             seen.fetch_add(1, Ordering::SeqCst);
                             Ok(())
@@ -1209,12 +1234,15 @@ async fn unload_registers_pending_wait_for_concurrent_unmount_reentry() {
     }
 
     let mut fiber = root
-        .plugin(Arc::new(GatedUnloadPlugin {
-            runtime: runtime_clone,
-            seen: seen.clone(),
-            entered: entered_tx,
-            release: release_rx,
-        }))
+        .plugin(
+            &KEY,
+            Arc::new(GatedUnloadPlugin {
+                runtime: runtime_clone,
+                seen: seen.clone(),
+                entered: entered_tx,
+                release: release_rx,
+            }),
+        )
         .await
         .unwrap();
     let mut restart = Box::pin(fiber.restart());
@@ -1234,18 +1262,16 @@ async fn unload_registers_pending_wait_for_concurrent_unmount_reentry() {
 
 #[tokio::test]
 async fn fiber_dispose_then_dispose_wait_preserves_async_errors() {
-    use cordis_core::PluginKey;
+    use cordis_core::PluginDefinition;
 
-    static KEY: PluginKey = PluginKey::new("test.async.dispose.then.wait");
+    static KEY: std::sync::LazyLock<PluginDefinition> =
+        std::sync::LazyLock::new(|| PluginDefinition::named("test.async.dispose.then.wait"));
     let runtime = runtime();
     let root = runtime.root();
 
     struct BoomPlugin;
     #[async_trait]
     impl Plugin for BoomPlugin {
-        fn key(&self) -> PluginKey {
-            KEY
-        }
         async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
             let effect = ctx.effect()?;
             effect.on_dispose_async(|| async move {
@@ -1255,7 +1281,7 @@ async fn fiber_dispose_then_dispose_wait_preserves_async_errors() {
         }
     }
 
-    let mut fiber = root.plugin(Arc::new(BoomPlugin)).await.unwrap();
+    let mut fiber = root.plugin(&KEY, Arc::new(BoomPlugin)).await.unwrap();
     fiber.dispose();
     let error = fiber.dispose_wait().await.expect_err("wait after dispose");
     assert!(matches!(error, CoreError::DisposeFailed { .. }));
@@ -1264,9 +1290,10 @@ async fn fiber_dispose_then_dispose_wait_preserves_async_errors() {
 
 #[tokio::test]
 async fn delayed_dispose_wait_after_dispose_preserves_async_errors() {
-    use cordis_core::PluginKey;
+    use cordis_core::PluginDefinition;
 
-    static KEY: PluginKey = PluginKey::new("test.delayed.dispose.wait.error");
+    static KEY: std::sync::LazyLock<PluginDefinition> =
+        std::sync::LazyLock::new(|| PluginDefinition::named("test.delayed.dispose.wait.error"));
     let runtime = runtime();
     let root = runtime.root();
     let (entered_tx, entered_rx) = oneshot::channel::<()>();
@@ -1280,9 +1307,6 @@ async fn delayed_dispose_wait_after_dispose_preserves_async_errors() {
     }
     #[async_trait]
     impl Plugin for GatedBoomPlugin {
-        fn key(&self) -> PluginKey {
-            KEY
-        }
         async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
             let entered = self.entered.clone();
             let release = self.release.clone();
@@ -1306,10 +1330,13 @@ async fn delayed_dispose_wait_after_dispose_preserves_async_errors() {
     }
 
     let mut fiber = root
-        .plugin(Arc::new(GatedBoomPlugin {
-            entered: entered_tx,
-            release: release_rx,
-        }))
+        .plugin(
+            &KEY,
+            Arc::new(GatedBoomPlugin {
+                entered: entered_tx,
+                release: release_rx,
+            }),
+        )
         .await
         .unwrap();
     fiber.dispose();
@@ -1319,9 +1346,9 @@ async fn delayed_dispose_wait_after_dispose_preserves_async_errors() {
     wait_until(|| {
         runtime
             .diagnostics()
-            .plugin_registry
+            .definitions
             .iter()
-            .all(|group| group.plugin_key != KEY.as_str())
+            .all(|group| group.definition_id != KEY.id())
     })
     .await;
     let error = fiber
@@ -1336,9 +1363,10 @@ async fn delayed_dispose_wait_after_dispose_preserves_async_errors() {
 
 #[tokio::test]
 async fn dispose_during_unload_keeps_registry_until_release_finishes() {
-    use cordis_core::PluginKey;
+    use cordis_core::PluginDefinition;
 
-    static KEY: PluginKey = PluginKey::new("test.dispose-during-unload");
+    static KEY: std::sync::LazyLock<PluginDefinition> =
+        std::sync::LazyLock::new(|| PluginDefinition::named("test.dispose-during-unload"));
     let runtime = runtime();
     let root = runtime.root();
     let (entered_tx, entered_rx) = oneshot::channel::<()>();
@@ -1352,9 +1380,6 @@ async fn dispose_during_unload_keeps_registry_until_release_finishes() {
     }
     #[async_trait]
     impl Plugin for GatedUnloadDisposePlugin {
-        fn key(&self) -> PluginKey {
-            KEY
-        }
         async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
             let entered = self.entered.clone();
             let release = self.release.clone();
@@ -1378,10 +1403,13 @@ async fn dispose_during_unload_keeps_registry_until_release_finishes() {
     }
 
     let mut fiber = root
-        .plugin(Arc::new(GatedUnloadDisposePlugin {
-            entered: entered_tx,
-            release: release_rx,
-        }))
+        .plugin(
+            &KEY,
+            Arc::new(GatedUnloadDisposePlugin {
+                entered: entered_tx,
+                release: release_rx,
+            }),
+        )
         .await
         .unwrap();
     let mut restart = Box::pin(fiber.restart());
@@ -1396,18 +1424,18 @@ async fn dispose_during_unload_keeps_registry_until_release_finishes() {
     assert!(
         runtime
             .diagnostics()
-            .plugin_registry
+            .definitions
             .iter()
-            .any(|group| group.plugin_key == KEY.as_str()),
+            .any(|group| group.definition_id == KEY.id()),
         "unload in flight must keep plugin index"
     );
     fiber.dispose();
     assert!(
         runtime
             .diagnostics()
-            .plugin_registry
+            .definitions
             .iter()
-            .any(|group| group.plugin_key == KEY.as_str()),
+            .any(|group| group.definition_id == KEY.id()),
         "dispose during unload must keep plugin index until release completes"
     );
     let _ = release_tx.send(());
@@ -1419,9 +1447,9 @@ async fn dispose_during_unload_keeps_registry_until_release_finishes() {
     wait_until(|| {
         runtime
             .diagnostics()
-            .plugin_registry
+            .definitions
             .iter()
-            .all(|group| group.plugin_key != KEY.as_str())
+            .all(|group| group.definition_id != KEY.id())
     })
     .await;
     assert!(fiber.is_disposed());
@@ -1430,12 +1458,13 @@ async fn dispose_during_unload_keeps_registry_until_release_finishes() {
     runtime.shutdown().await.expect("shutdown");
 }
 
-// P1-1: Loading 期 unmount 等待 Activating Scope 的 DisposeCompletion，完成前保留 plugin_registry。
+// P1-1: Loading 期 unmount 等待 Activating Scope 的 DisposeCompletion，完成前保留 definitions。
 #[tokio::test]
 async fn p1_unmount_during_loading_waits_for_pending_effect_disposer() {
-    use cordis_core::PluginKey;
+    use cordis_core::PluginDefinition;
 
-    static KEY: PluginKey = PluginKey::new("test.p1.loading-pending-effect");
+    static KEY: std::sync::LazyLock<PluginDefinition> =
+        std::sync::LazyLock::new(|| PluginDefinition::named("test.p1.loading-pending-effect"));
     let runtime = runtime();
     let root = runtime.root();
     let (apply_entered_tx, apply_entered_rx) = oneshot::channel::<()>();
@@ -1457,9 +1486,6 @@ async fn p1_unmount_during_loading_waits_for_pending_effect_disposer() {
     }
     #[async_trait]
     impl Plugin for LoadingPlugin {
-        fn key(&self) -> PluginKey {
-            KEY
-        }
         async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
             let effect = ctx.effect()?;
             let disp_entered = self.disp_entered.clone();
@@ -1498,19 +1524,22 @@ async fn p1_unmount_during_loading_waits_for_pending_effect_disposer() {
         let root = root.clone();
         let disposer_ran = disposer_ran.clone();
         async move {
-            root.plugin(Arc::new(LoadingPlugin {
-                apply_entered: apply_entered_tx,
-                apply_release: apply_release_rx,
-                disp_entered: disp_entered_tx,
-                disp_release: disp_release_rx,
-                disposer_ran,
-            }))
+            root.plugin(
+                &KEY,
+                Arc::new(LoadingPlugin {
+                    apply_entered: apply_entered_tx,
+                    apply_release: apply_release_rx,
+                    disp_entered: disp_entered_tx,
+                    disp_release: disp_release_rx,
+                    disposer_ran,
+                }),
+            )
             .await
         }
     });
     apply_entered_rx.await.expect("apply entered");
 
-    let mut unmount = Box::pin(runtime.unmount(KEY));
+    let mut unmount = Box::pin(runtime.unmount(KEY.id()));
     // 合同：disposer 完成前 unmount 不得成功返回，且 registry 仍可见。
     tokio::select! {
         result = &mut unmount => {
@@ -1526,9 +1555,9 @@ async fn p1_unmount_during_loading_waits_for_pending_effect_disposer() {
     assert!(
         runtime
             .diagnostics()
-            .plugin_registry
+            .definitions
             .iter()
-            .any(|group| group.plugin_key == KEY.as_str()),
+            .any(|group| group.definition_id == KEY.id()),
         "plugin index must remain until pending_effect DisposeCompletion finishes"
     );
     let _ = disp_release_tx.send(());
@@ -1549,14 +1578,14 @@ async fn p1_unmount_during_loading_waits_for_pending_effect_disposer() {
     wait_until(|| {
         runtime
             .diagnostics()
-            .plugin_registry
+            .definitions
             .iter()
-            .all(|group| group.plugin_key != KEY.as_str())
+            .all(|group| group.definition_id != KEY.id())
             && runtime
                 .diagnostics()
-                .plugin_fibers
+                .fibers
                 .iter()
-                .all(|fiber| fiber.plugin_key != KEY.as_str())
+                .all(|fiber| fiber.definition_id != KEY.id())
     })
     .await;
     assert_service_unavailable(&root, NUMBER);
@@ -1568,9 +1597,10 @@ async fn p1_unmount_during_loading_waits_for_pending_effect_disposer() {
 // （更窄的「revoke 检查之后、commit 之前」窗口需内部 hook，本测覆盖可稳定复现的公开路径。）
 #[tokio::test]
 async fn p1_abandon_while_apply_gated_before_return_leaves_no_orphan() {
-    use cordis_core::PluginKey;
+    use cordis_core::PluginDefinition;
 
-    static KEY: PluginKey = PluginKey::new("test.p1.abandon-toctou");
+    static KEY: std::sync::LazyLock<PluginDefinition> =
+        std::sync::LazyLock::new(|| PluginDefinition::named("test.p1.abandon-toctou"));
     let runtime = runtime();
     let root = runtime.root();
     let (ready_tx, ready_rx) = oneshot::channel::<()>();
@@ -1586,9 +1616,6 @@ async fn p1_abandon_while_apply_gated_before_return_leaves_no_orphan() {
     }
     #[async_trait]
     impl Plugin for GatePlugin {
-        fn key(&self) -> PluginKey {
-            KEY
-        }
         async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
             self.applies.fetch_add(1, Ordering::SeqCst);
             ctx.provide(NUMBER, Number(42))?;
@@ -1607,11 +1634,14 @@ async fn p1_abandon_while_apply_gated_before_return_leaves_no_orphan() {
         let root = root.clone();
         let applies = apply_count.clone();
         async move {
-            root.plugin(Arc::new(GatePlugin {
-                ready: ready_tx,
-                release: release_rx,
-                applies,
-            }))
+            root.plugin(
+                &KEY,
+                Arc::new(GatePlugin {
+                    ready: ready_tx,
+                    release: release_rx,
+                    applies,
+                }),
+            )
             .await
         }
     });
@@ -1623,14 +1653,14 @@ async fn p1_abandon_while_apply_gated_before_return_leaves_no_orphan() {
     wait_until(|| {
         runtime
             .diagnostics()
-            .plugin_registry
+            .definitions
             .iter()
-            .all(|group| group.plugin_key != KEY.as_str())
+            .all(|group| group.definition_id != KEY.id())
             && runtime
                 .diagnostics()
-                .plugin_fibers
+                .fibers
                 .iter()
-                .all(|fiber| fiber.plugin_key != KEY.as_str())
+                .all(|fiber| fiber.definition_id != KEY.id())
     })
     .await;
     assert_service_unavailable(&root, NUMBER);

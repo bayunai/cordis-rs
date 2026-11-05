@@ -1,7 +1,7 @@
 //! Settings 页面接入：list / editable / subscribe。
 
 use async_trait::async_trait;
-use cordis_core::{Context, CoreError, Plugin, PluginKey, Runtime};
+use cordis_core::{Context, CoreError, Plugin, Runtime};
 use cordis_loader::{
     EntryOptions, ExtensionCatalog, ExtensionFactory, ExtensionsConfig, LOADER, LoaderControlError,
     LoaderError, LoaderPlugin, PreparedExtension,
@@ -38,9 +38,6 @@ impl ExtensionFactory for Factory {
 
 #[async_trait]
 impl Plugin for Instance {
-    fn key(&self) -> PluginKey {
-        PluginKey::new("demo.row")
-    }
     async fn apply(&self, _: &Context) -> Result<(), CoreError> {
         Ok(())
     }
@@ -74,12 +71,19 @@ async fn harness() -> (Runtime, tempfile::TempDir, Vec<cordis_core::Fiber>) {
     std::fs::write(dir.path().join("home.patches.toml"), "version = 1\n").unwrap();
 
     let mut catalog = ExtensionCatalog::new();
-    catalog.register(Factory).unwrap();
-    catalog.register(IncludeFactory).unwrap();
+    catalog
+        .register(&cordis_core::PluginDefinition::named("demo.row"), Factory)
+        .unwrap();
+    catalog
+        .register(&cordis_plugin_include::PLUGIN_DEFINITION, IncludeFactory)
+        .unwrap();
     let runtime = Runtime::new().unwrap();
     let loader_fiber = runtime
         .root()
-        .plugin(Arc::new(LoaderPlugin::new(catalog)))
+        .plugin(
+            &cordis_loader::PLUGIN_DEFINITION,
+            Arc::new(LoaderPlugin::new(catalog)),
+        )
         .await
         .unwrap();
     let editor_config = ConfigEditorConfig::new(
@@ -102,12 +106,18 @@ async fn harness() -> (Runtime, tempfile::TempDir, Vec<cordis_core::Fiber>) {
         .unwrap();
     let editor_fiber = runtime
         .root()
-        .plugin(Arc::new(ConfigEditorPlugin::new(editor_config)))
+        .plugin(
+            &cordis_plugin_config_editor::PLUGIN_DEFINITION,
+            Arc::new(ConfigEditorPlugin::new(editor_config)),
+        )
         .await
         .unwrap();
     let settings_fiber = runtime
         .root()
-        .plugin(Arc::new(SettingsPlugin))
+        .plugin(
+            &cordis_plugin_settings::PLUGIN_DEFINITION,
+            Arc::new(SettingsPlugin),
+        )
         .await
         .unwrap();
     (
@@ -124,7 +134,7 @@ async fn list_excludes_groups_and_marks_editable_deploy_entries() {
     let list = settings.list().await.unwrap();
     let paths: Vec<_> = list.iter().map(|e| e.path.as_str()).collect();
     assert!(paths.contains(&"include:one"));
-    assert!(paths.contains(&"include:bucket:nested"));
+    assert!(paths.contains(&"include:nested"));
     assert!(!paths.contains(&"include:bucket"));
     let one = list.iter().find(|e| e.path == "include:one").unwrap();
     assert!(one.editable);
@@ -271,7 +281,10 @@ async fn subscribe_forwards_loader_changes_and_closes_on_unload() {
     let old_generation = *rx.borrow();
     let mut new_fiber = runtime
         .root()
-        .plugin(Arc::new(SettingsPlugin))
+        .plugin(
+            &cordis_plugin_settings::PLUGIN_DEFINITION,
+            Arc::new(SettingsPlugin),
+        )
         .await
         .unwrap();
     let settings = runtime.root().get(SETTINGS).unwrap();
@@ -296,5 +309,52 @@ async fn subscribe_forwards_loader_changes_and_closes_on_unload() {
     assert_eq!(*rx.borrow(), old_generation);
     assert!(rx.has_changed().is_err());
     new_fiber.dispose_wait().await.unwrap();
+    runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn group_child_edits_use_tree_local_id_and_preserve_group_parent() {
+    let (runtime, dir, _fibers) = harness().await;
+    let settings = runtime.root().get(SETTINGS).unwrap();
+    let before = settings.describe("include:nested").await.unwrap();
+    assert!(before.editable);
+    settings
+        .mutate(
+            "include:nested",
+            before.revision,
+            vec![ConfigOperation::Set {
+                path: vec!["value".into()],
+                value: 9.into(),
+            }],
+        )
+        .await
+        .unwrap();
+    let user = std::fs::read_to_string(dir.path().join("user.patches.toml")).unwrap();
+    assert!(user.contains("id = \"nested\""));
+    assert!(!user.contains("bucket:nested"));
+    let loader = runtime.root().get(LOADER).unwrap();
+    let snapshot = loader.await_idle().await.unwrap();
+    assert_eq!(
+        snapshot
+            .entry("include:nested")
+            .unwrap()
+            .parent
+            .as_ref()
+            .unwrap()
+            .as_str(),
+        "include:bucket"
+    );
+    assert!(snapshot.entry("include:bucket:nested").is_none());
+    let deployed = loader.subtree("include").unwrap().entries().unwrap();
+    let group = deployed
+        .extensions
+        .iter()
+        .find(|entry| entry.id == "bucket")
+        .unwrap();
+    assert_eq!(
+        group.children().unwrap()[0].config["value"].as_integer(),
+        Some(9)
+    );
+    assert!(settings.describe("include:bucket:nested").await.is_err());
     runtime.shutdown().await.unwrap();
 }

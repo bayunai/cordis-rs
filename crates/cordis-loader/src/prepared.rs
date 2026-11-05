@@ -5,7 +5,7 @@ use crate::{
     LoaderError,
     volatile::{ConfigRef, ConfigSnapshot, channel},
 };
-use cordis_core::{Context, CoreError, Plugin, PluginKey};
+use cordis_core::{Context, CoreError, Plugin};
 use std::{
     any::Any,
     future::Future,
@@ -37,14 +37,10 @@ impl TreeState {
 }
 
 struct TreePlugin {
-    key: PluginKey,
     state: Arc<TreeState>,
 }
 #[async_trait::async_trait]
 impl Plugin for TreePlugin {
-    fn key(&self) -> PluginKey {
-        self.key
-    }
     async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
         let open = self.state.opener.lock().expect("tree opener").clone();
         let source = open(ctx.clone())
@@ -80,7 +76,7 @@ pub struct PreparedExtension {
 impl PreparedExtension {
     /// 通用来源树载体。settings 改变执行完整替换；config 改变等待原子树协调完成。
     /// open 拥有 Context 并异步构造来源；Loader 不感知文件或格式。
-    pub fn tree<S, C, F, Fut>(key: PluginKey, settings: S, config: C, open: F) -> Self
+    pub fn tree<S, C, F, Fut>(settings: S, config: C, open: F) -> Self
     where
         S: Clone + PartialEq + Send + Sync + 'static,
         C: Clone + PartialEq + Send + Sync + 'static,
@@ -90,7 +86,6 @@ impl PreparedExtension {
         Self {
             resolved: None,
             inner: Box::new(TreePrepared {
-                key,
                 settings,
                 config,
                 open,
@@ -201,13 +196,11 @@ pub(crate) enum PreparedOutcome {
 }
 
 struct TreePrepared<S, C, F> {
-    key: PluginKey,
     settings: S,
     config: C,
     open: F,
 }
 struct TreeBinding<S, C> {
-    key: PluginKey,
     settings: S,
     config: Mutex<C>,
     state: Arc<TreeState>,
@@ -232,7 +225,6 @@ where
         current: Option<&Arc<dyn ConfigBinding>>,
     ) -> Result<PreparedOutcome, LoaderError> {
         let Self {
-            key,
             settings,
             config,
             open,
@@ -243,7 +235,6 @@ where
             Arc::new(move |ctx| Box::pin(open(open_settings.clone(), open_config.clone(), ctx)));
         if let Some(current) = current
             && let Some(binding) = current.as_any().downcast_ref::<TreeBinding<S, C>>()
-            && binding.key == key
             && binding.settings == settings
         {
             if *binding.config.lock().expect("tree config") == config
@@ -277,13 +268,11 @@ where
             opener: Mutex::new(open),
         });
         let plugin = Arc::new(TreePlugin {
-            key,
             state: state.clone(),
         });
         Ok(PreparedOutcome::Plugin {
             plugin,
             binding: Some(Arc::new(TreeBinding {
-                key,
                 settings,
                 config: Mutex::new(config),
                 state,

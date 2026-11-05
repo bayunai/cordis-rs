@@ -217,7 +217,7 @@ impl RuntimeTree {
     ) -> Result<LoaderSnapshot, LoaderError> {
         let retry_failed = revision.is_some() && prepared.is_none();
         let plan = self
-            .prepare_plan(config, revision, prepared, required, retry_failed)
+            .prepare_plan(config, revision, prepared, required, retry_failed, true)
             .await?;
         self.apply_plan(plan).await
     }
@@ -229,6 +229,7 @@ impl RuntimeTree {
         prepared: Option<(EntryId, PreparedExtension)>,
         required: Option<EntryId>,
         retry_failed: bool,
+        refresh_unchanged_bindings: bool,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<PreparedTreePlan, LoaderError>> + Send + '_>,
     > {
@@ -258,6 +259,7 @@ impl RuntimeTree {
                 &mut plan,
                 &self.entries,
                 prepared,
+                refresh_unchanged_bindings,
             )
             .await?;
             Ok(PreparedTreePlan {
@@ -397,7 +399,7 @@ impl RuntimeTree {
                         name: entry.name.clone(),
                         group: entry.group,
                         enabled: entry.enabled,
-                        plugin_key: entry.plugin_key,
+                        definition_id: entry.definition_id,
                         fiber_id: entry.fiber.as_ref().map(Fiber::id),
                         state: entry.fiber.as_ref().map(Fiber::state),
                         last_error: entry.fiber.as_ref().and_then(Fiber::last_error),
@@ -456,16 +458,12 @@ impl RuntimeTree {
         }
         let paths: Vec<_> = {
             let entries = self.entries.lock().expect("entries");
-            let mut paths: Vec<_> = entries.keys().cloned().collect();
-            paths.sort_by(|left, right| {
-                right
-                    .as_str()
-                    .matches(':')
-                    .count()
-                    .cmp(&left.as_str().matches(':').count())
-                    .then_with(|| left.cmp(right))
-            });
-            paths
+            let paths = entries.keys().cloned().collect();
+            crate::reconcile::postorder_among(
+                &paths,
+                &self.order.lock().expect("entry order"),
+                &entries,
+            )
         };
         for path in paths {
             if let Err(error) = self.dispose_and_remove(&path).await {

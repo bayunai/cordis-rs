@@ -5,7 +5,7 @@
 
 pub use async_trait::async_trait;
 pub use cordis_core::{
-    Context, CoreError, EventKey, FiberState, InjectionState, ListenOptions, ParallelKey, Plugin,
+    Context, CoreError, EventKey, FiberState, ListenOptions, ParallelKey, Plugin, PluginDefinition,
     Runtime, SerialKey, ServiceKey, WaterfallKey,
 };
 pub use cordis_testkit::{

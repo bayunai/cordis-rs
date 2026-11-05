@@ -22,10 +22,10 @@ async fn late_provider_activates_consumer_without_manual_settle() {
             }
         })
         .unwrap();
-    wait_injection(&handle, InjectionState::Pending).await;
+    wait_injection(&handle, FiberState::Pending).await;
 
     root.provide(NUMBER, Number(7)).unwrap();
-    wait_injection(&handle, InjectionState::Active).await;
+    wait_injection(&handle, FiberState::Active).await;
     assert_eq!(activated.load(Ordering::SeqCst), 1);
 }
 
@@ -48,12 +48,12 @@ async fn scheduler_injection_calling_settle_does_not_deadlock() {
             }
         })
         .unwrap();
-    assert_eq!(handle.state(), InjectionState::Pending);
+    assert_eq!(handle.state(), FiberState::Pending);
 
     root.effect().unwrap().provide(NUMBER, Number(7)).unwrap();
     tokio::time::timeout(
         std::time::Duration::from_secs(2),
-        wait_injection(&handle, InjectionState::Active),
+        wait_injection(&handle, FiberState::Active),
     )
     .await
     .expect("scheduler injection timed out — likely settle deadlock");
@@ -86,8 +86,8 @@ async fn injection_callback_panic_fails_only_that_injection_and_scheduler_contin
         .unwrap();
 
     root.effect().unwrap().provide(NUMBER, Number(1)).unwrap();
-    wait_injection(&failed, InjectionState::Failed).await;
-    wait_injection(&healthy, InjectionState::Active).await;
+    wait_injection(&failed, FiberState::Failed).await;
+    wait_injection(&healthy, FiberState::Active).await;
     assert_eq!(healthy_runs.load(Ordering::SeqCst), 1);
     tokio::time::timeout(std::time::Duration::from_secs(2), runtime.settle())
         .await
@@ -120,17 +120,17 @@ async fn injection_shutdown_fails_fast_and_other_ready_work_continues() {
 
     root.effect().unwrap().provide(NUMBER, Number(1)).unwrap();
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        wait_injection(&rejected, InjectionState::Failed).await;
-        wait_injection(&healthy, InjectionState::Active).await;
+        wait_injection(&rejected, FiberState::Failed).await;
+        wait_injection(&healthy, FiberState::Active).await;
     })
     .await
     .expect("scheduler must not deadlock on injection shutdown");
     assert_eq!(healthy_runs.load(Ordering::SeqCst), 1);
     let failure = runtime
         .diagnostics()
-        .inject_fibers
+        .fibers
         .into_iter()
-        .find(|item| item.phase == cordis_core::FiberStateSnapshot::Failed)
+        .find(|item| item.state == cordis_core::FiberState::Failed)
         .and_then(|item| item.last_error)
         .expect("failed injection diagnostic");
     assert!(failure.contains("shutdown 只能由宿主"));
@@ -156,15 +156,15 @@ async fn provider_removal_disposes_consumer_and_reactivation_rebuilds_it() {
         .unwrap();
     let provider = root.effect().unwrap();
     provider.provide(NUMBER, Number(1)).unwrap();
-    wait_injection(&handle, InjectionState::Active).await;
+    wait_injection(&handle, FiberState::Active).await;
 
     provider.dispose();
-    wait_injection(&handle, InjectionState::Pending).await;
+    wait_injection(&handle, FiberState::Pending).await;
     assert_eq!(disposed.load(Ordering::SeqCst), 1);
 
     let replacement = root.effect().unwrap();
     replacement.provide(NUMBER, Number(2)).unwrap();
-    wait_injection(&handle, InjectionState::Active).await;
+    wait_injection(&handle, FiberState::Active).await;
 }
 
 #[tokio::test]
@@ -218,7 +218,7 @@ async fn nested_inject_and_failed_callback_follow_dependency_changes() {
             })
         })
         .unwrap();
-    wait_injection(&failed, InjectionState::Failed).await;
+    wait_injection(&failed, FiberState::Failed).await;
 }
 
 #[tokio::test]
@@ -240,13 +240,13 @@ async fn cyclic_injections_stay_pending_with_missing_deps_only() {
         })
         .unwrap();
     runtime.settle().await;
-    assert_eq!(a.state(), InjectionState::Pending);
-    assert_eq!(b.state(), InjectionState::Pending);
+    assert_eq!(a.state(), FiberState::Pending);
+    assert_eq!(b.state(), FiberState::Pending);
 
     let snapshot = runtime.diagnostics();
     assert!(
         snapshot
-            .inject_fibers
+            .fibers
             .iter()
             .any(|fiber| !fiber.missing_dependencies.is_empty())
     );
@@ -280,13 +280,13 @@ async fn concurrent_provide_and_dispose_converge() {
         current = Some(effect);
         runtime.settle().await;
     }
-    wait_injection(&handle, InjectionState::Active).await;
+    wait_injection(&handle, FiberState::Active).await;
     assert!(runs.load(Ordering::SeqCst) >= 1);
 
     if let Some(previous) = current.take() {
         previous.dispose();
     }
-    wait_injection(&handle, InjectionState::Pending).await;
+    wait_injection(&handle, FiberState::Pending).await;
 }
 
 #[tokio::test]
@@ -334,7 +334,7 @@ async fn provider_revoke_from_non_tokio_thread_still_converges() {
         .unwrap();
     let provider = root.effect().unwrap();
     provider.provide(NUMBER, Number(1)).unwrap();
-    wait_injection(&handle, InjectionState::Active).await;
+    wait_injection(&handle, FiberState::Active).await;
 
     let provider = Arc::new(provider);
     let to_dispose = provider.clone();
@@ -344,7 +344,7 @@ async fn provider_revoke_from_non_tokio_thread_still_converges() {
     .join()
     .expect("thread join");
 
-    wait_injection(&handle, InjectionState::Pending).await;
+    wait_injection(&handle, FiberState::Pending).await;
 }
 
 #[tokio::test]
@@ -352,21 +352,27 @@ async fn key_type_conflict_across_plugins() {
     let runtime = runtime();
     let root = runtime.root();
     let first = TestPlugin::new().provide_clone(NUMBER, Number(1));
-    let mut a = root.plugin(first.into_arc()).await.unwrap();
+    let mut a = root
+        .plugin(&cordis_testkit::PLUGIN_DEFINITION, first.into_arc())
+        .await
+        .unwrap();
     a.dispose();
 
     struct OtherPlugin;
+    static OTHERPLUGIN_DEFINITION: std::sync::LazyLock<cordis_core::PluginDefinition> =
+        std::sync::LazyLock::new(|| cordis_core::PluginDefinition::named("test.otherplugin"));
+
     #[async_trait]
     impl Plugin for OtherPlugin {
-        fn key(&self) -> cordis_core::PluginKey {
-            cordis_core::PluginKey::new("test.otherplugin")
-        }
         async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
             ctx.provide(OTHER_NUMBER, Other)?;
             Ok(())
         }
     }
-    let fiber = root.plugin(Arc::new(OtherPlugin)).await.unwrap();
+    let fiber = root
+        .plugin(&OTHERPLUGIN_DEFINITION, Arc::new(OtherPlugin))
+        .await
+        .unwrap();
     assert_eq!(fiber.state(), cordis_core::FiberState::Failed);
     assert!(
         fiber

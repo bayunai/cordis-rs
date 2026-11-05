@@ -7,12 +7,20 @@
 ### 破坏性变更
 
 - `dispose()` 立即禁止 Scope 树新增工作，任务取消及同步、异步清理由协调器按依赖顺序执行；`on_dispose` 不再保证返回前运行。子 Scope 使用独立取消令牌。
-- `InjectionState` 增加 `Loading` / `Unloading`；依赖变化后先完整释放旧执行，再运行下一轮回调。
+- `PluginDefinition` 身份与 Plugin 对象分离；挂载和 Catalog 登记显式传 Definition。插件与派生注入统一为 Fiber，状态直接使用 `FiberState`。
+- `plugin()` 返回拥有型 `Fiber`，Drop 卸载；`inject()` 和 `Fiber::handle()` 返回可克隆的非拥有型 `FiberHandle`，Drop 不卸载。
+- 插件与派生注入的 Failed 均只通过显式 restart 或插件 replace 恢复；依赖变化不自动重试。
+- Runtime 诊断统一为 fibers / definitions / providers / effects / isolations；事件与日志使用 Definition 身份及可选名称。
+- Loader Group 不再参与地址前缀，同一 EntryTree 内所有条目 ID 唯一；ID 拒绝空值和冒号。旧 Group 层级地址及 patch 目标必须显式迁移，不保留别名；Include 边界前缀仍保留。
+
+迁移步骤见 [Definition 与 Fiber 接入迁移](docs/migration-plugin-definitions.md)。
 
 ### 新增
 
 - 显式注入按 Provider 实例与消费者执行 Scope 建立生命周期绑定，覆盖 Loading、Active、失败清理与在途卸载；提供者等待消费者全部清理完成后才取消任务和释放资源，适用于普通 Effect、插件重启替换、批量卸载与 Runtime shutdown。
 - 新增 `DependencyCycle { scopes }` 与 `LifecycleReentrant { scope }` 错误；`unmount` 的专用重入检查覆盖跨树服务依赖。
+- Loader 支持跨 Include 移动条目及 Group 同树成员。两侧全量预检后协调运行时，按目标、源顺序写回；目标写入失败不写源，`LoaderControlError::Move` 与 `MovePersistence` 分别报告实际快照、生命周期错误和两侧持久化状态；同树移动也使用该错误且只写所属来源一次。不回滚已发生的变更，取消等待不取消协调。
+- 同树换 Group 保持条目地址，完整重挂载仍可改变 Fiber ID；仅同父项排序不重挂载。
 
 ### 改进与修复
 

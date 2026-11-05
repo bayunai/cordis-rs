@@ -237,7 +237,7 @@ impl LayerEngine {
         let user = document.config_for(&local).cloned();
         let inherited_tree = compose_entries(&captured.with_user(&UserPatchDocument::empty()))
             .map_err(user_layer_error)?;
-        let inherited_entry = match find_entry(&inherited_tree.extensions, &local) {
+        let inherited_entry = match find_entry(&inherited_tree.extensions, &local)? {
             Some(entry) => entry,
             None => {
                 return Ok(LayeredEntryConfig {
@@ -258,7 +258,7 @@ impl LayerEngine {
         let effective_entry = compose_entries(&patches)
             .map_err(user_layer_error)
             .and_then(|tree| {
-                find_entry(&tree.extensions, &local).ok_or_else(|| {
+                find_entry(&tree.extensions, &local)?.ok_or_else(|| {
                     LoaderControlError::EntryNotFound {
                         path: format!("{}:{local}", self.include_root),
                     }
@@ -324,7 +324,7 @@ impl LayerEngine {
                     let mut document = previous.clone();
                     document.upsert_disabled(&local, &factory, override_disabled);
                     let composed = engine.compose_full(&document).await?;
-                    if find_entry(&composed.extensions, &local)
+                    if find_entry(&composed.extensions, &local)?
                         .is_none_or(|entry| entry.disabled != next_disabled)
                     {
                         return Err(LoaderControlError::ConfigNotEditable);
@@ -388,7 +388,7 @@ impl LayerEngine {
                     }
                     // 更高层 home 盖住则拒绝写入（对齐 DSH）。
                     let composed = engine.compose_full(&document).await?;
-                    let after = find_entry(&composed.extensions, &local).ok_or_else(|| {
+                    let after = find_entry(&composed.extensions, &local)?.ok_or_else(|| {
                         LoaderControlError::EntryNotFound {
                             path: format!("{}:{local}", engine.include_root),
                         }
@@ -528,7 +528,7 @@ impl LayerEngine {
 
     async fn read_deploy_entry(&self, local: &str) -> Result<EntryOptions, LoaderControlError> {
         let tree = self.compose_deploy().await?;
-        find_entry(&tree.extensions, local).ok_or_else(|| LoaderControlError::EntryNotFound {
+        find_entry(&tree.extensions, local)?.ok_or_else(|| LoaderControlError::EntryNotFound {
             path: format!("{}:{local}", self.include_root),
         })
     }
@@ -554,30 +554,32 @@ fn ownership_index(
 ) -> Result<std::collections::HashMap<String, DeployOwner>, LoaderControlError> {
     let mut map = std::collections::HashMap::new();
     fn walk(
-        prefix: &str,
         entries: &[EntryOptions],
         map: &mut std::collections::HashMap<String, DeployOwner>,
     ) -> Result<(), LoaderControlError> {
         for entry in entries {
-            let path = if prefix.is_empty() {
-                entry.id.clone()
-            } else {
-                format!("{prefix}:{}", entry.id)
-            };
-            map.insert(
-                path.clone(),
-                DeployOwner {
-                    name: entry.name.clone(),
-                    group: entry.group,
-                },
-            );
+            if map
+                .insert(
+                    entry.id.clone(),
+                    DeployOwner {
+                        name: entry.name.clone(),
+                        group: entry.group,
+                    },
+                )
+                .is_some()
+            {
+                return Err(cordis_loader::LoaderError::DuplicateEntry {
+                    path: entry.id.clone(),
+                }
+                .into());
+            }
             if entry.group {
-                walk(&path, &entry.children()?, map)?;
+                walk(&entry.children()?, map)?;
             }
         }
         Ok(())
     }
-    walk("", entries, &mut map)?;
+    walk(entries, &mut map)?;
     Ok(map)
 }
 
@@ -598,23 +600,21 @@ fn classify_editability(
     }
 }
 
-fn find_entry(entries: &[EntryOptions], path: &str) -> Option<EntryOptions> {
-    let (head, tail) = path
-        .split_once(':')
-        .map_or((path, None), |(a, b)| (a, Some(b)));
-    if head.is_empty() {
-        return None;
-    }
-    let entry = entries.iter().find(|entry| entry.id == head)?;
-    if let Some(tail) = tail {
-        if !entry.group {
-            return None;
+fn find_entry(
+    entries: &[EntryOptions],
+    id: &str,
+) -> Result<Option<EntryOptions>, LoaderControlError> {
+    for entry in entries {
+        if entry.id == id {
+            return Ok(Some(entry.clone()));
         }
-        let children = entry.children().ok()?;
-        find_entry(&children, tail)
-    } else {
-        Some(entry.clone())
+        if entry.group
+            && let Some(found) = find_entry(&entry.children()?, id)?
+        {
+            return Ok(Some(found));
+        }
     }
+    Ok(None)
 }
 
 fn editability_error(error: LoaderControlError) -> LoaderControlError {
@@ -629,8 +629,7 @@ fn map_form_edit_error(error: LoaderControlError) -> LoaderControlError {
         LoaderControlError::Loader(
             LoaderError::InvalidConfig { .. }
             | LoaderError::FactoryPanic { .. }
-            | LoaderError::PluginBuild { .. }
-            | LoaderError::PluginPanic { .. },
+            | LoaderError::PluginBuild { .. },
         ) => LoaderControlError::ConfigValidation,
         LoaderControlError::Loader(LoaderError::Source { source })
             if source.kind == SourceErrorKind::Conflict =>

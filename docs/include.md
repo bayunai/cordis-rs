@@ -12,10 +12,10 @@ use cordis_loader::{ExtensionCatalog, LOADER, LoaderPlugin};
 use cordis_plugin_include::{IncludeFactory, include_root_entry};
 
 let mut catalog = ExtensionCatalog::new();
-catalog.register(IncludeFactory)?;
+catalog.register(&cordis_plugin_include::PLUGIN_DEFINITION, IncludeFactory)?;
 // 继续登记本应用的业务 Factory。
 let plugin = LoaderPlugin::new(catalog);
-let _loader_fiber = host.root().plugin(std::sync::Arc::new(plugin)).await?;
+let _loader_fiber = host.root().plugin(&cordis_loader::PLUGIN_DEFINITION, std::sync::Arc::new(plugin)).await?;
 let loader = host.root().get(LOADER)?;
 loader.create(include_root_entry("include", "cordis.toml")?, None, None).await?;
 ```
@@ -26,7 +26,7 @@ loader.create(include_root_entry("include", "cordis.toml")?, None, None).await?;
 
 `include_root_entry` 的 ID 必须由 Host 显式传入。示例统一使用 `include`，因此文件中的 `worker`
 完整路径为 `include:worker`；嵌套文件 `reports` 中的 `importer` 为 `include:reports:importer`。
-这是实际路径变化，不提供无前缀别名。文件内部保存的局部 ID 不增加前缀。
+Group 不增加地址段：`worker` 位于文件中任意 Group 内时仍为 `include:worker`。同一文件树内所有条目（含 Group 与其成员）的 ID 都必须唯一；不同 Include 树可各自使用同名局部 ID。ID 不得为空或包含 `:`，不支持旧 Group 前缀地址或无 Include 前缀的别名。文件内部保存的局部 ID 不增加前缀。
 `include` 是应用启动层选择的稳定 ID，不是 Loader 保留名称；应用传入其他 ID 时，
 完整路径使用该 ID 作为前缀，Loader 不特殊识别或省略根 Include。
 
@@ -73,7 +73,7 @@ Loader 的 `ENTRY_LOCATION` 只提供条目与所属树的位置，不再携带�
 ## 顺序 patches
 
 每个 patch 可包含 `id`、`insert`、`name`、`config`、`disabled`、`group`、`inject`、`isolate`。
-`id` 使用当前文件内的完整局部路径，例如 `workers:sender`，不带外层 `include:` 前缀。
+`id` 使用当前文件树内唯一的条目 ID，例如 Group `workers` 内的 `sender` 仍使用 `sender`，不带 Group 或外层 Include 前缀。向该 Group 插入时使用 `id = "workers"`。patch 不能穿过嵌套 Include 边界修改另一文件树；需在对应 Include 的 patches 中指定其树内 ID。
 
 - 含 insert：无 id 时插入文件根；有 id 时必须定位到 Group。不能同时包含字段覆盖。
 - 不含 insert：必须有 id，覆盖该条目的指定字段；未指定字段保持原声明。
@@ -156,10 +156,10 @@ Include 将路径规范化、读取与解析、版本检查、写回验证及原
 并在同目录创建和清理唯一的 0600 探测文件。不修改目标或父目录权限，不永久缓存只读状态；
 已知权限拒绝返回 `ReadOnly`，其他文件异常明确报错。只读来源仍允许读取、挂载和 reload。
 实际写回前会再次检查，但预判不能保证之后的 ACL、权限、文件占用或文件系统状态不变；
-协调后才发生的写回失败仍返回 `Persist` 和实际运行快照，不回滚运行时。
+普通配置协调后才发生的写回失败返回 `Persist` 和实际运行快照，不回滚运行时；移动使用下文的 `Move` 报告。
 
-运行时先应用，再写文件。生命周期失败不写回，但已经触及的实例不会回滚；写回失败返回
-`Persist` 与实际运行快照，不能解释为从未执行。初始业务子条目失败保留声明和 Failed 状态，
+普通配置操作先应用运行时，再写文件。生命周期失败不写回，但已经触及的实例不会回滚；写回失败返回
+`Persist` 与实际运行快照，不能解释为从未执行。移动在提交后保留目标声明并继续结算持久化，使用下文的 `Move` 报告失败。初始业务子条目失败保留声明和 Failed 状态，
 不撤销 Include 控制面或无关插件；文件、格式、来源登记等错误落在对应 Include 条目。
 
 取消调用方等待不会中断已接受提交。已经开始的阻塞任务不可强制取消，不会另起无人结算的
@@ -169,6 +169,16 @@ Include 将路径规范化、读取与解析、版本检查、写回验证及原
 旧句柄也只返回旧实例的结果，不操作新实例。释放失败仍尝试其余目标，重复调用保留原失败。
 秘密字段的安全描述仍由配置
 控制面处理；文件权限不是加密，业务插件不得把配置正文或凭据放入错误、日志与 panic。
+
+## 跨 Include 移动
+
+Loader 的 `update()` 可以将普通条目或 Group 移动到另一 Include 树，Group 的同树成员随之移动。移动后地址使用目标 Include 前缀；同树换 Group 则保持地址。完整重挂载可能改变 Fiber ID，仅同父项排序不会重挂载。
+
+两侧候选声明、树内 ID 唯一性、来源版本与写回能力在运行时变更前统一预检。运行时协调提交后，先原子写回目标文件，成功后才写源文件；目标文件写入失败时不尝试写源。源写入失败时目标文件可能已经保存，运行时也可能已完成移动。错误分别报告两侧运行时和持久化状态，不自动恢复源文件、不删除已保存目标，也不静默重试。
+
+运行时或写回失败由 `LoaderControlError::Move { snapshot, origin, destination, lifecycle_errors }` 报告。`snapshot` 为实际 Loader 状态，`lifecycle_errors` 为生命周期失败；两侧 `MovePersistence` 为 `NotRequired`、`Written { source_id }`、`Failed { source_id, error: Box<SourceError> }` 或 `NotAttempted { source_id }`。同树移动只有一次来源写回，其 `origin` 为 `NotRequired`，`destination` 报告该次写回；具体字段与全局／子树 `update` 的 parent 参数区别见 [Host 管理 API](host.md#管理-api-与可见性)。
+
+单份文件的原子替换不构成两份文件的事务。失败后读取错误中的两侧状态、Loader 实际快照及当前文件内容，再显式决定后续操作；不要用旧版本令牌重复提交。调用方取消等待不会取消已接受的移动协调或跳过剩余结算步骤。
 
 ## 破坏性 API 迁移
 
@@ -183,6 +193,7 @@ Include 将路径规范化、读取与解析、版本检查、写回验证及原
 - 自定义来源必须实现纯内存的 `enable_logs()`，明确是否输出所属条目的生命周期信息日志。
 - 删除 `attach_file_subtree`；自定义来源使用通用 `attach_subtree`，不把文件路径交给 Loader。
 - 删除 `EntryLocation.source_dir`；文件目录从 Include 的 `INCLUDE_LOCATION` 读取。
+- Group 不再构成地址前缀；将旧 `include:group:worker` 查询及 patch 目标改为所属树内的 `include:worker` / `worker`，并先消除同树各 Group 中的重复 ID。嵌套 Include 的 `include:reports:worker` 保持分段，因为 `reports` 是来源边界。
 - 所有文件条目服务查询、路由参数与配置描述增加实际 Include 前缀；文件 CRUD 可用完整路径
   （Loader 自动路由）或 `LoaderSubtree` 局部路径。
 - 外部工作台和网关需要独立迁移；本仓库不替它们增加兼容入口或旧路径别名。

@@ -38,6 +38,7 @@ pub type IsolateConfig = BTreeMap<String, IsolateValue>;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EntryOptions {
+    /// 所属 EntryTree 内唯一的本地 ID；Group 不建立独立命名空间。
     pub id: String,
     pub name: String,
     #[serde(default = "empty_table")]
@@ -116,28 +117,24 @@ impl EntryOptions {
 impl ExtensionsConfig {
     pub fn validate(&self, catalog: &ExtensionCatalog) -> Result<(), LoaderError> {
         ensure_version(self.version)?;
-        validate_entries(&self.extensions, catalog, None)
+        validate_entries(&self.extensions, catalog, &mut HashSet::new())
     }
 }
 
 fn validate_entries(
     entries: &[EntryOptions],
     catalog: &ExtensionCatalog,
-    parent: Option<&str>,
+    seen: &mut HashSet<String>,
 ) -> Result<(), LoaderError> {
-    let mut seen = HashSet::new();
     for entry in entries {
-        let path = parent.map_or_else(
-            || entry.id.clone(),
-            |parent| format!("{parent}:{id}", id = entry.id),
-        );
+        let path = entry.id.clone();
         if entry.id.is_empty() || entry.id.contains(':') {
             return Err(LoaderError::InvalidEntry {
                 path,
                 message: "id 不得为空或包含 ':'".into(),
             });
         }
-        if !seen.insert(entry.id.as_str()) {
+        if !seen.insert(entry.id.clone()) {
             return Err(LoaderError::DuplicateEntry { path });
         }
         validate_inject(entry, catalog, &path)?;
@@ -149,7 +146,7 @@ fn validate_entries(
                     message: format!("Group 的 name 必须为 `{GROUP_NAME}`"),
                 });
             }
-            validate_entries(&entry.children()?, catalog, Some(&path))?;
+            validate_entries(&entry.children()?, catalog, seen)?;
         } else if entry.name == GROUP_NAME {
             return Err(LoaderError::InvalidEntry {
                 path,

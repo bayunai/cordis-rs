@@ -17,10 +17,10 @@
 须在 `ConfigEditorPlugin` 之后（`include_root` 只来自 ConfigEditor）：
 
 ```rust
-ctx.plugin(Arc::new(PluginManagerPlugin))
+ctx.plugin(&cordis_plugin_plugin_manager::PLUGIN_DEFINITION, Arc::new(PluginManagerPlugin))
 ```
 
-PluginKey：`cordis.plugin-manager`。
+共享定义的展示名称：`cordis.plugin-manager`。
 
 ## 生命周期与只读状态
 

@@ -16,9 +16,9 @@ pub(crate) use state::ActivateClaim;
 pub use state::{FiberState, FiberStateChange};
 
 use crate::{
-    Context, ServiceId,
+    Context, CoreError, EffectContext, ServiceId, Services,
     effect::EffectScope,
-    plugin::{Plugin, PluginKey},
+    plugin::{Plugin, PluginDefinition},
 };
 use std::sync::{
     Arc, Mutex, Weak,
@@ -32,13 +32,69 @@ pub struct Fiber {
     pub(crate) inner: Arc<FiberInner>,
 }
 
+type CallbackFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), CoreError>> + Send>>;
+pub(crate) type InjectionCallback =
+    Arc<dyn Fn(Services, EffectContext) -> CallbackFuture + Send + Sync>;
+
+#[derive(Clone)]
+pub(crate) enum InstanceBody {
+    Plugin(Arc<dyn Plugin>),
+    Callback(InjectionCallback),
+}
+
+/// 非拥有型实例控制句柄；克隆或丢弃不改变实例生命周期。
+#[derive(Clone)]
+pub struct FiberHandle {
+    pub(crate) inner: Arc<FiberInner>,
+}
+
+impl FiberHandle {
+    pub fn id(&self) -> u64 {
+        self.inner.id
+    }
+    pub fn definition(&self) -> &PluginDefinition {
+        &self.inner.definition
+    }
+    pub fn state(&self) -> FiberState {
+        *self.inner.state.lock().expect("fiber state")
+    }
+    pub fn last_error(&self) -> Option<String> {
+        self.inner.last_error.lock().expect("fiber error").clone()
+    }
+    pub fn is_disposed(&self) -> bool {
+        self.inner.disposed.load(Ordering::Acquire)
+    }
+    pub fn missing_dependencies(&self) -> Vec<ServiceId> {
+        self.inner.missing_dependencies()
+    }
+    pub fn snapshot(&self) -> crate::FiberSnapshot {
+        self.inner.snapshot()
+    }
+    pub fn dispose(&self) {
+        self.inner.dispose_now();
+    }
+    pub async fn dispose_wait(&self) -> Result<(), CoreError> {
+        self.inner.check_lifecycle_wait()?;
+        self.inner.dispose_wait_inner().await
+    }
+    pub async fn restart(&self) -> Result<(), CoreError> {
+        self.inner.check_lifecycle_wait()?;
+        self.inner
+            .start_lifecycle(LifecycleOp::Restart)?
+            .wait()
+            .await
+    }
+}
+
 pub(crate) struct FiberInner {
     pub(crate) id: u64,
-    pub(crate) plugin_key: PluginKey,
+    pub(crate) definition: PluginDefinition,
+    pub(crate) parent_fiber_id: Option<u64>,
     pub(crate) context: Context,
     pub(crate) registry: Weak<crate::registry::Registry>,
     pub(crate) parent_scope: EffectScope,
-    pub(crate) plugin: Mutex<Arc<dyn Plugin>>,
+    pub(crate) body: Mutex<InstanceBody>,
     pub(crate) dependencies: Mutex<Vec<ServiceId>>,
     pub(crate) ownership: Mutex<EffectOwnership>,
     /// 本轮 Fiber 释放的最终结果；供延迟 `dispose_wait` 读取同一错误。
@@ -53,6 +109,14 @@ pub(crate) struct FiberInner {
 }
 
 impl Fiber {
+    pub fn handle(&self) -> FiberHandle {
+        FiberHandle {
+            inner: self.inner.clone(),
+        }
+    }
+    pub fn definition(&self) -> &PluginDefinition {
+        &self.inner.definition
+    }
     pub fn id(&self) -> u64 {
         self.inner.id
     }
@@ -73,7 +137,7 @@ impl Fiber {
         self.inner.missing_dependencies()
     }
 
-    pub fn snapshot(&self) -> crate::diagnostics::PluginFiberSnapshot {
+    pub fn snapshot(&self) -> crate::diagnostics::FiberSnapshot {
         self.inner.snapshot()
     }
 }
@@ -103,21 +167,16 @@ impl FiberInner {
         crate::registry::dependency_diagnostics(&state, &self.context, &deps).1
     }
 
-    pub(crate) fn snapshot(&self) -> crate::diagnostics::PluginFiberSnapshot {
-        let state = match *self.state.lock().expect("fiber state") {
-            FiberState::Pending => crate::diagnostics::FiberStateSnapshot::Pending,
-            FiberState::Loading => crate::diagnostics::FiberStateSnapshot::Loading,
-            FiberState::Active => crate::diagnostics::FiberStateSnapshot::Active,
-            FiberState::Failed => crate::diagnostics::FiberStateSnapshot::Failed,
-            FiberState::Unloading => crate::diagnostics::FiberStateSnapshot::Unloading,
-            FiberState::Disposed => crate::diagnostics::FiberStateSnapshot::Disposed,
-        };
+    pub(crate) fn snapshot(&self) -> crate::diagnostics::FiberSnapshot {
+        let state = *self.state.lock().expect("fiber state");
         let deps = self.dependencies.lock().expect("deps").clone();
         let missing = self.missing_dependencies();
         let unavailable = self.unavailable_dependencies();
-        crate::diagnostics::PluginFiberSnapshot {
+        crate::diagnostics::FiberSnapshot {
             id: self.id,
-            plugin_key: self.plugin_key.as_str(),
+            definition_id: self.definition.id(),
+            parent_fiber_id: self.parent_fiber_id,
+            name: self.definition.shared_name(),
             context_depth: self.context.context_depth(),
             state,
             dependencies: deps.iter().map(|d| d.as_str()).collect(),
@@ -153,9 +212,6 @@ mod claim_tests {
 
     #[async_trait]
     impl Plugin for NoopPlugin {
-        fn key(&self) -> crate::plugin::PluginKey {
-            crate::plugin::PluginKey::new("test.noop")
-        }
         async fn apply(&self, _ctx: &Context) -> Result<(), CoreError> {
             Ok(())
         }
@@ -177,11 +233,12 @@ mod claim_tests {
         std::mem::forget(core);
         Arc::new(FiberInner {
             id: 1,
-            plugin_key: crate::plugin::PluginKey::new("test.noop"),
+            definition: crate::PluginDefinition::named("test.noop"),
+            parent_fiber_id: None,
             context,
             registry: Weak::new(),
             parent_scope: EffectScope::root(handle),
-            plugin: Mutex::new(Arc::new(NoopPlugin)),
+            body: Mutex::new(InstanceBody::Plugin(Arc::new(NoopPlugin))),
             dependencies: Mutex::new(Vec::new()),
             ownership: Mutex::new(EffectOwnership::Empty),
             dispose_result: Mutex::new(None),

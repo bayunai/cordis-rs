@@ -38,7 +38,7 @@ impl IncludeConfig {
     }
 }
 
-/// id 是文件内完整局部路径；insert 无 id 表示向文件根插入，有 id 则必须指向 Group。
+/// id 是文件所属 EntryTree 内的单段 ID；insert 无 id 表示向文件根插入，有 id 则必须指向 Group。
 /// 非插入 patch 只能覆盖已有条目字段，name 仅作 Factory 身份校验。
 #[derive(Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]

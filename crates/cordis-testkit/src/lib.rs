@@ -1,9 +1,7 @@
 //! Test helpers for [`cordis_core`]. Not intended for production hosts.
 
 use async_trait::async_trait;
-use cordis_core::{
-    Context, CoreError, EventKey, InjectionHandle, InjectionState, Plugin, ServiceKey,
-};
+use cordis_core::{Context, CoreError, EventKey, FiberHandle, FiberState, Plugin, ServiceKey};
 use std::{
     sync::{
         Arc, Mutex,
@@ -13,8 +11,8 @@ use std::{
 };
 use tokio::time::timeout;
 
-/// 轮询直到注入达到期望状态或超时。
-pub async fn wait_injection(handle: &InjectionHandle, expected: InjectionState) {
+/// 轮询直到注入 Fiber 达到期望状态或超时。
+pub async fn wait_injection(handle: &FiberHandle, expected: FiberState) {
     timeout(Duration::from_secs(2), async {
         loop {
             if handle.state() == expected {
@@ -143,9 +141,6 @@ impl TestPlugin {
 
 #[async_trait]
 impl Plugin for TestPlugin {
-    fn key(&self) -> cordis_core::PluginKey {
-        cordis_core::PluginKey::new("testkit.plugin")
-    }
     async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
         let counter = self.dispose_count.clone();
         let effect = ctx.effect()?;
@@ -166,3 +161,7 @@ pub fn assert_service_unavailable<T: Send + Sync + 'static>(ctx: &Context, key: 
         Err(CoreError::ServiceUnavailable { .. })
     ));
 }
+
+/// TestPlugin 的共享定义；需要独立身份时由测试显式创建其他定义。
+pub static PLUGIN_DEFINITION: std::sync::LazyLock<cordis_core::PluginDefinition> =
+    std::sync::LazyLock::new(|| cordis_core::PluginDefinition::named("testkit.plugin"));

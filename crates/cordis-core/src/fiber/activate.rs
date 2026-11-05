@@ -2,7 +2,7 @@
 //!
 //! 认领 Pending→Loading，解析依赖并调用 Plugin::apply；生命周期入口在 `lifecycle` / `coordinator`。
 
-use super::{ActivateClaim, EffectOwnership, FiberInner, FiberState, HandleHandoff};
+use super::{ActivateClaim, EffectOwnership, FiberInner, FiberState, HandleHandoff, InstanceBody};
 use crate::{
     Context, CoreError, ServiceId,
     callback_context::{LifecycleFrame, USER_LIFECYCLE_CALLBACK},
@@ -16,7 +16,8 @@ use std::{
 };
 
 async fn invoke_plugin_apply(
-    plugin: &Arc<dyn crate::plugin::Plugin>,
+    plugin: &InstanceBody,
+    services: crate::Services,
     context: &Context,
     effect_scope: &EffectScope,
 ) -> Result<(), String> {
@@ -26,8 +27,16 @@ async fn invoke_plugin_apply(
                 scope: effect_scope.clone(),
             },
             async {
-                let future = catch_unwind(AssertUnwindSafe(|| plugin.apply(context)))
-                    .map_err(|payload| format_panic_message("plugin apply", payload))?;
+                let future = catch_unwind(AssertUnwindSafe(|| match plugin {
+                    InstanceBody::Plugin(plugin) => plugin.apply(context),
+                    InstanceBody::Callback(callback) => callback(
+                        services,
+                        crate::EffectContext {
+                            context: context.clone(),
+                        },
+                    ),
+                }))
+                .map_err(|payload| format_panic_message("plugin apply", payload))?;
                 match AssertUnwindSafe(future).catch_unwind().await {
                     Ok(Ok(())) => Ok(()),
                     Ok(Err(error)) => Err(error.to_string()),
@@ -145,7 +154,7 @@ impl FiberInner {
             .unwrap_or(CoreError::FiberDisposed)
     }
 
-    fn mark_ready_for_handle_if_preparing(&self, initial_mount: bool) {
+    pub(super) fn mark_ready_for_handle_if_preparing(&self, initial_mount: bool) {
         if !initial_mount {
             return;
         }
@@ -226,7 +235,7 @@ impl FiberInner {
             return Err(self.revoke_abandoned_mount().await);
         }
 
-        let plugin = self.plugin.lock().expect("plugin").clone();
+        let plugin = self.body.lock().expect("plugin").clone();
         let parent_scope = self.parent_scope.clone();
         if parent_scope.is_disposed() {
             *self.last_error.lock().expect("error") =
@@ -239,9 +248,11 @@ impl FiberInner {
             Ok(scope) => scope,
             Err(error) => return Err(error),
         };
-        let apply_ctx =
-            self.context
-                .with_scope_and_log_source(effect_scope.clone(), self.id, self.plugin_key);
+        let apply_ctx = self.context.with_scope_and_log_source(
+            effect_scope.clone(),
+            self.id,
+            self.definition.clone(),
+        );
         if let Err(error) = registry.register_effect(
             effect_scope.id(),
             effect_scope.name().to_string(),
@@ -264,26 +275,27 @@ impl FiberInner {
                 return Err(error);
             }
         };
-        let providers = match registry.bind_dependencies(&self.context, &deps, &effect_scope) {
-            Ok(Some((providers, _))) => providers,
-            Ok(None) => {
-                drop(execution);
-                self.abandon_loading_to_pending(Some(&effect_scope), true)
-                    .await?;
-                self.mark_ready_for_handle_if_preparing(initial_mount);
-                return Ok(());
-            }
-            Err(error) => {
-                drop(execution);
-                self.abandon_loading_to_pending(Some(&effect_scope), false)
-                    .await?;
-                *self.last_error.lock().expect("error") = Some(error.to_string());
-                let _ = self.transition_if_alive(FiberState::Failed);
-                self.mark_ready_for_handle_if_preparing(initial_mount);
-                return Err(error);
-            }
-        };
-        let outcome = invoke_plugin_apply(&plugin, &apply_ctx, &effect_scope).await;
+        let (providers, services) =
+            match registry.bind_dependencies(&self.context, &deps, &effect_scope) {
+                Ok(Some(binding)) => binding,
+                Ok(None) => {
+                    drop(execution);
+                    self.abandon_loading_to_pending(Some(&effect_scope), true)
+                        .await?;
+                    self.mark_ready_for_handle_if_preparing(initial_mount);
+                    return Ok(());
+                }
+                Err(error) => {
+                    drop(execution);
+                    self.abandon_loading_to_pending(Some(&effect_scope), false)
+                        .await?;
+                    *self.last_error.lock().expect("error") = Some(error.to_string());
+                    let _ = self.transition_if_alive(FiberState::Failed);
+                    self.mark_ready_for_handle_if_preparing(initial_mount);
+                    return Err(error);
+                }
+            };
+        let outcome = invoke_plugin_apply(&plugin, services, &apply_ctx, &effect_scope).await;
         drop(execution);
         match outcome {
             Ok(()) => {
@@ -376,8 +388,10 @@ impl FiberInner {
 mod initial_mount_revoke_tests {
     use crate::{
         Context, CoreError,
-        fiber::{EffectOwnership, FiberInner, FiberState, coordinator::HandleHandoff},
-        plugin::{Plugin, PluginKey},
+        fiber::{
+            EffectOwnership, FiberInner, FiberState, InstanceBody, coordinator::HandleHandoff,
+        },
+        plugin::{Plugin, PluginDefinition},
     };
     use async_trait::async_trait;
     use std::sync::{
@@ -391,9 +405,6 @@ mod initial_mount_revoke_tests {
 
     #[async_trait]
     impl Plugin for CountingPlugin {
-        fn key(&self) -> PluginKey {
-            PluginKey::new("test.unit-abandon-before-apply")
-        }
         async fn apply(&self, _ctx: &Context) -> Result<(), CoreError> {
             self.applies.fetch_add(1, Ordering::SeqCst);
             Ok(())
@@ -415,11 +426,12 @@ mod initial_mount_revoke_tests {
         std::mem::forget(core);
         Arc::new(FiberInner {
             id: 1,
-            plugin_key: PluginKey::new("test.unit-abandon-before-apply"),
+            definition: PluginDefinition::named("test.unit-abandon-before-apply"),
+            parent_fiber_id: None,
             context,
             registry: Weak::new(),
             parent_scope: crate::effect::EffectScope::root(handle),
-            plugin: Mutex::new(Arc::new(CountingPlugin { applies })),
+            body: Mutex::new(InstanceBody::Plugin(Arc::new(CountingPlugin { applies }))),
             dependencies: Mutex::new(Vec::new()),
             ownership: Mutex::new(EffectOwnership::Empty),
             dispose_result: Mutex::new(None),
@@ -461,17 +473,15 @@ mod initial_mount_revoke_tests {
 
     #[tokio::test]
     async fn p1_ready_for_handle_abandon_leaves_no_orphan() {
-        use crate::{PluginKey, Runtime, ServiceKey};
+        use crate::{PluginDefinition, Runtime, ServiceKey};
 
-        static KEY: PluginKey = PluginKey::new("test.p1.ready-for-handle");
+        static KEY: std::sync::LazyLock<PluginDefinition> =
+            std::sync::LazyLock::new(|| PluginDefinition::named("test.p1.ready-for-handle"));
         static VALUE: ServiceKey<u64> = ServiceKey::new("test.p1.ready-for-handle.n@1");
 
         struct ProvidePlugin;
         #[async_trait]
         impl Plugin for ProvidePlugin {
-            fn key(&self) -> PluginKey {
-                KEY
-            }
             async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
                 ctx.provide(VALUE, 7)?;
                 Ok(())
@@ -480,10 +490,10 @@ mod initial_mount_revoke_tests {
 
         let runtime = Runtime::new().expect("runtime");
         let root = runtime.root();
-        let gate = FiberInner::arm_ready_for_handle_gate(KEY);
+        let gate = FiberInner::arm_ready_for_handle_gate(KEY.id());
         let mount = tokio::spawn({
             let root = root.clone();
-            async move { root.plugin(Arc::new(ProvidePlugin)).await }
+            async move { root.plugin(&KEY, Arc::new(ProvidePlugin)).await }
         });
         gate.entered.await.expect("ready for handle");
         mount.abort();
@@ -493,13 +503,13 @@ mod initial_mount_revoke_tests {
         while std::time::Instant::now() < deadline {
             let snap = runtime.diagnostics();
             let gone = snap
-                .plugin_registry
+                .definitions
                 .iter()
-                .all(|group| group.plugin_key != KEY.as_str())
+                .all(|group| group.definition_id != KEY.id())
                 && snap
-                    .plugin_fibers
+                    .fibers
                     .iter()
-                    .all(|fiber| fiber.plugin_key != KEY.as_str());
+                    .all(|fiber| fiber.definition_id != KEY.id());
             if gone && root.get(VALUE).is_err() {
                 runtime.shutdown().await.expect("shutdown");
                 return;

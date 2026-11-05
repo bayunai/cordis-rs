@@ -1,7 +1,7 @@
 //! PluginManager：Entry 库存与启停；委托 ConfigEditor user 层。
 
 use async_trait::async_trait;
-use cordis_core::{Context, CoreError, FiberState, Plugin, PluginKey, ServiceId, ServiceKey};
+use cordis_core::{Context, CoreError, FiberState, Plugin, ServiceId, ServiceKey};
 use cordis_loader::{LOADER, LoaderControlError, LoaderEvent};
 use cordis_plugin_config_editor::{
     CONFIG_EDITOR, ConfigEditability, ConfigEditorService, ConfigReadOnlyReason,
@@ -115,10 +115,6 @@ pub struct PluginManagerPlugin;
 
 #[async_trait]
 impl Plugin for PluginManagerPlugin {
-    fn key(&self) -> PluginKey {
-        PluginKey::new("cordis.plugin-manager")
-    }
-
     fn inject(&self) -> Vec<ServiceId> {
         vec![LOADER.id(), CONFIG_EDITOR.id()]
     }

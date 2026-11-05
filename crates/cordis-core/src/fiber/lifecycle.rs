@@ -50,12 +50,6 @@ impl Fiber {
         }
         self.inner.check_lifecycle_wait()?;
         let metadata = read_metadata(plugin.as_ref())?;
-        if metadata.key != self.inner.plugin_key {
-            return Err(CoreError::PluginKeyMismatch {
-                expected: self.inner.plugin_key,
-                actual: metadata.key,
-            });
-        }
         let completion = self
             .inner
             .start_lifecycle(LifecycleOp::Replace { plugin, metadata })?;
@@ -175,7 +169,7 @@ impl FiberInner {
         self.transition_disposed();
         self.clear_release_if_matching(&scope);
         if let Some(registry) = self.registry.upgrade() {
-            registry.unregister_plugin_fiber(self.id);
+            registry.unregister_fiber(self.id);
         }
         result
     }
@@ -205,7 +199,7 @@ impl FiberInner {
         self.store_dispose_result(Ok(()));
         self.transition_disposed();
         if let Some(registry) = self.registry.upgrade() {
-            registry.unregister_plugin_fiber(self.id);
+            registry.unregister_fiber(self.id);
         }
     }
 

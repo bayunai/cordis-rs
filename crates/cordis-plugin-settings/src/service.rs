@@ -2,7 +2,7 @@
 
 use crate::form::{self, ConfigOperation, EntryConfigView};
 use async_trait::async_trait;
-use cordis_core::{Context, CoreError, Plugin, PluginKey, ServiceId, ServiceKey};
+use cordis_core::{Context, CoreError, Plugin, ServiceId, ServiceKey};
 use cordis_loader::{ConfigRevision, LOADER, LoaderControlError, LoaderEvent};
 use cordis_plugin_config_editor::{
     CONFIG_EDITOR, ConfigEditability, ConfigEditorService, ConfigReadOnlyReason,
@@ -132,10 +132,6 @@ pub struct SettingsPlugin;
 
 #[async_trait]
 impl Plugin for SettingsPlugin {
-    fn key(&self) -> PluginKey {
-        PluginKey::new("cordis.settings")
-    }
-
     fn inject(&self) -> Vec<ServiceId> {
         vec![LOADER.id(), CONFIG_EDITOR.id()]
     }

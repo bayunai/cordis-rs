@@ -12,6 +12,8 @@ use crate::{
 use cordis_core::{Context, ServiceKey};
 use std::sync::Arc;
 use tokio::sync::broadcast;
+#[path = "entry_move.rs"]
+mod entry_move;
 
 /// Loader 的运行时快照已失效。
 ///
@@ -30,6 +32,22 @@ pub struct EntryUpdate {
     pub disabled: Option<bool>,
     pub inject: Option<Option<InjectConfig>>,
     pub isolate: Option<Option<IsolateConfig>>,
+}
+
+/// 跨树移动一侧的持久化结果，不包含配置正文。
+#[derive(Debug, Clone)]
+pub enum MovePersistence {
+    NotRequired,
+    Written {
+        source_id: String,
+    },
+    Failed {
+        source_id: String,
+        error: Box<crate::SourceError>,
+    },
+    NotAttempted {
+        source_id: String,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -60,8 +78,13 @@ pub enum LoaderControlError {
     ParentNotGroup { path: String },
     #[error("不能将条目移动到自己或自己的子树: {path}")]
     InvalidMove { path: String },
-    #[error("不支持跨树移动条目: {path}")]
-    CrossTreeMove { path: String },
+    #[error("条目移动已提交但未完全结算；源：{origin:?}；目标：{destination:?}；生命周期错误数：{count}", count = .lifecycle_errors.len())]
+    Move {
+        snapshot: Box<LoaderSnapshot>,
+        origin: MovePersistence,
+        destination: MovePersistence,
+        lifecycle_errors: Vec<LoaderError>,
+    },
     #[error("配置来源已在 Loader 外修改；请先 reload: {source_id}")]
     ConfigConflict { source_id: String },
     #[error("配置来源失败: {source}")]
@@ -85,7 +108,29 @@ impl LoaderControlError {
 
     /// 个别 Entry 挂载/清理失败；组成变更通常已生效，调用方可继续。
     pub fn is_entry_lifecycle_failure(&self) -> bool {
-        matches!(self, Self::Loader(error) if error.is_entry_lifecycle_failure())
+        match self {
+            Self::Loader(error) => error.is_entry_lifecycle_failure(),
+            Self::Move {
+                lifecycle_errors,
+                origin,
+                destination,
+                ..
+            } => {
+                !lifecycle_errors.is_empty()
+                    && lifecycle_errors
+                        .iter()
+                        .all(LoaderError::is_entry_lifecycle_failure)
+                    && !matches!(
+                        origin,
+                        MovePersistence::Failed { .. } | MovePersistence::NotAttempted { .. }
+                    )
+                    && !matches!(
+                        destination,
+                        MovePersistence::Failed { .. } | MovePersistence::NotAttempted { .. }
+                    )
+            }
+            _ => false,
+        }
     }
 }
 
@@ -275,7 +320,9 @@ impl Loader {
         .map(|_| inner.aggregate_snapshot())
     }
 
-    /// 按完整路径更新（可同树内移动）。路径与目标 parent 分属不同来源树时返回 `CrossTreeMove`。
+    /// 按 Include 地址更新或移动。`Some(None)` 移到 Loader 根树，
+    /// `Some(Some(parent))` 指定目标 Group 或 Include 树根；`None` 保持父级。
+    /// 更换父级会完整释放旧轮再挂载；调用方取消等待不会中断已接受的操作。
     pub async fn update(
         &self,
         path: impl AsRef<str>,
@@ -283,39 +330,15 @@ impl Loader {
         parent: Option<Option<&str>>,
         position: Option<usize>,
     ) -> Result<LoaderSnapshot, LoaderControlError> {
-        let path = path.as_ref().to_owned();
-        let inner = self.inner()?;
-        let (tree, local_path) = resolve_entry_path(&inner, &path);
-        let parent = match parent {
-            None => None,
-            Some(None) => Some(None),
-            Some(Some(parent)) => {
-                let (parent_tree, parent_local) = resolve_parent_path(&inner, parent);
-                if !Arc::ptr_eq(&tree, &parent_tree) {
-                    return Err(LoaderControlError::CrossTreeMove { path });
-                }
-                Some(parent_local)
-            }
-        };
-        mutate_tree(&tree, false, move |config| {
-            let destination = if let Some(parent) = parent.as_ref() {
-                let parent = parent.as_deref();
-                if parent.is_some_and(|parent| {
-                    parent == local_path || parent.starts_with(&(local_path.clone() + ":"))
-                }) {
-                    return Err(LoaderControlError::InvalidMove { path: path.clone() });
-                }
-                let entry = remove_entry(&mut config.extensions, &local_path)?;
-                let next_path = join_path(parent, &entry.id);
-                insert_entry(&mut config.extensions, parent, position, entry)?;
-                next_path
-            } else {
-                local_path.clone()
-            };
-            patch_entry(&mut config.extensions, &destination, patch)
-        })
+        entry_move::update(
+            self.inner()?,
+            path.as_ref().to_owned(),
+            patch,
+            parent.map(|parent| parent.map(str::to_owned)),
+            position,
+            None,
+        )
         .await
-        .map(|_| inner.aggregate_snapshot())
     }
 
     /// 按完整路径删除条目。
@@ -425,7 +448,7 @@ impl LoaderSubtree {
             .subtree_owning_path(&full)
             .is_some_and(|tree| !Arc::ptr_eq(&tree, &self.tree))
         {
-            return Err(LoaderControlError::CrossTreeMove { path: full });
+            return Err(LoaderControlError::EntryNotFound { path: full });
         }
         Ok(())
     }
@@ -482,25 +505,24 @@ impl LoaderSubtree {
         if let Some(Some(parent)) = parent {
             self.reject_nested_path(parent)?;
         }
-        let parent = parent.map(|parent| parent.map(str::to_owned));
-        mutate_tree(&self.tree, false, move |config| {
-            let destination = if let Some(parent) = parent.as_ref() {
-                let parent = parent.as_deref();
-                if parent.is_some_and(|parent| {
-                    parent == path || parent.starts_with(&(path.clone() + ":"))
-                }) {
-                    return Err(LoaderControlError::InvalidMove { path: path.clone() });
-                }
-                let entry = remove_entry(&mut config.extensions, &path)?;
-                let next_path = join_path(parent, &entry.id);
-                insert_entry(&mut config.extensions, parent, position, entry)?;
-                next_path
-            } else {
-                path.clone()
-            };
-            patch_entry(&mut config.extensions, &destination, patch)
-        })
+        let prefix = self.tree.prefix.to_string();
+        let full = format!("{prefix}:{path}");
+        let parent = parent.map(|parent| {
+            Some(match parent {
+                Some(parent) => format!("{prefix}:{parent}"),
+                None => prefix.clone(),
+            })
+        });
+        entry_move::update(
+            self.loader.clone(),
+            full,
+            patch,
+            parent,
+            position,
+            Some(self.tree.clone()),
+        )
         .await
+        .map(|_| self.tree.local_snapshot())
     }
 
     pub async fn remove(
@@ -646,20 +668,52 @@ pub(crate) async fn commit_tree_locked(
     }
 }
 
-fn path_parts(path: &str) -> Result<Vec<&str>, LoaderControlError> {
-    let parts = path
-        .split(':')
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>();
-    if parts.is_empty() || parts.join(":") != path {
-        Err(LoaderControlError::EntryNotFound { path: path.into() })
-    } else {
-        Ok(parts)
+/// 在同一 EntryTree 的嵌套声明中按本地 ID 查找；Group 不是地址命名空间。
+pub(crate) fn find_entry(
+    entries: &[EntryOptions],
+    id: &str,
+) -> Result<EntryOptions, LoaderControlError> {
+    if id.is_empty() || id.contains(':') {
+        return Err(LoaderControlError::EntryNotFound { path: id.into() });
     }
+    fn find(
+        entries: &[EntryOptions],
+        id: &str,
+    ) -> Result<Option<EntryOptions>, LoaderControlError> {
+        for entry in entries {
+            if entry.id == id {
+                return Ok(Some(entry.clone()));
+            }
+            if entry.group
+                && let Some(found) = find(&entry.children()?, id)?
+            {
+                return Ok(Some(found));
+            }
+        }
+        Ok(None)
+    }
+    find(entries, id)?.ok_or_else(|| LoaderControlError::EntryNotFound { path: id.into() })
 }
 
-fn join_path(parent: Option<&str>, id: &str) -> String {
-    parent.map_or_else(|| id.into(), |parent| format!("{parent}:{id}"))
+fn edit_entry(
+    entries: &mut [EntryOptions],
+    id: &str,
+    edit: &mut impl FnMut(&mut EntryOptions) -> Result<(), LoaderControlError>,
+) -> Result<bool, LoaderControlError> {
+    for entry in entries {
+        if entry.id == id {
+            edit(entry)?;
+            return Ok(true);
+        }
+        if entry.group {
+            let mut children = entry.children()?;
+            if edit_entry(&mut children, id, edit)? {
+                entry.set_children(children)?;
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
 }
 
 fn insert_entry(
@@ -668,88 +722,90 @@ fn insert_entry(
     position: Option<usize>,
     entry: EntryOptions,
 ) -> Result<(), LoaderControlError> {
-    match parent {
-        None => insert_local(entries, position, entry, None),
-        Some(parent) => insert_nested(entries, &path_parts(parent)?, parent, position, entry),
+    match find_entry(entries, &entry.id) {
+        Ok(_) => return Err(LoaderControlError::EntryExists { path: entry.id }),
+        Err(LoaderControlError::EntryNotFound { .. }) => {}
+        Err(error) => return Err(error),
     }
-}
-
-fn insert_local(
-    entries: &mut Vec<EntryOptions>,
-    position: Option<usize>,
-    entry: EntryOptions,
-    parent: Option<&str>,
-) -> Result<(), LoaderControlError> {
-    if entries.iter().any(|item| item.id == entry.id) {
-        return Err(LoaderControlError::EntryExists {
-            path: join_path(parent, &entry.id),
-        });
-    }
-    let index = position.unwrap_or(entries.len()).min(entries.len());
-    entries.insert(index, entry);
-    Ok(())
-}
-
-fn insert_nested(
-    entries: &mut [EntryOptions],
-    parts: &[&str],
-    full_parent: &str,
-    position: Option<usize>,
-    entry: EntryOptions,
-) -> Result<(), LoaderControlError> {
-    let group = entries
-        .iter_mut()
-        .find(|item| item.id == parts[0])
-        .ok_or_else(|| LoaderControlError::ParentNotGroup {
-            path: full_parent.into(),
-        })?;
-    if !group.group {
+    let Some(parent) = parent else {
+        let index = position.unwrap_or(entries.len()).min(entries.len());
+        entries.insert(index, entry);
+        return Ok(());
+    };
+    if parent.is_empty() || parent.contains(':') {
         return Err(LoaderControlError::ParentNotGroup {
-            path: full_parent.into(),
+            path: parent.into(),
         });
     }
-    let mut children = group.children()?;
-    if parts.len() == 1 {
-        insert_local(&mut children, position, entry, Some(full_parent))?;
-    } else {
-        insert_nested(&mut children, &parts[1..], full_parent, position, entry)?;
+    let mut candidate = Some(entry);
+    if !edit_entry(entries, parent, &mut |group| {
+        if !group.group {
+            return Err(LoaderControlError::ParentNotGroup {
+                path: parent.into(),
+            });
+        }
+        let mut children = group.children()?;
+        let index = position.unwrap_or(children.len()).min(children.len());
+        children.insert(index, candidate.take().expect("one matching group"));
+        group.set_children(children)?;
+        Ok(())
+    })? {
+        return Err(LoaderControlError::ParentNotGroup {
+            path: parent.into(),
+        });
     }
-    group.set_children(children)?;
     Ok(())
 }
 
 fn remove_entry(
     entries: &mut Vec<EntryOptions>,
-    path: &str,
+    id: &str,
 ) -> Result<EntryOptions, LoaderControlError> {
-    remove_nested(entries, &path_parts(path)?, path)
+    find_entry(entries, id)?;
+    fn remove(
+        entries: &mut Vec<EntryOptions>,
+        id: &str,
+    ) -> Result<Option<EntryOptions>, LoaderControlError> {
+        if let Some(index) = entries.iter().position(|entry| entry.id == id) {
+            return Ok(Some(entries.remove(index)));
+        }
+        for entry in entries {
+            if entry.group {
+                let mut children = entry.children()?;
+                if let Some(found) = remove(&mut children, id)? {
+                    entry.set_children(children)?;
+                    return Ok(Some(found));
+                }
+            }
+        }
+        Ok(None)
+    }
+    remove(entries, id)?.ok_or_else(|| LoaderControlError::EntryNotFound { path: id.into() })
 }
 
-#[allow(clippy::ptr_arg)]
-fn remove_nested(
-    entries: &mut Vec<EntryOptions>,
-    parts: &[&str],
-    full_path: &str,
-) -> Result<EntryOptions, LoaderControlError> {
-    let index = entries
-        .iter()
-        .position(|item| item.id == parts[0])
-        .ok_or_else(|| LoaderControlError::EntryNotFound {
-            path: full_path.into(),
-        })?;
-    if parts.len() == 1 {
-        return Ok(entries.remove(index));
+fn move_local(
+    config: &mut ExtensionsConfig,
+    path: &str,
+    parent: Option<&str>,
+    position: Option<usize>,
+) -> Result<(), LoaderControlError> {
+    let entry = find_entry(&config.extensions, path)?;
+    if let Some(parent) = parent {
+        let descendant = if entry.group {
+            match find_entry(&entry.children()?, parent) {
+                Ok(_) => true,
+                Err(LoaderControlError::EntryNotFound { .. }) => false,
+                Err(error) => return Err(error),
+            }
+        } else {
+            false
+        };
+        if parent == path || descendant {
+            return Err(LoaderControlError::InvalidMove { path: path.into() });
+        }
     }
-    let group = &mut entries[index];
-    if !group.group {
-        return Err(LoaderControlError::EntryNotFound {
-            path: full_path.into(),
-        });
-    }
-    let mut children = group.children()?;
-    let result = remove_nested(&mut children, &parts[1..], full_path)?;
-    group.set_children(children)?;
-    Ok(result)
+    let entry = remove_entry(&mut config.extensions, path)?;
+    insert_entry(&mut config.extensions, parent, position, entry)
 }
 
 fn map_config_type_error(error: LoaderError) -> LoaderControlError {
@@ -757,7 +813,6 @@ fn map_config_type_error(error: LoaderError) -> LoaderControlError {
         LoaderError::InvalidConfig { .. }
         | LoaderError::FactoryPanic { .. }
         | LoaderError::PluginBuild { .. }
-        | LoaderError::PluginPanic { .. }
         | LoaderError::UnknownFactory { .. } => LoaderControlError::ConfigValidation,
         other => LoaderControlError::Loader(other),
     }
@@ -768,43 +823,21 @@ pub(crate) fn patch_entry(
     path: &str,
     patch: EntryUpdate,
 ) -> Result<(), LoaderControlError> {
-    patch_nested(entries, &path_parts(path)?, path, patch)
-}
-
-fn patch_nested(
-    entries: &mut [EntryOptions],
-    parts: &[&str],
-    full_path: &str,
-    patch: EntryUpdate,
-) -> Result<(), LoaderControlError> {
-    let entry = entries
-        .iter_mut()
-        .find(|item| item.id == parts[0])
-        .ok_or_else(|| LoaderControlError::EntryNotFound {
-            path: full_path.into(),
-        })?;
-    if parts.len() == 1 {
-        if let Some(config) = patch.config {
-            entry.config = config;
+    find_entry(entries, path)?;
+    edit_entry(entries, path, &mut |entry| {
+        if let Some(config) = &patch.config {
+            entry.config = config.clone();
         }
         if let Some(disabled) = patch.disabled {
             entry.disabled = disabled;
         }
-        if let Some(inject) = patch.inject {
-            entry.inject = inject;
+        if let Some(inject) = &patch.inject {
+            entry.inject = inject.clone();
         }
-        if let Some(isolate) = patch.isolate {
-            entry.isolate = isolate;
+        if let Some(isolate) = &patch.isolate {
+            entry.isolate = isolate.clone();
         }
-        return Ok(());
-    }
-    if !entry.group {
-        return Err(LoaderControlError::EntryNotFound {
-            path: full_path.into(),
-        });
-    }
-    let mut children = entry.children()?;
-    patch_nested(&mut children, &parts[1..], full_path, patch)?;
-    entry.set_children(children)?;
+        Ok(())
+    })?;
     Ok(())
 }

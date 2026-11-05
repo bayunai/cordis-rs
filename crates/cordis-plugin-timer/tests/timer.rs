@@ -1,9 +1,7 @@
 //! Timer 生命周期与虚拟时间回归。
 
 use async_trait::async_trait;
-use cordis_core::{
-    Context, CoreError, EffectContext, FiberState, Plugin, PluginKey, Runtime, ServiceId,
-};
+use cordis_core::{Context, CoreError, EffectContext, FiberState, Plugin, Runtime, ServiceId};
 use cordis_plugin_timer::{TIMER, TimerError, TimerExt, TimerPlugin};
 use cordis_testkit::wait_until;
 use futures_util::StreamExt;
@@ -20,9 +18,12 @@ fn runtime() -> Runtime {
 }
 
 async fn mount_timer(root: &Context) -> cordis_core::Fiber {
-    root.plugin(Arc::new(TimerPlugin))
-        .await
-        .expect("mount timer")
+    root.plugin(
+        &cordis_plugin_timer::PLUGIN_DEFINITION,
+        Arc::new(TimerPlugin),
+    )
+    .await
+    .expect("mount timer")
 }
 
 /// 在 `start_paused` 下让受管任务有机会被轮询。
@@ -378,10 +379,6 @@ struct TimerConsumer {
 
 #[async_trait]
 impl Plugin for TimerConsumer {
-    fn key(&self) -> PluginKey {
-        PluginKey::new("test.timer.consumer")
-    }
-
     fn inject(&self) -> Vec<ServiceId> {
         vec![TIMER.id()]
     }
@@ -417,9 +414,12 @@ async fn consumer_pending_when_timer_fiber_disposed() {
 
     let ticks = Arc::new(AtomicUsize::new(0));
     let consumer = root
-        .plugin(Arc::new(TimerConsumer {
-            ticks: ticks.clone(),
-        }))
+        .plugin(
+            &cordis_core::PluginDefinition::named("test.timer.consumer"),
+            Arc::new(TimerConsumer {
+                ticks: ticks.clone(),
+            }),
+        )
         .await
         .expect("mount consumer");
     assert_eq!(

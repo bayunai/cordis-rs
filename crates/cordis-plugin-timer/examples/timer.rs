@@ -5,7 +5,7 @@
 //! ```
 
 use async_trait::async_trait;
-use cordis_core::{Context, CoreError, Plugin, PluginKey, ServiceId};
+use cordis_core::{Context, CoreError, Plugin, ServiceId};
 use cordis_host::CordisHost;
 use cordis_plugin_logger_console::ConsoleLoggerPlugin;
 use cordis_plugin_timer::{TIMER, TimerExt, TimerPlugin};
@@ -15,10 +15,6 @@ struct HeartbeatPlugin;
 
 #[async_trait]
 impl Plugin for HeartbeatPlugin {
-    fn key(&self) -> PluginKey {
-        PluginKey::new("example.heartbeat")
-    }
-
     fn inject(&self) -> Vec<ServiceId> {
         vec![TIMER.id()]
     }
@@ -60,10 +56,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let host = CordisHost::new()?;
     let _console = host
         .root()
-        .plugin(Arc::new(ConsoleLoggerPlugin::default()))
+        .plugin(
+            &cordis_plugin_logger_console::PLUGIN_DEFINITION,
+            Arc::new(ConsoleLoggerPlugin::default()),
+        )
         .await?;
-    let _timer = host.root().plugin(Arc::new(TimerPlugin)).await?;
-    let _heartbeat = host.root().plugin(Arc::new(HeartbeatPlugin)).await?;
+    let _timer = host
+        .root()
+        .plugin(
+            &cordis_plugin_timer::PLUGIN_DEFINITION,
+            Arc::new(TimerPlugin),
+        )
+        .await?;
+    let _heartbeat = host
+        .root()
+        .plugin(
+            &cordis_core::PluginDefinition::named("example.heartbeat"),
+            Arc::new(HeartbeatPlugin),
+        )
+        .await?;
 
     tokio::time::sleep(Duration::from_millis(200)).await;
     host.shutdown().await?;

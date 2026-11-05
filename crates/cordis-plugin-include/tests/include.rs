@@ -1,7 +1,7 @@
 //! Include 插件集成测试。
 
 use async_trait::async_trait;
-use cordis_core::{Context, CoreError, FiberState, Plugin, PluginKey, Runtime, ServiceKey};
+use cordis_core::{Context, CoreError, FiberState, Plugin, Runtime, ServiceKey};
 use cordis_loader::{
     EntryOptions, EntryUpdate, ExtensionCatalog, ExtensionFactory, ExtensionsConfig, IsolateValue,
     IsolationDescriptor, LOADER, Loader, LoaderControlError, LoaderError, LoaderPlugin,
@@ -27,24 +27,19 @@ impl ExtensionFactory for ValueFactory {
         self.id
     }
     fn prepare(&self, _: Empty) -> Result<PreparedExtension, LoaderError> {
-        let id = self.id;
         let label = self.label;
         Ok(PreparedExtension::ordinary(move || {
-            Ok(Arc::new(ValuePlugin { id, label }))
+            Ok(Arc::new(ValuePlugin { label }))
         }))
     }
 }
 
 struct ValuePlugin {
-    id: &'static str,
     label: &'static str,
 }
 
 #[async_trait]
 impl Plugin for ValuePlugin {
-    fn key(&self) -> PluginKey {
-        PluginKey::new(self.id)
-    }
     async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
         if !self.label.is_empty() {
             ctx.provide(VALUE, self.label.into())?;
@@ -55,24 +50,35 @@ impl Plugin for ValuePlugin {
 
 fn catalog() -> ExtensionCatalog {
     let mut catalog = ExtensionCatalog::new();
-    catalog.register(IncludeFactory).unwrap();
     catalog
-        .register(ValueFactory {
-            id: "demo.value",
-            label: "from-include",
-        })
+        .register(&cordis_plugin_include::PLUGIN_DEFINITION, IncludeFactory)
         .unwrap();
     catalog
-        .register(ValueFactory {
-            id: "demo.root",
-            label: "from-root",
-        })
+        .register(
+            &cordis_core::PluginDefinition::anonymous(),
+            ValueFactory {
+                id: "demo.value",
+                label: "from-include",
+            },
+        )
         .unwrap();
     catalog
-        .register(ValueFactory {
-            id: "demo.noop",
-            label: "",
-        })
+        .register(
+            &cordis_core::PluginDefinition::anonymous(),
+            ValueFactory {
+                id: "demo.root",
+                label: "from-root",
+            },
+        )
+        .unwrap();
+    catalog
+        .register(
+            &cordis_core::PluginDefinition::anonymous(),
+            ValueFactory {
+                id: "demo.noop",
+                label: "",
+            },
+        )
         .unwrap();
     catalog
         .register_isolation(IsolationDescriptor::new("value", VALUE))
@@ -124,7 +130,14 @@ async fn root_include_id_is_application_owned_and_has_no_path_aliases() {
         );
         let runtime = Runtime::new().unwrap();
         let plugin = LoaderPlugin::new(catalog());
-        let _fiber = runtime.root().plugin(Arc::new(plugin)).await.unwrap();
+        let _fiber = runtime
+            .root()
+            .plugin(
+                &cordis_core::PluginDefinition::anonymous(),
+                Arc::new(plugin),
+            )
+            .await
+            .unwrap();
         let loader = runtime.root().get(LOADER).unwrap();
         loader
             .create(
@@ -371,9 +384,6 @@ async fn failed_child_keeps_include_control_plane_and_independent_sibling() {
     struct Broken;
     #[async_trait]
     impl Plugin for Broken {
-        fn key(&self) -> PluginKey {
-            PluginKey::new("demo.broken")
-        }
         async fn apply(&self, _: &Context) -> Result<(), CoreError> {
             Err(CoreError::PluginApply("child apply failed".into()))
         }
@@ -405,7 +415,9 @@ async fn failed_child_keeps_include_control_plane_and_independent_sibling() {
         &nested,
     );
     let mut catalog = catalog();
-    catalog.register(BrokenFactory).unwrap();
+    catalog
+        .register(&cordis_core::PluginDefinition::anonymous(), BrokenFactory)
+        .unwrap();
     let runtime = Runtime::new().unwrap();
     let mut fiber = mount_file(&runtime, catalog, &cordis).await;
     let loader = runtime.root().get(LOADER).unwrap();
@@ -441,7 +453,7 @@ async fn failed_child_keeps_include_control_plane_and_independent_sibling() {
         stable.fiber_id
     );
     fiber.dispose_wait().await.unwrap();
-    assert!(runtime.diagnostics().plugin_fibers.is_empty());
+    assert!(runtime.diagnostics().fibers.is_empty());
     assert!(loader.subtree("include:reports").is_err());
     runtime.shutdown().await.unwrap();
 }
@@ -515,7 +527,7 @@ async fn loader_full_path_crud_routes_to_source_tree() {
 }
 
 #[tokio::test]
-async fn cross_tree_move_is_rejected() {
+async fn subtree_move_rejects_another_trees_address() {
     let dir = tempfile::tempdir().unwrap();
     let include = ExtensionsConfig {
         version: 3,
@@ -535,14 +547,14 @@ async fn cross_tree_move_is_rejected() {
         .subtree("include")
         .unwrap()
         .update(
-            "app:local",
+            "local",
             EntryUpdate::default(),
             Some(Some("reports:child")),
             None,
         )
         .await
         .unwrap_err();
-    assert!(matches!(err, LoaderControlError::CrossTreeMove { .. }));
+    assert!(matches!(err, LoaderControlError::EntryNotFound { .. }));
     runtime.shutdown().await.unwrap();
 }
 
@@ -632,7 +644,7 @@ async fn include_cycle_fails_only_cyclic_entry_without_registering_another_tree(
     let mut fiber = fiber;
     fiber.dispose_wait().await.unwrap();
     assert!(runtime.root().get(LOADER).is_err());
-    assert!(runtime.diagnostics().plugin_fibers.is_empty());
+    assert!(runtime.diagnostics().fibers.is_empty());
     runtime.shutdown().await.unwrap();
 }
 
@@ -776,7 +788,10 @@ async fn mount_file(
     let entry = cordis_plugin_include::include_root_entry("include", cordis).unwrap();
     let fiber = runtime
         .root()
-        .plugin(Arc::new(LoaderPlugin::new(catalog)))
+        .plugin(
+            &cordis_loader::PLUGIN_DEFINITION,
+            Arc::new(LoaderPlugin::new(catalog)),
+        )
         .await
         .unwrap();
     runtime

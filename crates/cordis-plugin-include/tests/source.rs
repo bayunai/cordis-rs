@@ -102,10 +102,10 @@ async fn initial_does_not_overwrite_a_file_created_after_open() {
 }
 
 #[test]
-fn sequential_patches_resolve_full_local_paths_and_preserve_base() {
+fn sequential_patches_resolve_tree_local_ids_inside_groups_and_preserve_base() {
     let base = document(vec![
         EntryOptions::group("group", vec![entry("same", 1)]).unwrap(),
-        entry("same", 2),
+        entry("outside", 2),
     ]);
     let patches = vec![
         EntryPatch {
@@ -114,13 +114,13 @@ fn sequential_patches_resolve_full_local_paths_and_preserve_base() {
             ..Default::default()
         },
         EntryPatch {
-            id: Some("group:inserted".into()),
+            id: Some("inserted".into()),
             name: Some("test".into()),
             disabled: Some(true),
             ..Default::default()
         },
         EntryPatch {
-            id: Some("group:same".into()),
+            id: Some("same".into()),
             config: Some(toml::toml! {value=4}.into()),
             ..Default::default()
         },
@@ -133,6 +133,56 @@ fn sequential_patches_resolve_full_local_paths_and_preserve_base() {
     assert_eq!(
         base.extensions[0].children().unwrap()[0].config["value"].as_integer(),
         Some(1)
+    );
+}
+
+#[test]
+fn tree_local_ids_reject_duplicates_across_groups_and_old_group_addresses() {
+    let duplicate = document(vec![
+        EntryOptions::group("left", vec![entry("same", 1)]).unwrap(),
+        EntryOptions::group("right", vec![entry("same", 2)]).unwrap(),
+    ]);
+    assert!(apply_patches(&duplicate, &[]).is_err());
+    let base = document(vec![
+        EntryOptions::group(
+            "outer",
+            vec![EntryOptions::group("inner", vec![entry("leaf", 1)]).unwrap()],
+        )
+        .unwrap(),
+    ]);
+    for id in ["outer:inner:leaf", "inner:leaf"] {
+        assert!(
+            apply_patches(
+                &base,
+                &[EntryPatch {
+                    id: Some(id.into()),
+                    disabled: Some(true),
+                    ..Default::default()
+                }]
+            )
+            .is_err()
+        );
+    }
+    let next = apply_patches(
+        &base,
+        &[EntryPatch {
+            id: Some("leaf".into()),
+            disabled: Some(true),
+            ..Default::default()
+        }],
+    )
+    .unwrap();
+    assert!(
+        next.extensions[0].children().unwrap()[0]
+            .children()
+            .unwrap()[0]
+            .disabled
+    );
+    assert!(
+        !base.extensions[0].children().unwrap()[0]
+            .children()
+            .unwrap()[0]
+            .disabled
     );
 }
 

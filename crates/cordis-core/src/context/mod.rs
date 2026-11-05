@@ -1,13 +1,11 @@
 //! Context：从 Runtime 派生的层级运行时视图，不拥有底层资源。
 //!
-//! 公开概念：[`Context`]、[`EffectContext`]、[`InjectionHandle`] / [`InjectionState`]。
-//! 子模块：`effect` 提供可处置资源注册入口；`injection` 提供注入句柄与状态 DTO。
+//! Context 提供服务视图；普通插件与匿名注入均进入统一 Fiber 生命周期。
+//! `effect` 提供可处置资源注册入口。
 
 mod effect;
-mod injection;
 
 pub use effect::EffectContext;
-pub use injection::{InjectionHandle, InjectionState};
 
 use crate::{
     ConfigKey, CoreError, ProviderAvailability, ProviderHandle, ServiceId, ServiceKey, Services,
@@ -16,10 +14,12 @@ use crate::{
         EventKey, ListenMeta, ListenOptions, Next, ParallelKey, SerialKey, Unsubscribe,
         WaterfallKey,
     },
-    fiber::{Fiber, FiberInner, FiberState, FiberStateChange},
+    fiber::{
+        Fiber, FiberHandle, FiberInner, FiberState, FiberStateChange, HandleHandoff, InstanceBody,
+    },
     isolation::IsolationLabel,
     logger::{LOGGER_CONFIG, LogExporter, LogLevel, Logger, LoggerService},
-    plugin::{Plugin, PluginKey, read_metadata},
+    plugin::{Plugin, PluginDefinition, read_metadata},
     registry::{Registry, provider::ProviderCheck},
     service::ErasedService,
 };
@@ -43,7 +43,8 @@ pub(crate) struct ContextInner {
     /// Runtime 唯一 LoggerService（与 isolate / ServiceKey 无关）。
     pub(crate) logger: Arc<LoggerService>,
     pub(crate) log_fiber_id: Option<u64>,
-    pub(crate) log_plugin_key: Option<PluginKey>,
+    pub(crate) log_definition: Option<PluginDefinition>,
+    pub(crate) log_default_name: Option<Arc<str>>,
 }
 
 /// 通用的层级 Service Context。
@@ -76,7 +77,8 @@ impl Context {
                 scope: self.inner.scope.clone(),
                 logger: self.inner.logger.clone(),
                 log_fiber_id: self.inner.log_fiber_id,
-                log_plugin_key: self.inner.log_plugin_key,
+                log_definition: self.inner.log_definition.clone(),
+                log_default_name: self.inner.log_default_name.clone(),
             }),
         })
     }
@@ -97,7 +99,8 @@ impl Context {
                 scope: self.inner.scope.clone(),
                 logger: self.inner.logger.clone(),
                 log_fiber_id: self.inner.log_fiber_id,
-                log_plugin_key: self.inner.log_plugin_key,
+                log_definition: self.inner.log_definition.clone(),
+                log_default_name: self.inner.log_default_name.clone(),
             }),
         })
     }
@@ -118,7 +121,8 @@ impl Context {
                 scope: self.inner.scope.clone(),
                 logger: self.inner.logger.clone(),
                 log_fiber_id: self.inner.log_fiber_id,
-                log_plugin_key: self.inner.log_plugin_key,
+                log_definition: self.inner.log_definition.clone(),
+                log_default_name: self.inner.log_default_name.clone(),
             }),
         })
     }
@@ -245,12 +249,9 @@ impl Context {
             .map_err(|_| CoreError::ServiceTypeMismatch { service: key.id() })
     }
 
-    /// 在所有依赖均可见时运行回调，并在依赖变化时自动重建该回调的子 Effect。
-    pub fn inject<I, F, Fut>(
-        &self,
-        dependencies: I,
-        callback: F,
-    ) -> Result<InjectionHandle, CoreError>
+    /// 登记由父 Scope 拥有的匿名插件；返回非拥有型控制句柄。
+    /// 失败实例仅在显式 restart 后恢复，丢弃返回值不卸载实例。
+    pub fn inject<I, F, Fut>(&self, dependencies: I, callback: F) -> Result<FiberHandle, CoreError>
     where
         I: IntoIterator<Item = ServiceId>,
         F: Fn(Services, EffectContext) -> Fut + Send + Sync + 'static,
@@ -258,46 +259,53 @@ impl Context {
     {
         self.ensure_alive()?;
         let dependencies = dependencies.into_iter().collect::<Vec<_>>();
-        let parent = self.inner.scope.clone();
-        let template = self.clone();
-        let callback = Arc::new(move |services: Services, child: EffectScope| {
-            let registry = template.registry().expect("live injection context");
-            if let Err(error) = registry.register_effect(
-                child.id(),
-                child.name().to_string(),
-                child.parent_id(),
-                Some(template.clone()),
-                None,
-                &child,
-            ) {
-                return Box::pin(async move { Err(error) })
-                    as std::pin::Pin<Box<dyn Future<Output = Result<(), CoreError>> + Send>>;
-            }
-            let context = EffectContext {
-                context: Context {
-                    inner: Arc::new(ContextInner {
-                        parent: template.inner.parent.clone(),
-                        identity: template.inner.identity.clone(),
-                        isolations: template.inner.isolations.clone(),
-                        configs: template.inner.configs.clone(),
-                        registry: template.inner.registry.clone(),
-                        scope: child,
-                        logger: template.inner.logger.clone(),
-                        log_fiber_id: template.inner.log_fiber_id,
-                        log_plugin_key: template.inner.log_plugin_key,
-                    }),
-                },
-            };
-            Box::pin(callback(services, context))
-                as std::pin::Pin<Box<dyn Future<Output = Result<(), CoreError>> + Send>>
-        });
-        let id =
-            self.registry()?
-                .register_injection(self.clone(), parent, dependencies, callback)?;
-        Ok(InjectionHandle {
+        if dependencies.is_empty() {
+            return Err(CoreError::EmptyInjection);
+        }
+        let body = InstanceBody::Callback(Arc::new(move |services, effect| {
+            Box::pin(callback(services, effect))
+        }));
+        let inner = self.register_fiber(
+            &PluginDefinition::anonymous(),
+            body,
+            dependencies,
+            HandleHandoff::HandleClaimed,
+        )?;
+        self.registry()?.mark_dirty_public();
+        Ok(FiberHandle { inner })
+    }
+
+    fn register_fiber(
+        &self,
+        definition: &PluginDefinition,
+        body: InstanceBody,
+        dependencies: Vec<ServiceId>,
+        handoff: HandleHandoff,
+    ) -> Result<Arc<FiberInner>, CoreError> {
+        self.ensure_alive()?;
+        let registry = self.registry()?;
+        let id = registry.allocate_id();
+        let inner = Arc::new(FiberInner {
             id,
+            definition: definition.clone(),
+            parent_fiber_id: self.inner.log_fiber_id,
+            context: self.clone(),
             registry: self.inner.registry.clone(),
-        })
+            parent_scope: self.inner.scope.clone(),
+            body: Mutex::new(body),
+            dependencies: Mutex::new(dependencies),
+            ownership: Mutex::new(crate::fiber::EffectOwnership::Empty),
+            dispose_result: Mutex::new(None),
+            state: Mutex::new(FiberState::Pending),
+            last_error: Mutex::new(None),
+            resolved_providers: Mutex::new(Vec::new()),
+            disposed: std::sync::atomic::AtomicBool::new(false),
+            busy: Mutex::new(false),
+            lifecycle: Mutex::new(None),
+            handoff: Mutex::new(handoff),
+        });
+        registry.register_fiber(inner.clone())?;
+        Ok(inner)
     }
 
     /// 创建归属当前 Effect/Fiber Scope 的普通 Effect（默认名 `"effect"`）。
@@ -328,7 +336,8 @@ impl Context {
                     scope,
                     logger: self.inner.logger.clone(),
                     log_fiber_id: self.inner.log_fiber_id,
-                    log_plugin_key: self.inner.log_plugin_key,
+                    log_definition: self.inner.log_definition.clone(),
+                    log_default_name: self.inner.log_default_name.clone(),
                 }),
             },
         })
@@ -337,42 +346,18 @@ impl Context {
     /// 挂载插件：返回可重启 / 可替换的 [`Fiber`]。
     ///
     /// 调用方在首次激活完成前取消 wait：协调器撤销临时 Scope 并注销 Fiber，不返回可用句柄。
-    pub async fn plugin(&self, plugin: Arc<dyn Plugin>) -> Result<Fiber, CoreError> {
-        self.ensure_alive()?;
+    pub async fn plugin(
+        &self,
+        definition: &PluginDefinition,
+        plugin: Arc<dyn Plugin>,
+    ) -> Result<Fiber, CoreError> {
         let metadata = read_metadata(plugin.as_ref())?;
-        let plugin_key = metadata.key;
-        let registry = self.registry()?;
-        let id = registry.allocate_id();
-        let dependencies = metadata.dependencies;
-        let inner = Arc::new(FiberInner {
-            id,
-            plugin_key,
-            context: self.clone(),
-            registry: self.inner.registry.clone(),
-            parent_scope: self.inner.scope.clone(),
-            plugin: Mutex::new(plugin),
-            dependencies: Mutex::new(dependencies),
-            ownership: Mutex::new(crate::fiber::EffectOwnership::Empty),
-            dispose_result: Mutex::new(None),
-            state: Mutex::new(FiberState::Pending),
-            last_error: Mutex::new(None),
-            resolved_providers: Mutex::new(Vec::new()),
-            disposed: std::sync::atomic::AtomicBool::new(false),
-            busy: Mutex::new(false),
-            lifecycle: Mutex::new(None),
-            handoff: Mutex::new(crate::fiber::HandleHandoff::Preparing),
-        });
-        // 先挂父释放钩子，再以 Preparing 状态登记到分组。登记会先拒绝同 Key
-        // 的 unmounting；只有成功后才能启动用户 apply。scheduler 会跳过
-        // Preparing Fiber，因此首次协调器仍是唯一的 Pending→Loading 所有者。
-        let weak = Arc::downgrade(&inner);
-        self.inner.scope.on_dispose(move || {
-            if let Some(fiber) = weak.upgrade() {
-                fiber.dispose_now();
-            }
-        });
-        registry.register_plugin_fiber(inner.clone())?;
-        inner.publish_initial_state();
+        let inner = self.register_fiber(
+            definition,
+            InstanceBody::Plugin(plugin),
+            metadata.dependencies,
+            HandleHandoff::Preparing,
+        )?;
         let completion = match inner.start_lifecycle(crate::fiber::LifecycleOp::Activate {
             initial_mount: true,
         }) {
@@ -393,9 +378,15 @@ impl Context {
         if !claimed || disposed {
             return Err(CoreError::FiberDisposed);
         }
-        match result {
-            Ok(()) | Err(CoreError::PluginApply(_)) => {}
-            Err(error) => return Err(error),
+        if let Err(error) = result
+            && inner
+                .state
+                .lock()
+                .expect("fiber state")
+                .ne(&FiberState::Failed)
+        {
+            let _ = inner.dispose_wait_inner().await;
+            return Err(error);
         }
         Ok(Fiber { inner })
     }
@@ -768,7 +759,7 @@ impl Context {
         &self,
         scope: EffectScope,
         fiber_id: u64,
-        plugin_key: PluginKey,
+        definition: PluginDefinition,
     ) -> Context {
         Context {
             inner: Arc::new(ContextInner {
@@ -780,12 +771,15 @@ impl Context {
                 scope,
                 logger: self.inner.logger.clone(),
                 log_fiber_id: Some(fiber_id),
-                log_plugin_key: Some(plugin_key),
+                log_default_name: definition
+                    .shared_name()
+                    .or_else(|| self.inner.log_default_name.clone()),
+                log_definition: Some(definition),
             }),
         }
     }
 
-    /// 当前 Context 的默认 Logger（目标名：`LOGGER_CONFIG.name` → PluginKey → `root`）。
+    /// 当前 Context 的默认 Logger（目标名：`LOGGER_CONFIG.name` → 最近命名插件 → `root`）。
     ///
     /// 仅 [`CoreError::ConfigUnavailable`] 表示无 `LOGGER_CONFIG` 覆盖（使用默认名/等级）；
     /// `ContextDisposed`、配置类型冲突等其他错误原样返回。
@@ -796,7 +790,11 @@ impl Context {
             name,
             default_level,
             self.inner.log_fiber_id,
-            self.inner.log_plugin_key,
+            self.inner.log_definition.as_ref().map(PluginDefinition::id),
+            self.inner
+                .log_definition
+                .as_ref()
+                .and_then(PluginDefinition::shared_name),
         ))
     }
 
@@ -808,7 +806,11 @@ impl Context {
             name.into(),
             default_level,
             self.inner.log_fiber_id,
-            self.inner.log_plugin_key,
+            self.inner.log_definition.as_ref().map(PluginDefinition::id),
+            self.inner
+                .log_definition
+                .as_ref()
+                .and_then(PluginDefinition::shared_name),
         ))
     }
 
@@ -834,8 +836,9 @@ impl Context {
             .and_then(|cfg| cfg.name.clone())
             .or_else(|| {
                 self.inner
-                    .log_plugin_key
-                    .map(|key| key.as_str().to_string())
+                    .log_default_name
+                    .as_ref()
+                    .map(|name| name.to_string())
             })
             .unwrap_or_else(|| "root".into());
         let default_level = config

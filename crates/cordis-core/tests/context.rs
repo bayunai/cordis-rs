@@ -254,17 +254,20 @@ async fn intercept_type_conflict_and_plugin_can_read_config() {
     ));
 
     struct ConfigReader;
+    static CONFIGREADER_DEFINITION: std::sync::LazyLock<cordis_core::PluginDefinition> =
+        std::sync::LazyLock::new(|| cordis_core::PluginDefinition::named("test.configreader"));
+
     #[async_trait]
     impl Plugin for ConfigReader {
-        fn key(&self) -> cordis_core::PluginKey {
-            cordis_core::PluginKey::new("test.configreader")
-        }
         async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
             assert!(ctx.config(FLAG)?.0);
             Ok(())
         }
     }
-    let mut fiber = scoped.plugin(Arc::new(ConfigReader)).await.unwrap();
+    let mut fiber = scoped
+        .plugin(&CONFIGREADER_DEFINITION, Arc::new(ConfigReader))
+        .await
+        .unwrap();
     assert_eq!(fiber.state(), FiberState::Active);
     fiber.dispose();
 }
@@ -289,6 +292,12 @@ async fn discarded_root_views_do_not_create_runtime_resources() {
     let after = runtime.diagnostics();
     assert_eq!(after.providers.len(), before.providers.len());
     assert_eq!(after.effects.len(), before.effects.len());
-    assert_eq!(after.plugin_fibers.len(), before.plugin_fibers.len());
-    assert_eq!(after.inject_fibers.len(), before.inject_fibers.len());
+    assert_eq!(
+        after.fibers.iter().filter(|f| f.name.is_some()).count(),
+        before.fibers.iter().filter(|f| f.name.is_some()).count()
+    );
+    assert_eq!(
+        after.fibers.iter().filter(|f| f.name.is_none()).count(),
+        before.fibers.iter().filter(|f| f.name.is_none()).count()
+    );
 }

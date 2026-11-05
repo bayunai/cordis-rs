@@ -53,16 +53,12 @@ fn unavailable_reason(state: &RegistryState, provider: &ProviderRecord) -> Optio
         .effect_id
         .and_then(|effect_id| state.effects.get(&effect_id))?;
     let fiber_id = effect.fiber_id?;
-    let active = state
-        .plugin_fibers
-        .get(&fiber_id)
-        .and_then(std::sync::Weak::upgrade)
-        .is_some_and(|fiber| {
-            matches!(
-                *fiber.state.lock().expect("fiber state"),
-                FiberState::Active
-            )
-        });
+    let active = state.fibers.get(&fiber_id).is_some_and(|fiber| {
+        matches!(
+            *fiber.state.lock().expect("fiber state"),
+            FiberState::Active
+        )
+    });
     (!active).then(|| Arc::from("provider plugin fiber is not active"))
 }
 

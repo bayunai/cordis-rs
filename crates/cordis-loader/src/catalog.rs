@@ -5,7 +5,9 @@ use crate::{
     config::{IsolateConfig, IsolateValue},
     error::{ConfigProjectionError, LoaderError, format_panic_message},
 };
-use cordis_core::{ConfigKey, Context, CoreError, IsolationLabel, ServiceId, ServiceKey};
+use cordis_core::{
+    ConfigKey, Context, CoreError, IsolationLabel, PluginDefinition, ServiceId, ServiceKey,
+};
 use schemars::JsonSchema;
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value as JsonValue;
@@ -103,6 +105,7 @@ pub struct FactoryDescriptor {
 }
 #[derive(Clone)]
 struct FactoryRecord {
+    definition: PluginDefinition,
     factory: Arc<dyn ErasedExtensionFactory>,
     descriptor: FactoryDescriptor,
 }
@@ -217,7 +220,13 @@ impl ExtensionCatalog {
     pub fn new() -> Self {
         Self::default()
     }
-    pub fn register<F: ExtensionFactory>(&mut self, factory: F) -> Result<(), LoaderError> {
+    /// 将配置名称绑定到显式插件定义；多个工厂可以共享同一定义。
+    /// 定义的显示名称不参与寻址或身份比较，克隆 Catalog 保留已登记的身份。
+    pub fn register<F: ExtensionFactory>(
+        &mut self,
+        definition: &PluginDefinition,
+        factory: F,
+    ) -> Result<(), LoaderError> {
         let id = catch_unwind(AssertUnwindSafe(|| factory.id())).map_err(|payload| {
             LoaderError::FactoryPanic {
                 message: format_panic_message("extension factory id", payload),
@@ -236,6 +245,7 @@ impl ExtensionCatalog {
         self.factories.insert(
             id,
             FactoryRecord {
+                definition: definition.clone(),
                 factory,
                 descriptor,
             },
@@ -276,6 +286,10 @@ impl ExtensionCatalog {
         }
         self.isolations.insert(descriptor.id, descriptor);
         Ok(())
+    }
+    /// 工厂的插件定义；工厂名称只用于配置寻址。
+    pub fn definition(&self, id: &str) -> Option<&PluginDefinition> {
+        self.factories.get(id).map(|record| &record.definition)
     }
     pub(crate) fn get(&self, id: &str) -> Option<&Arc<dyn ErasedExtensionFactory>> {
         self.factories.get(id).map(|record| &record.factory)

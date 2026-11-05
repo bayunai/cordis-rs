@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use cordis_core::{Context, CoreError, Fiber, Plugin, PluginKey, Runtime, ServiceKey};
+use cordis_core::{Context, CoreError, Fiber, Plugin, Runtime, ServiceKey};
 use cordis_loader::{
     ConfigRef, EntryOptions, ExtensionCatalog, ExtensionFactory, LOADER, LoaderError, LoaderPlugin,
     PreparedExtension,
@@ -81,9 +81,6 @@ impl ExtensionFactory for Factory {
 }
 #[async_trait]
 impl Plugin for Instance {
-    fn key(&self) -> PluginKey {
-        PluginKey::new("projection")
-    }
     async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
         if self.address == "fail" {
             return Err(CoreError::PluginApply("controlled failure".into()));
@@ -98,13 +95,20 @@ struct Harness {
 }
 async fn mount(config: ConfigEditorConfig, root: &std::path::Path) -> Harness {
     let mut catalog = ExtensionCatalog::new();
-    catalog.register(Factory).unwrap();
-    catalog.register(IncludeFactory).unwrap();
+    catalog
+        .register(&cordis_core::PluginDefinition::named("projection"), Factory)
+        .unwrap();
+    catalog
+        .register(&cordis_plugin_include::PLUGIN_DEFINITION, IncludeFactory)
+        .unwrap();
     let runtime = Runtime::new().unwrap();
     let mut fibers = vec![
         runtime
             .root()
-            .plugin(Arc::new(LoaderPlugin::new(catalog)))
+            .plugin(
+                &cordis_loader::PLUGIN_DEFINITION,
+                Arc::new(LoaderPlugin::new(catalog)),
+            )
             .await
             .unwrap(),
     ];
@@ -122,14 +126,20 @@ async fn mount(config: ConfigEditorConfig, root: &std::path::Path) -> Harness {
     fibers.push(
         runtime
             .root()
-            .plugin(Arc::new(ConfigEditorPlugin::new(config)))
+            .plugin(
+                &cordis_plugin_config_editor::PLUGIN_DEFINITION,
+                Arc::new(ConfigEditorPlugin::new(config)),
+            )
             .await
             .unwrap(),
     );
     fibers.push(
         runtime
             .root()
-            .plugin(Arc::new(SettingsPlugin))
+            .plugin(
+                &cordis_plugin_settings::PLUGIN_DEFINITION,
+                Arc::new(SettingsPlugin),
+            )
             .await
             .unwrap(),
     );

@@ -3,7 +3,7 @@
 //! 全局 Logger **不过滤**等级：每条记录都进入缓冲区并分发给全部 exporter；
 //! 等级阈值由各 exporter 自行解释（可参考 [`LogRecord::default_level`]）。
 
-use crate::{ConfigKey, PluginKey};
+use crate::{ConfigKey, PluginDefinitionId};
 use std::{
     collections::{HashMap, VecDeque},
     fmt::Display,
@@ -46,7 +46,8 @@ pub struct LogRecord {
     pub target: String,
     pub message: String,
     pub fiber_id: Option<u64>,
-    pub plugin_key: Option<PluginKey>,
+    pub definition_id: Option<PluginDefinitionId>,
+    pub plugin_name: Option<Arc<str>>,
     /// 调用 Context 的默认阈值（来自 `LOGGER_CONFIG.level`，缺省 `Info`）。
     /// 供 exporter 在无专用配置时回退，**不**决定是否写入全局缓冲。
     pub default_level: LogLevel,
@@ -83,13 +84,16 @@ impl LoggerService {
         })
     }
 
+    // Source metadata stays explicit at the structured log boundary.
+    #[allow(clippy::too_many_arguments)]
     pub fn emit(
         &self,
         level: LogLevel,
         target: impl Into<String>,
         message: impl Display,
         fiber_id: Option<u64>,
-        plugin_key: Option<PluginKey>,
+        definition_id: Option<PluginDefinitionId>,
+        plugin_name: Option<Arc<str>>,
         default_level: LogLevel,
     ) {
         let record = LogRecord {
@@ -99,7 +103,8 @@ impl LoggerService {
             target: target.into(),
             message: message.to_string(),
             fiber_id,
-            plugin_key,
+            definition_id,
+            plugin_name,
             default_level,
         };
         let exporters = {
@@ -157,7 +162,8 @@ pub struct Logger {
     target: String,
     default_level: LogLevel,
     fiber_id: Option<u64>,
-    plugin_key: Option<PluginKey>,
+    definition_id: Option<PluginDefinitionId>,
+    plugin_name: Option<Arc<str>>,
 }
 
 impl Logger {
@@ -166,14 +172,16 @@ impl Logger {
         target: String,
         default_level: LogLevel,
         fiber_id: Option<u64>,
-        plugin_key: Option<PluginKey>,
+        definition_id: Option<PluginDefinitionId>,
+        plugin_name: Option<Arc<str>>,
     ) -> Self {
         Self {
             service,
             target,
             default_level,
             fiber_id,
-            plugin_key,
+            definition_id,
+            plugin_name,
         }
     }
 
@@ -196,7 +204,8 @@ impl Logger {
             self.target.clone(),
             message,
             self.fiber_id,
-            self.plugin_key,
+            self.definition_id,
+            self.plugin_name.clone(),
             self.default_level,
         );
     }

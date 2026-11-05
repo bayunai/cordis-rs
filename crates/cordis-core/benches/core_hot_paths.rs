@@ -1,12 +1,12 @@
 use async_trait::async_trait;
 use cordis_core::{
-    Context, CoreError, EventKey, Plugin, PluginKey, ProviderAvailability, Runtime, SerialKey,
-    ServiceKey,
+    Context, CoreError, EventKey, Plugin, PluginDefinition, ProviderAvailability, Runtime,
+    SerialKey, ServiceKey,
 };
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 use std::{
     sync::{
-        Arc,
+        Arc, LazyLock,
         atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
@@ -15,17 +15,14 @@ use std::{
 const COUNTER: ServiceKey<u64> = ServiceKey::new("bench.counter");
 const OBSERVE: EventKey<u64> = EventKey::new("bench.observe");
 const DECIDE: SerialKey<u64, u64> = SerialKey::new("bench.decide");
-const BATCH_PLUGIN: PluginKey = PluginKey::new("bench.lifecycle.noop@1");
+static BATCH_DEFINITION: LazyLock<PluginDefinition> =
+    LazyLock::new(|| PluginDefinition::named("bench.lifecycle.noop@1"));
 const CONSUMER_DEPENDENCY: ServiceKey<u64> = ServiceKey::new("bench.lifecycle.dependency");
 
 struct NoopPlugin;
 
 #[async_trait]
 impl Plugin for NoopPlugin {
-    fn key(&self) -> PluginKey {
-        BATCH_PLUGIN
-    }
-
     async fn apply(&self, _ctx: &Context) -> Result<(), CoreError> {
         Ok(())
     }
@@ -146,14 +143,16 @@ fn bench_lifecycle(criterion: &mut Criterion) {
                                 let started = Instant::now();
                                 for _ in 0..count {
                                     fibers.push(
-                                        root.plugin(plugin.clone()).await.expect("mount plugin"),
+                                        root.plugin(&BATCH_DEFINITION, plugin.clone())
+                                            .await
+                                            .expect("mount plugin"),
                                     );
                                 }
                                 elapsed += started.elapsed();
                                 black_box(&fibers);
 
                                 runtime
-                                    .unmount(BATCH_PLUGIN)
+                                    .unmount(BATCH_DEFINITION.id())
                                     .await
                                     .expect("unmount plugins");
                                 runtime.shutdown().await.expect("shutdown runtime");
@@ -164,7 +163,7 @@ fn bench_lifecycle(criterion: &mut Criterion) {
             );
 
             group.bench_with_input(
-                BenchmarkId::new("unmount_plugins_with_same_key", count),
+                BenchmarkId::new("unmount_plugins_with_same_definition", count),
                 &count,
                 |bencher, &count| {
                     bencher
@@ -178,13 +177,15 @@ fn bench_lifecycle(criterion: &mut Criterion) {
                                 let mut fibers = Vec::with_capacity(count);
                                 for _ in 0..count {
                                     fibers.push(
-                                        root.plugin(plugin.clone()).await.expect("mount plugin"),
+                                        root.plugin(&BATCH_DEFINITION, plugin.clone())
+                                            .await
+                                            .expect("mount plugin"),
                                     );
                                 }
 
                                 let started = Instant::now();
                                 let removed = runtime
-                                    .unmount(BATCH_PLUGIN)
+                                    .unmount(BATCH_DEFINITION.id())
                                     .await
                                     .expect("unmount plugins");
                                 elapsed += started.elapsed();

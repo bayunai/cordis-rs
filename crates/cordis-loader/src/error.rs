@@ -1,6 +1,6 @@
 //! [`LoaderError`]：配置、工厂目录与编排失败契约。
 
-use cordis_core::{CoreError, PluginKey};
+use cordis_core::CoreError;
 use std::any::Any;
 
 /// 类型投影的输入不完整与执行故障必须分开处理。
@@ -83,12 +83,6 @@ pub enum LoaderError {
     },
     #[error("实例 {instance} 不存在")]
     UnknownInstance { instance: String },
-    #[error("实例 {instance} 的 PluginKey 不允许更换：期望 {expected}，实际 {actual}")]
-    PluginKeyChanged {
-        instance: String,
-        expected: PluginKey,
-        actual: PluginKey,
-    },
     #[error("插件配置无效: {message}")]
     InvalidConfig { message: String },
     #[error("实例 {instance}（工厂 {factory}）构造失败: {message}")]
@@ -99,8 +93,6 @@ pub enum LoaderError {
     },
     #[error("工厂边界 panic: {message}")]
     FactoryPanic { message: String },
-    #[error("插件元数据 panic: {message}")]
-    PluginPanic { message: String },
     #[error("实例 {instance} 生命周期失败: {source}")]
     Lifecycle {
         instance: String,

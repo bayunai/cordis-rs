@@ -1,6 +1,6 @@
 //! 统一 Factory：延迟构造、能力/类型切换与预检错误。
 use async_trait::async_trait;
-use cordis_core::{Context, CoreError, Fiber, FiberState, Plugin, PluginKey, Runtime, ServiceKey};
+use cordis_core::{Context, CoreError, Fiber, FiberState, Plugin, Runtime, ServiceKey};
 use cordis_loader::{
     ConfigRef, EntryOptions, EntryUpdate, ExtensionCatalog, ExtensionFactory, ExtensionsConfig,
     LOADER, Loader, LoaderControlError, LoaderError, LoaderPlugin, PreparedExtension,
@@ -21,7 +21,6 @@ enum Mode {
     Hot,
     OtherStatic,
     OtherLive,
-    BadKey,
     PreparePanic,
     BuildPanic,
     BuildError,
@@ -76,17 +75,9 @@ struct Factory(Arc<Counts>);
 struct Instance {
     view: View,
     counts: Arc<Counts>,
-    alt_key: bool,
 }
 #[async_trait]
 impl Plugin for Instance {
-    fn key(&self) -> PluginKey {
-        PluginKey::new(if self.alt_key {
-            "test.prepared.alt"
-        } else {
-            "test.prepared"
-        })
-    }
     async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
         self.counts.applies.fetch_add(1, Ordering::SeqCst);
         ctx.provide(VIEW, self.view.clone())
@@ -114,11 +105,7 @@ impl ExtensionFactory for Factory {
             if matches!(config.mode, Mode::BuildError) {
                 return Err(LoaderError::invalid_config("construct error"));
             }
-            Ok(Arc::new(Instance {
-                view,
-                counts,
-                alt_key: matches!(config.mode, Mode::BadKey),
-            }))
+            Ok(Arc::new(Instance { view, counts }))
         };
         Ok(match config.mode {
             Mode::Hot => PreparedExtension::volatile(
@@ -172,9 +159,17 @@ impl Harness {
         .unwrap();
         let counts = Arc::new(Counts::default());
         let mut catalog = ExtensionCatalog::new();
-        catalog.register(Factory(counts.clone())).unwrap();
         catalog
-            .register(cordis_plugin_include::IncludeFactory)
+            .register(
+                &cordis_core::PluginDefinition::anonymous(),
+                Factory(counts.clone()),
+            )
+            .unwrap();
+        catalog
+            .register(
+                &cordis_plugin_include::PLUGIN_DEFINITION,
+                cordis_plugin_include::IncludeFactory,
+            )
             .unwrap();
         let runtime = Runtime::new().unwrap();
         let fiber = mount_file(&runtime, catalog, directory.path().join("cordis.toml")).await;
@@ -235,10 +230,22 @@ async fn create_factory_precheck_failure_keeps_loader_active_without_applying_en
     ] {
         let counts = Arc::new(Counts::default());
         let mut catalog = ExtensionCatalog::new();
-        catalog.register(Factory(counts.clone())).unwrap();
+        catalog
+            .register(
+                &cordis_core::PluginDefinition::anonymous(),
+                Factory(counts.clone()),
+            )
+            .unwrap();
         let runtime = Runtime::new().unwrap();
         let plugin = LoaderPlugin::new(catalog);
-        let fiber = runtime.root().plugin(Arc::new(plugin)).await.unwrap();
+        let fiber = runtime
+            .root()
+            .plugin(
+                &cordis_core::PluginDefinition::anonymous(),
+                Arc::new(plugin),
+            )
+            .await
+            .unwrap();
         let loader = runtime.root().get(LOADER).unwrap();
         assert!(
             loader
@@ -324,7 +331,7 @@ async fn capability_and_binding_types_replace_but_hot_values_do_not_construct() 
 }
 
 #[tokio::test]
-async fn prepare_construct_and_key_failures_are_zero_runtime_change() {
+async fn prepare_and_construct_failures_are_zero_runtime_change() {
     let h = Harness::new(Mode::Hot, false).await;
     let before = h.view();
     let file = h.directory.path().join("cordis.toml");
@@ -334,20 +341,12 @@ async fn prepare_construct_and_key_failures_are_zero_runtime_change() {
         Mode::BuildPanic,
         Mode::BuildError,
         Mode::Invalid,
-        Mode::BadKey,
     ] {
         let result = h.update(mode, 2).await;
         if matches!(mode, Mode::PreparePanic | Mode::BuildPanic) {
             assert!(matches!(
                 result,
                 Err(LoaderControlError::Loader(LoaderError::FactoryPanic { .. }))
-            ));
-        } else if matches!(mode, Mode::BadKey) {
-            assert!(matches!(
-                result,
-                Err(LoaderControlError::Loader(
-                    LoaderError::PluginKeyChanged { .. }
-                ))
             ));
         } else {
             assert!(result.is_err());
@@ -420,7 +419,10 @@ async fn mount_file(
     let entry = cordis_plugin_include::include_root_entry("include", cordis).unwrap();
     let fiber = runtime
         .root()
-        .plugin(Arc::new(LoaderPlugin::new(catalog)))
+        .plugin(
+            &cordis_loader::PLUGIN_DEFINITION,
+            Arc::new(LoaderPlugin::new(catalog)),
+        )
         .await
         .unwrap();
     runtime

@@ -40,7 +40,12 @@ impl ExtensionFactory for Factory {
 fn serialization_failures_are_redacted_and_precede_prepare_or_build() {
     let calls = Arc::new(AtomicUsize::new(0));
     let mut catalog = ExtensionCatalog::new();
-    catalog.register(Factory(calls.clone())).unwrap();
+    catalog
+        .register(
+            &cordis_core::PluginDefinition::anonymous(),
+            Factory(calls.clone()),
+        )
+        .unwrap();
     for mode in [1, 2] {
         let error = catalog
             .prepare("projection.error", &toml::toml! { mode = mode }.into())
@@ -59,7 +64,12 @@ fn serialization_failures_are_redacted_and_precede_prepare_or_build() {
 fn projection_distinguishes_invalid_input_from_execution_failure() {
     let calls = Arc::new(AtomicUsize::new(0));
     let mut catalog = ExtensionCatalog::new();
-    catalog.register(Factory(calls.clone())).unwrap();
+    catalog
+        .register(
+            &cordis_core::PluginDefinition::anonymous(),
+            Factory(calls.clone()),
+        )
+        .unwrap();
     assert!(matches!(
         catalog.project("projection.error", &toml::Value::Table(Default::default())),
         Err(ConfigProjectionError::InputInvalid)
@@ -114,7 +124,12 @@ impl ExtensionFactory for DeserializeFactory {
 #[test]
 fn deserialize_error_and_panic_have_distinct_redacted_categories() {
     let mut catalog = ExtensionCatalog::new();
-    catalog.register(DeserializeFactory).unwrap();
+    catalog
+        .register(
+            &cordis_core::PluginDefinition::anonymous(),
+            DeserializeFactory,
+        )
+        .unwrap();
     for should_panic in [false, true] {
         let error = catalog
             .project(
@@ -140,7 +155,10 @@ async fn closed_loader_is_not_an_invalid_projection_input() {
     let runtime = cordis_core::Runtime::new().unwrap();
     let _fiber = runtime
         .root()
-        .plugin(Arc::new(LoaderPlugin::new(ExtensionCatalog::new())))
+        .plugin(
+            &cordis_loader::PLUGIN_DEFINITION,
+            Arc::new(LoaderPlugin::new(ExtensionCatalog::new())),
+        )
         .await
         .unwrap();
     let loader = (*runtime.root().get(LOADER).unwrap()).clone();

@@ -28,7 +28,7 @@
 
 ```text
 应用入口构造 LoaderPlugin::new(catalog)
-  → root.plugin(LoaderPlugin)
+  → root.plugin(&cordis_loader::PLUGIN_DEFINITION, LoaderPlugin)
   → 分层应用 await prepare_root_include(cordis.toml, &config)，或直接 include_root_entry(id, path)
   → await loader.create(entry, None, None)
   → include Include 读取文件、提供来源上下文与文件版本
@@ -38,7 +38,8 @@
 
 - 根 Include 的 `path` 须为绝对路径（`include_root_entry` 负责解析）；嵌套 Include 相对于所属文件目录。
   文件重载使用 `loader.subtree("include")?.reload()`，没有自动监听。
-- Loader 的内存根 CRUD 不写任何文件；Include 来源树的 CRUD 与配置编辑只写所属文件。
+- Loader 地址由所属来源树前缀与树内 ID 构成；Group 不增加前缀，同树所有 Group 的成员 ID 也必须唯一。Include 边界增加前缀，同树换 Group 保持地址。
+- Loader 的内存根 CRUD 不写任何文件；普通 Include 来源树 CRUD 与配置编辑写所属文件。跨来源移动先全量预检，运行时提交后先写目标、成功后写源；目标失败不写源，错误报告两侧状态，不回滚已发生的运行时或文件变更。
   `EntryLocation` 只描述条目位置；文件目录与继承日志策略由 Include 的 `INCLUDE_LOCATION` 提供。
 - 扩展包目录、信任公钥、基础日志、SQLite/PostgreSQL 配置存储和文件热更新仍是未来
   宿主或扩展能力，不进入 `cordis-core`。首版 Host 遇到这些字段会因
@@ -69,31 +70,33 @@
 3. 派生 Context 覆盖父 Provider（未隔离 Key）；retiring Provider 保留槽位并遮蔽父级，完成撤销后才恢复父级解析。
 4. 同槽冲突返回 `ServiceConflict`；Runtime 内 ID↔TypeId 永久锁定。
 
-## Fiber（Plugin 生命周期）
+## Definition 与 Fiber 生命周期
+
+`PluginDefinition` 是显式身份句柄，与 `Plugin` 对象分离。`named(name)` 创建带名称的定义，`anonymous()` 创建匿名定义；`id()` 返回 `PluginDefinitionId`，`name()` 只提供可选展示元数据。Clone 共享身份，独立创建的同名定义具有不同身份；同一 Definition 可跨 Runtime 使用，实例状态仍由各 Runtime 独立维护。
 
 ```text
-Context::plugin(Arc<dyn Plugin>)
+Context::plugin(&definition, Arc<dyn Plugin>)
         │
         ├─ 登记 Fiber（Plugin::inject 声明依赖）
         ├─ 依赖未齐 → Pending；齐则 Loading → apply → Active / Failed
-        └─ 返回 Fiber（首次激活由内部协调器完成）
-                ├─ dispose / dispose_wait / Drop
-                ├─ restart()：同 Plugin 强制重跑
-                └─ replace(plugin)：同 PluginKey；dispose_wait 旧任务后再挂
-                跨 Key：Runtime::unmount(key) 后再 plugin(new)
+        └─ 返回拥有型 Fiber
+                ├─ dispose / dispose_wait / Drop：卸载
+                ├─ restart()：保留执行逻辑，显式重新激活
+                ├─ replace(plugin)：保留 Definition 身份，替换执行对象
+                └─ handle()：取得可克隆的非拥有型 FiberHandle
+Context::inject(deps, callback)
+        └─ 返回 FiberHandle；Drop 不卸载，生命周期归属创建它的 Scope
+Runtime::unmount(definition.id())
+        └─ 卸载当前 Runtime 中该定义的全部实例
 ```
 
-`Loading` / `Unloading` 始终由 **Fiber 内部生命周期协调器** 收敛：调用方 Future 取消只取消 wait，不 abort 协调器。因此不会因取消而残留 Busy、Loading 或 Unloading。
+`Plugin` 只定义 `inject()` 与 `apply()`，不自行产生或校验身份。`FiberHandle` 可查询状态、快照和依赖，并调用 `restart()`、`dispose()`、`dispose_wait()`；只有拥有型插件 `Fiber` 提供 `replace(plugin)`。
 
-- **首次 `plugin()`**：调用方在返回 Handle 前取消 wait → 协调器撤销临时 Scope、注销 Fiber，视为从未成功挂载。
-- **`restart()` / `replace()`**：一旦开始（`replace` 在候选 `key()`/`inject()` 预检成功后即提交），调用方取消不回滚；协调器继续完成卸载与后续重激活。
-- Provider 变化、`restart()` 与 `replace()` 都先经历 `Active → Unloading → Pending → Loading → Active`：Core 取消并等待旧 Effect 的受控任务退出后，才允许下一次 `apply()`。
-- 普通配置更新为：宿主读取并校验配置 → 构造新的不可变 Plugin 实例 → `Fiber::replace`（Core **无** `update(json)`）。Factory 可通过 `PreparedExtension::volatile()` 将热参数独立为 `ConfigRef<Live>`；仅热部分变化时校验并原子提交快照，保留 Active Fiber。热引用和更新策略属于 Loader，Core 不保存可变插件配置。
-- 配置无效：宿主记录配置错误，**不得调用** `replace`；旧 Active 实例继续运行。
-- 新实例 `apply` 失败：旧实例已释放，Fiber 进入 `Failed`；Core 不回滚配置或恢复旧实例。
-- `restart()` 只用于配置未变时的重新执行、依赖变化或人工恢复，禁止作为可变配置更新入口。
+`Loading` / `Unloading` 由每个 Fiber 的内部协调器收敛。调用方取消已提交操作的等待，不取消协调器。首次 `plugin()` 在拥有型句柄交付前被取消时撤销该次挂载，不遗留实例。旧执行、子 Scope、清理和受控任务完整结束后才允许下一轮激活。
 
-`Context::inject` 返回 `InjectionHandle`（派生依赖），与 Plugin Fiber 分开诊断；状态包括 `Pending`、`Loading`、`Active`、`Unloading`、`Failed`、`Disposed`。旧回调及其资源完整释放后才运行下一轮回调。
+普通配置更新由宿主校验后构造新的不可变 Plugin 对象，再调用 `Fiber::replace`；身份由挂载时传入的 Definition 决定。热配置由 Loader 的 `PreparedExtension::volatile()` 与 `ConfigRef<Live>` 提交，Core 不保存可变插件配置或配置工厂。
+
+配置候选无效时不调用 `replace`。新对象 `apply` 失败或清理失败进入 `Failed`，不回滚已释放对象。插件与 `inject` 统一采用显式恢复：依赖变化不会重试 Failed；只有 `restart()` 或插件 `replace()` 会启动下一次尝试。
 
 ### Factory 统一构造边界
 
@@ -101,14 +104,14 @@ Factory 是静态 Loader 的必要构造边界：Catalog 根据条目 `name` 找
 解析、校验并构造为 `Plugin`；Core 只负责挂载和生命周期，不认识业务配置或插件发现。
 因此 Factory 本身不是冗余，也不应将这部分逻辑散回应用入口。
 
-`ExtensionFactory::prepare()` 是唯一预备入口，`register()` 是唯一登记入口。
+`ExtensionFactory::prepare()` 是唯一预备入口，`register(&definition, factory)` 是唯一登记入口；Catalog 将工厂与显式 Definition 关联。
 `PreparedExtension::ordinary()` 表达普通插件，`PreparedExtension::volatile()` 表达包含
 普通配置与热配置的插件；两者均延迟构造。普通插件无需空 Live 或划分方法，只有热配置
 结果创建配置引用。`PreparedExtension::tree()` 表达 Include 等来源树载体，在同来源配置更新时
 等待子树局部协调，不用普通 volatile 订阅假装提交已经完成。Loader 内部统一比较、构造与提交，
 插件作者不操作类型擦除或写入端。
 
-普通/热配置能力切换或绑定类型变化会完整替换实例，重新校验 PluginKey 并关闭旧引用。
+普通/热配置能力切换或绑定类型变化会完整替换实例，使用 Catalog 登记的 Definition 并关闭旧引用。
 该 API 为直接迁移，外部应用需同步更新；不保留双入口或旧构造接口。
 
 ### 配置控制面
@@ -137,7 +140,7 @@ Factory 是静态 Loader 的必要构造边界：Catalog 根据条目 `name` 找
 
 只有 `Plugin::inject` 与 `Context::inject` 的显式声明建立生命周期绑定。Registry 在同一次锁内解析依赖并绑定 Provider 实例 ID 与本轮消费者执行 Scope；普通 `get()`、`Services` 克隆和 `Arc` 克隆不建立或延长绑定。绑定从用户回调开始前持续到回调、子 Scope、清理和受控任务全部结束，覆盖 Loading、失败及卸载中的执行。
 
-Provider 开始释放时先标记 retiring，拒绝新绑定并请求已有消费者卸载。提供者等待所有消费者完成后，才取消自身任务并运行资源清理。这个顺序适用于普通 Effect、插件 restart / replace / unmount 及 Runtime shutdown；兄弟插件也按声明的服务依赖排序。资源由实际注册 Provider 的 Scope 保护，不由 PluginKey 或 ServiceKey 代替实例归属。
+Provider 开始释放时先标记 retiring，拒绝新绑定并请求已有消费者卸载。提供者等待所有消费者完成后，才取消自身任务并运行资源清理。这个顺序适用于普通 Effect、插件 restart / replace / unmount 及 Runtime shutdown；兄弟插件也按声明的服务依赖排序。资源由实际注册 Provider 的 Scope 保护，不由 Definition ID 或 ServiceKey 代替实例归属。
 
 消费者清理使用激活时捕获的服务引用；`Context::get()` 仍严格要求 Provider Ready 且所属 Fiber Active。该保证保护 Core 管理的资源释放，不保证外部故障中的服务继续可用。服务等待关系与 Effect 父子等待关系形成环时返回 `DependencyCycle { scopes }`，不执行候选回调；依赖尚未满足的循环注入保持 Pending。
 
@@ -166,7 +169,7 @@ Provider 开始释放时先标记 retiring，拒绝新绑定并请求已有消�
 
 ## 诊断
 
-`Runtime::diagnostics()` 含：isolations、providers、plugin_fibers（含 `plugin_key`）、plugin_registry（Key + Fiber id/state）、inject_fibers、effects。Provider 与依赖 Snapshot 会显示受控的未就绪原因；业务 `get()` 错误不会携带原因。普通 Context 是不可枚举的短生命周期视图，不进入诊断；无 Service / Config 值。
+`Runtime::diagnostics()` 统一包含 `fibers`、`definitions`、`providers`、`effects`、`isolations`。每个 `FiberSnapshot` 使用 `FiberState`，并报告 `id`、`definition_id`、`parent_fiber_id`、可选 `name`、依赖、缺失/不可用原因、最近错误及根 Effect。Definition 条目报告 `definition_id`、可选名称、`unmounting` 和 `fiber_ids`。事件 `FiberStateChange` 同样包含 Definition 与父 Fiber 身份；日志记录使用可选 `definition_id` 与 `plugin_name`。诊断不含 Service / Config 业务值。
 
 ## Config / intercept
 
@@ -174,9 +177,9 @@ Provider 开始释放时先标记 retiring，拒绝新绑定并请求已有消�
 identity** 的派生配置视图并写入覆盖；`config(key)` 向父链查找最近值。`provide` / `get` /
 `inject` 的服务域不因配置覆盖而改变。需要新服务域时使用 `extend()`；按 Key 隔离可见性使用 `isolate` / `isolate_with`。
 
-## Plugin Registry
+## Definition 分组
 
-`Plugin::key()` 声明稳定身份。Runtime 按 Key 归组 Fiber；`Runtime::unmount(key)` 标记卸载中、拒绝同 Key 新挂载、`dispose_wait` 全部实例后清分组；释放错误聚合返回，但仍完成分组清理。
+Runtime 按显式 Definition ID 归组 Fiber；`Runtime::unmount(definition.id())` 标记卸载中、拒绝该定义的新挂载，等待全部实例完整释放后清理分组。释放错误聚合返回，但仍完成分组清理。
 
 生命周期等待同时检查服务依赖与 Effect 父子等待关系：用户回调中的 `dispose_wait`、`restart`、`replace` 若会反向等待当前 Scope，立即返回 `LifecycleReentrant { scope }`，不启动该操作。`unmount` 保留同树检查，并增加跨树服务依赖检查，拒绝时返回 `UnmountReentrant`；卸载不形成反向等待的无关插件仍允许。同步清理、异步清理、`apply`、inject 和受控任务均携带所属 Scope。同树判定使用创建时冻结的共享祖先链（`detach` 后仍有效）。`shutdown` 的全局 `ShutdownReentrant` 约束不变。
 
@@ -184,7 +187,7 @@ identity** 的派生配置视图并写入覆盖；`config(key)` 向父链查找�
 
 首次挂载：`Context::plugin` 的 wait 被取消时向本轮协调器请求放弃 Handle——若 `apply` 尚未开始则直接撤销；若已开始则**不** abort 用户 Future，等 `apply` 返回后不提交 Active、释放临时 Scope 并注销 Fiber。因此 `Plugin::apply` **不得无限阻塞**；长等须用 Effect `spawn` + 取消令牌。
 
-`Fiber::replace` 仅允许同 Key；旧 Effect 释放失败时进入 `Failed`，不启动新 `apply`。
+`Fiber::replace` 保留挂载时的 Definition 身份；旧 Effect 释放失败时进入 `Failed`，不启动新 `apply`。
 
 ## 关闭
 

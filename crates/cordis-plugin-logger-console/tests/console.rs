@@ -1,10 +1,13 @@
 //! ConsoleExporter 渲染与挂载回归。
 
-use cordis_core::{LogLevel, LogRecord, PluginKey, Runtime};
+use cordis_core::{LogLevel, LogRecord, Runtime};
 use cordis_plugin_logger_console::{
     ColorMode, ConsoleExporter, ConsoleLoggerConfig, ConsoleLoggerPlugin, LabelAlign,
 };
 use std::{collections::BTreeMap, sync::Arc, time::SystemTime};
+
+static APP_DEFINITION: std::sync::LazyLock<cordis_core::PluginDefinition> =
+    std::sync::LazyLock::new(|| cordis_core::PluginDefinition::named("demo.app"));
 
 fn record(level: LogLevel, target: &str, message: &str, default_level: LogLevel) -> LogRecord {
     LogRecord {
@@ -14,7 +17,8 @@ fn record(level: LogLevel, target: &str, message: &str, default_level: LogLevel)
         target: target.into(),
         message: message.into(),
         fiber_id: Some(7),
-        plugin_key: Some(PluginKey::new("demo.app")),
+        definition_id: Some(APP_DEFINITION.id()),
+        plugin_name: Some("demo.app".into()),
         default_level,
     }
 }
@@ -135,16 +139,19 @@ async fn plugin_mount_and_unmount_clears_exporter() {
     assert_eq!(runtime.logger_service().exporter_count(), 0);
     let mut fiber = runtime
         .root()
-        .plugin(Arc::new(ConsoleLoggerPlugin::new(ConsoleLoggerConfig {
-            colors: ColorMode::Never,
-            levels: BTreeMap::from([("default".into(), LogLevel::Debug)]),
-            show_time: false,
-            show_diff: false,
-            max_length: None,
-            label_width: 8,
-            label_margin: 1,
-            label_align: LabelAlign::Right,
-        })))
+        .plugin(
+            &cordis_plugin_logger_console::PLUGIN_DEFINITION,
+            Arc::new(ConsoleLoggerPlugin::new(ConsoleLoggerConfig {
+                colors: ColorMode::Never,
+                levels: BTreeMap::from([("default".into(), LogLevel::Debug)]),
+                show_time: false,
+                show_diff: false,
+                max_length: None,
+                label_width: 8,
+                label_margin: 1,
+                label_align: LabelAlign::Right,
+            })),
+        )
         .await
         .unwrap();
     assert_eq!(runtime.logger_service().exporter_count(), 1);

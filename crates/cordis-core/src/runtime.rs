@@ -4,7 +4,7 @@
 //! 不是业务宿主，不承担应用协议或外部基础设施职责。
 
 use crate::{
-    Context, CoreError, PluginKey,
+    Context, CoreError, PluginDefinitionId,
     callback_context::{
         SHUTDOWN_COORDINATOR, current_lifecycle_scope, in_shutdown_coordinator,
         in_user_lifecycle_callback,
@@ -117,7 +117,7 @@ async fn run_shutdown_worker(inner: Arc<RuntimeInner>) -> Result<(), CoreError> 
 
 struct UnmountFinishGuard {
     registry: Arc<Registry>,
-    key: PluginKey,
+    key: PluginDefinitionId,
     completion: Arc<UnmountCompletion>,
     finished: bool,
 }
@@ -138,6 +138,9 @@ async fn run_unmount_worker(
     fibers: Vec<Arc<crate::fiber::FiberInner>>,
 ) -> Result<usize, CoreError> {
     let count = fibers.len();
+    for fiber in &fibers {
+        fiber.dispose_now();
+    }
     let mut errors = Vec::new();
     for fiber in fibers {
         let mut handle = Fiber { inner: fiber };
@@ -176,7 +179,8 @@ impl Runtime {
                         scope: root_scope,
                         logger: logger.clone(),
                         log_fiber_id: None,
-                        log_plugin_key: None,
+                        log_definition: None,
+                        log_default_name: None,
                     }),
                 },
                 logger,
@@ -270,15 +274,15 @@ impl Runtime {
         self.inner.registry.subscribe_fiber_states()
     }
 
-    /// 按 [`PluginKey`] 统一卸载：拒绝并发新挂载，等待该组全部 Fiber `dispose_wait`。
+    /// 按 [`PluginDefinitionId`] 统一卸载：拒绝并发新挂载，等待该组全部 Fiber `dispose_wait`。
     ///
     /// 若在用户生命周期回调内且目标 Fiber 的等待 Scope 与当前回调同树，立即返回
     /// [`CoreError::UnmountReentrant`]，不取消、不等待任何 Fiber。
     ///
     /// 即使部分 Fiber 释放失败，仍会尝试释放同组其余实例并清理分组，再返回聚合错误。
-    pub async fn unmount(&self, key: PluginKey) -> Result<usize, CoreError> {
+    pub async fn unmount(&self, key: PluginDefinitionId) -> Result<usize, CoreError> {
         if let Some(frame_scope) = current_lifecycle_scope() {
-            let targets = self.inner.registry.plugin_fibers_for_key(key)?;
+            let targets = self.inner.registry.fibers_for_definition(key)?;
             for fiber in &targets {
                 for scope in fiber.scopes_awaited_by_unmount() {
                     if frame_scope.is_same_tree_as(&scope) {
@@ -411,7 +415,24 @@ mod shutdown_supervisor_tests {
     #[tokio::test]
     async fn unmount_supervisor_drop_releases_group_and_finishes_waiters() {
         let runtime = Runtime::new().expect("runtime");
-        let key = PluginKey::new("test.unmount-supervisor-drop");
+        let definition = crate::PluginDefinition::named("test.unmount-supervisor-drop");
+        let key = definition.id();
+        runtime
+            .inner
+            .registry
+            .state
+            .lock()
+            .expect("registry")
+            .plugin_index
+            .insert(
+                key,
+                crate::plugin::group::DefinitionGroup {
+                    definition,
+                    fibers: Vec::new(),
+                    unmounting: false,
+                    unmount_completion: None,
+                },
+            );
         let (_, completion) = runtime
             .inner
             .registry
@@ -432,9 +453,9 @@ mod shutdown_supervisor_tests {
         assert!(
             runtime
                 .diagnostics()
-                .plugin_registry
+                .definitions
                 .iter()
-                .all(|group| group.plugin_key != key.as_str())
+                .all(|group| group.definition_id != key)
         );
         runtime.shutdown().await.expect("shutdown");
     }

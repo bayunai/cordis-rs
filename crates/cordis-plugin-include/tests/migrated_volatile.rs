@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use cordis_core::{Context, CoreError, Fiber, FiberState, Plugin, PluginKey, Runtime, ServiceKey};
+use cordis_core::{Context, CoreError, Fiber, FiberState, Plugin, Runtime, ServiceKey};
 use cordis_loader::{
     ConfigRef, EntryOptions, EntryUpdate, ExtensionCatalog, ExtensionFactory, ExtensionsConfig,
     LOADER, Loader, LoaderControlError, LoaderError, LoaderPlugin, PreparedExtension,
@@ -112,9 +112,6 @@ impl ExtensionFactory for Factory {
 }
 #[async_trait]
 impl Plugin for TestPlugin {
-    fn key(&self) -> PluginKey {
-        PluginKey::new("test.live")
-    }
     fn inject(&self) -> Vec<cordis_core::ServiceId> {
         self.settings
             .dependency
@@ -181,9 +178,17 @@ fn entry(id: &str, address: &str, limit: u32) -> EntryOptions {
 }
 fn catalog(state: &Arc<State>) -> ExtensionCatalog {
     let mut catalog = ExtensionCatalog::new();
-    catalog.register(Factory(state.clone())).unwrap();
     catalog
-        .register(cordis_plugin_include::IncludeFactory)
+        .register(
+            &cordis_core::PluginDefinition::anonymous(),
+            Factory(state.clone()),
+        )
+        .unwrap();
+    catalog
+        .register(
+            &cordis_plugin_include::PLUGIN_DEFINITION,
+            cordis_plugin_include::IncludeFactory,
+        )
         .unwrap();
     catalog
         .register_isolation(cordis_loader::IsolationDescriptor::new("dep", DEP))
@@ -460,7 +465,15 @@ async fn multiple_instances_disable_restore_and_unmount_rebuild() {
     assert_eq!(next.get().revision, 0);
     let mut next_updates = next.subscribe();
     h.runtime
-        .unmount(PluginKey::new("test.live"))
+        .unmount(
+            h.loader
+                .await_idle()
+                .await
+                .unwrap()
+                .entry("include:a")
+                .unwrap()
+                .definition_id,
+        )
         .await
         .unwrap();
     assert!(
@@ -635,14 +648,14 @@ async fn move_and_group_rebuild_replace_only_affected_references() {
         ],
     )
     .await;
-    let old = state.refs.lock().unwrap()[1].clone();
-    // Build order is path-sorted: b precedes g:a.
-    let untouched = state.refs.lock().unwrap()[0].clone();
+    let old = state.refs.lock().unwrap()[0].clone();
+    // 构造按树内 ID 排序，a 在 b 之前，Group 不增加地址前缀。
+    let untouched = state.refs.lock().unwrap()[1].clone();
     let mut sub = old.subscribe();
     h.loader
         .subtree("include")
         .unwrap()
-        .update("g:a", EntryUpdate::default(), Some(None), None)
+        .update("a", EntryUpdate::default(), Some(None), None)
         .await
         .unwrap();
     assert!(sub.changed().await.is_err());
@@ -808,7 +821,7 @@ async fn registration_shares_id_checks_and_schema_is_complete_raw_input() {
     let state = Arc::new(State::default());
     let mut catalog = catalog(&state);
     assert!(matches!(
-        catalog.register(Factory(state)),
+        catalog.register(&cordis_core::PluginDefinition::anonymous(), Factory(state)),
         Err(LoaderError::DuplicateFactory { .. })
     ));
     let descriptor = catalog
@@ -833,13 +846,18 @@ async fn registration_shares_id_checks_and_schema_is_complete_raw_input() {
         }
     }
     assert!(matches!(
-        catalog.register(Ordinary),
+        catalog.register(&cordis_core::PluginDefinition::anonymous(), Ordinary),
         Err(LoaderError::DuplicateFactory { .. })
     ));
     let mut reverse = ExtensionCatalog::new();
-    reverse.register(Ordinary).unwrap();
+    reverse
+        .register(&cordis_core::PluginDefinition::anonymous(), Ordinary)
+        .unwrap();
     assert!(matches!(
-        reverse.register(Factory(Arc::new(State::default()))),
+        reverse.register(
+            &cordis_core::PluginDefinition::anonymous(),
+            Factory(Arc::new(State::default()))
+        ),
         Err(LoaderError::DuplicateFactory { .. })
     ));
 }
@@ -905,7 +923,10 @@ async fn mount_file(
     let entry = cordis_plugin_include::include_root_entry("include", cordis).unwrap();
     let fiber = runtime
         .root()
-        .plugin(Arc::new(LoaderPlugin::new(catalog)))
+        .plugin(
+            &cordis_loader::PLUGIN_DEFINITION,
+            Arc::new(LoaderPlugin::new(catalog)),
+        )
         .await
         .unwrap();
     runtime

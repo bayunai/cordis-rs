@@ -74,11 +74,8 @@ pub enum CoreError {
     #[error("Config {config} 已绑定其他 Rust 类型")]
     ConfigKeyTypeConflict { config: crate::config::ConfigId },
     #[error("插件 {plugin} 正在卸载")]
-    PluginUnmounting { plugin: crate::plugin::PluginKey },
-    #[error("插件 Key 不匹配：期望 {expected}，实际 {actual}")]
-    PluginKeyMismatch {
-        expected: crate::plugin::PluginKey,
-        actual: crate::plugin::PluginKey,
+    PluginUnmounting {
+        plugin: crate::plugin::PluginDefinitionId,
     },
     #[error("释放失败: {errors:?}")]
     DisposeFailed { errors: Vec<String> },

@@ -2,16 +2,15 @@
 //!
 //! 导出 Context / Fiber / Effect 等结构信息；不包含服务载荷。
 
-use crate::{ProviderAvailability, registry::InjectionPhase};
+use crate::{FiberState, PluginDefinitionId, ProviderAvailability};
 
 /// 非敏感运行时诊断快照。
 #[derive(Debug, Clone, Default)]
 pub struct RuntimeSnapshot {
     pub isolations: Vec<IsolationSnapshot>,
     pub providers: Vec<ProviderSnapshot>,
-    pub plugin_fibers: Vec<PluginFiberSnapshot>,
-    pub plugin_registry: Vec<PluginRegistrySnapshot>,
-    pub inject_fibers: Vec<InjectFiberSnapshot>,
+    pub fibers: Vec<FiberSnapshot>,
+    pub definitions: Vec<PluginDefinitionSnapshot>,
     pub effects: Vec<EffectSnapshot>,
 }
 
@@ -38,48 +37,15 @@ pub struct UnavailableDependencySnapshot {
     pub reason: std::sync::Arc<str>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FiberStateSnapshot {
-    Pending,
-    Loading,
-    Active,
-    Failed,
-    Unloading,
-    Disposed,
-}
-
-impl From<InjectionPhase> for FiberStateSnapshot {
-    fn from(value: InjectionPhase) -> Self {
-        match value {
-            InjectionPhase::Pending => Self::Pending,
-            InjectionPhase::Loading => Self::Loading,
-            InjectionPhase::Unloading => Self::Unloading,
-            InjectionPhase::Active => Self::Active,
-            InjectionPhase::Failed => Self::Failed,
-            InjectionPhase::Disposed => Self::Disposed,
-        }
-    }
-}
-
-/// 派生 inject 的诊断快照（非 Plugin Fiber）。
-#[derive(Debug, Clone)]
-pub struct InjectFiberSnapshot {
-    pub id: u64,
-    pub context_depth: usize,
-    pub phase: FiberStateSnapshot,
-    pub dependencies: Vec<&'static str>,
-    pub missing_dependencies: Vec<&'static str>,
-    pub unavailable_dependencies: Vec<UnavailableDependencySnapshot>,
-    pub last_error: Option<String>,
-}
-
 /// Plugin Fiber 诊断快照。
 #[derive(Debug, Clone)]
-pub struct PluginFiberSnapshot {
+pub struct FiberSnapshot {
     pub id: u64,
-    pub plugin_key: &'static str,
+    pub definition_id: PluginDefinitionId,
+    pub parent_fiber_id: Option<u64>,
+    pub name: Option<std::sync::Arc<str>>,
     pub context_depth: usize,
-    pub state: FiberStateSnapshot,
+    pub state: FiberState,
     pub dependencies: Vec<&'static str>,
     pub missing_dependencies: Vec<&'static str>,
     pub unavailable_dependencies: Vec<UnavailableDependencySnapshot>,
@@ -87,18 +53,13 @@ pub struct PluginFiberSnapshot {
     pub root_effect: Option<u64>,
 }
 
-/// Plugin Registry 分组诊断（仅 Key + Fiber id/state）。
+/// 同一定义在本 Runtime 内的实例分组；状态来自统一 fibers 列表。
 #[derive(Debug, Clone)]
-pub struct PluginRegistrySnapshot {
-    pub plugin_key: &'static str,
+pub struct PluginDefinitionSnapshot {
+    pub definition_id: PluginDefinitionId,
+    pub name: Option<std::sync::Arc<str>>,
     pub unmounting: bool,
-    pub fibers: Vec<PluginRegistryFiberSnapshot>,
-}
-
-#[derive(Debug, Clone)]
-pub struct PluginRegistryFiberSnapshot {
-    pub id: u64,
-    pub state: FiberStateSnapshot,
+    pub fiber_ids: Vec<u64>,
 }
 
 #[derive(Debug, Clone)]

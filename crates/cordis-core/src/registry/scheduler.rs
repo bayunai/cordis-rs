@@ -5,12 +5,11 @@
 use crate::{
     CoreError,
     callback_context::in_user_lifecycle_callback,
-    effect::EffectScope,
     fiber::{FiberInner, FiberState},
-    registry::{InjectionId, Registry},
+    registry::Registry,
     service::resolver::provider_ids,
 };
-use std::sync::{Arc, Weak, atomic::Ordering};
+use std::sync::{Arc, atomic::Ordering};
 use tokio::task::JoinHandle;
 
 tokio::task_local! {
@@ -20,18 +19,13 @@ tokio::task_local! {
 
 struct RecomputeBatch {
     epoch: u64,
-    ready: Vec<InjectionId>,
-    stale_scopes: Vec<EffectScope>,
     unload: Vec<Arc<FiberInner>>,
     activate: Vec<Arc<FiberInner>>,
 }
 
 impl RecomputeBatch {
     fn is_empty(&self) -> bool {
-        self.ready.is_empty()
-            && self.stale_scopes.is_empty()
-            && self.unload.is_empty()
-            && self.activate.is_empty()
+        self.unload.is_empty() && self.activate.is_empty()
     }
 }
 
@@ -165,12 +159,9 @@ impl Registry {
                 let _guard = self.recompute_lock.lock().await;
                 let epoch = self.recompute_epoch.load(Ordering::Acquire);
                 let _ = self.dirty.swap(false, Ordering::AcqRel);
-                let injection = self.take_ready();
-                let (unload, activate) = self.classify_plugin_fibers();
+                let (unload, activate) = self.classify_fibers();
                 RecomputeBatch {
                     epoch,
-                    ready: injection.ready,
-                    stale_scopes: injection.stale_scopes,
                     unload,
                     activate,
                 }
@@ -193,12 +184,6 @@ impl Registry {
             }
 
             // 锁外：用户 sync cleanup / unload wait / inject / Plugin::apply。
-            for scope in batch.stale_scopes {
-                scope.dispose();
-                self.spawn_recompute_job(async move {
-                    let _ = scope.dispose_wait().await;
-                });
-            }
             let unloads = batch
                 .unload
                 .into_iter()
@@ -211,14 +196,6 @@ impl Registry {
             for completion in unloads {
                 self.spawn_recompute_job(async move {
                     let _ = completion.wait().await;
-                });
-            }
-            for injection in batch.ready {
-                let registry = self.clone();
-                self.spawn_recompute_job(async move {
-                    IN_RECOMPUTE_USER
-                        .scope((), registry.run_injection(injection))
-                        .await;
                 });
             }
             for fiber in batch.activate {
@@ -247,16 +224,16 @@ impl Registry {
     }
 
     /// 仅识别需 unload / 可 activate 的 Fiber；禁止在此 await。
-    fn classify_plugin_fibers(&self) -> (Vec<Arc<FiberInner>>, Vec<Arc<FiberInner>>) {
+    fn classify_fibers(&self) -> (Vec<Arc<FiberInner>>, Vec<Arc<FiberInner>>) {
         let fibers = {
             let Ok(state) = self.state.lock() else {
                 return (Vec::new(), Vec::new());
             };
             state
-                .plugin_fibers
+                .fibers
                 .values()
-                .filter_map(Weak::upgrade)
                 .filter(|fiber| !fiber.disposed.load(Ordering::Acquire))
+                .cloned()
                 .collect::<Vec<_>>()
         };
 

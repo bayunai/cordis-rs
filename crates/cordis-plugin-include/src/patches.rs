@@ -84,46 +84,56 @@ fn check_name(entry: &EntryOptions, patch: &EntryPatch) -> Result<(), SourceErro
 
 fn modify(
     entries: &mut [EntryOptions],
-    path: &str,
+    id: &str,
     change: &mut dyn FnMut(&mut EntryOptions) -> Result<(), SourceError>,
 ) -> Result<(), SourceError> {
-    let (head, tail) = path
-        .split_once(':')
-        .map_or((path, None), |(head, tail)| (head, Some(tail)));
-    if head.is_empty() {
-        return Err(invalid("patch 路径不能为空或包含空段"));
+    if id.is_empty() || id.contains(':') {
+        return Err(invalid("patch 必须使用当前 EntryTree 内的单段 ID"));
     }
-    let entry = entries
-        .iter_mut()
-        .find(|entry| entry.id == head)
-        .ok_or_else(|| invalid("patch 的目标条目不存在"))?;
-    if let Some(tail) = tail {
-        if !entry.group {
-            return Err(invalid("patch 路径穿过非 Group 条目"));
-        }
-        let mut children = entry
-            .children()
-            .map_err(|_| invalid("Group 子条目结构无效"))?;
-        modify(&mut children, tail, change)?;
-        entry.config =
-            toml::Value::try_from(children).map_err(|_| invalid("无法表示 Group 条目"))?;
+    if modify_entry(entries, id, change)? {
         Ok(())
     } else {
-        change(entry)
+        Err(invalid("patch 的目标条目不存在"))
     }
+}
+
+fn modify_entry(
+    entries: &mut [EntryOptions],
+    id: &str,
+    change: &mut dyn FnMut(&mut EntryOptions) -> Result<(), SourceError>,
+) -> Result<bool, SourceError> {
+    for entry in entries {
+        if entry.id == id {
+            change(entry)?;
+            return Ok(true);
+        }
+        if entry.group {
+            let mut children = entry
+                .children()
+                .map_err(|_| invalid("Group 子条目结构无效"))?;
+            if modify_entry(&mut children, id, change)? {
+                entry.config =
+                    toml::Value::try_from(children).map_err(|_| invalid("无法表示 Group 条目"))?;
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
 }
 
 pub(crate) fn validate(config: &ExtensionsConfig) -> Result<(), SourceError> {
     if config.version != CONFIG_VERSION {
         return Err(invalid("不支持的配置版本；当前要求 version = 3"));
     }
-    validate_entries(&config.extensions)
+    validate_entries(&config.extensions, &mut HashSet::new())
 }
-fn validate_entries(entries: &[EntryOptions]) -> Result<(), SourceError> {
-    let mut ids = HashSet::new();
+fn validate_entries(
+    entries: &[EntryOptions],
+    ids: &mut HashSet<String>,
+) -> Result<(), SourceError> {
     for entry in entries {
-        if entry.id.is_empty() || entry.id.contains(':') || !ids.insert(&entry.id) {
-            return Err(invalid("条目 ID 为空、含分隔符或同组重复"));
+        if entry.id.is_empty() || entry.id.contains(':') || !ids.insert(entry.id.clone()) {
+            return Err(invalid("条目 ID 为空、含分隔符或在 EntryTree 内重复"));
         }
         if entry.name.is_empty() {
             return Err(invalid("条目 Factory 名称不能为空"));
@@ -135,7 +145,7 @@ fn validate_entries(entries: &[EntryOptions]) -> Result<(), SourceError> {
             let children = entry
                 .children()
                 .map_err(|_| invalid("Group 子条目结构无效"))?;
-            validate_entries(&children)?;
+            validate_entries(&children, ids)?;
         } else if entry.name == GROUP_NAME || !entry.config.is_table() {
             return Err(invalid(
                 "普通条目 config 必须是配置表且不能使用 Group Factory",

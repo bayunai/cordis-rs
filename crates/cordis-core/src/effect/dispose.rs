@@ -333,29 +333,6 @@ impl EffectScope {
         Ok(())
     }
 
-    pub(crate) fn release_result(&self) -> Option<Result<(), CoreError>> {
-        let completion = self
-            .inner
-            .completion
-            .lock()
-            .expect("dispose completion")
-            .clone()?;
-        completion
-            .result
-            .lock()
-            .expect("dispose completion")
-            .as_ref()
-            .map(|report| {
-                if report.is_empty() {
-                    Ok(())
-                } else {
-                    Err(CoreError::DisposeFailed {
-                        errors: report.values().flatten().cloned().collect(),
-                    })
-                }
-            })
-    }
-
     pub(super) fn parent_inner(&self) -> Option<Arc<EffectScopeInner>> {
         self.inner
             .parent

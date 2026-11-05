@@ -7,8 +7,14 @@ use crate::plugins::greeting::GreetingFactory;
 /// 注册到这里不代表插件会启动；`cordis.toml` 的条目配置才是唯一启停来源。
 pub fn build_catalog() -> Result<ExtensionCatalog, LoaderError> {
     let mut catalog = ExtensionCatalog::new();
-    catalog.register(GreetingFactory)?;
+    catalog.register(
+        &crate::plugins::greeting::PLUGIN_DEFINITION,
+        GreetingFactory,
+    )?;
     // 根文件与嵌套文件都由显式 Include 条目承载；Loader 根树本身只保存在内存。
-    catalog.register(cordis_plugin_include::IncludeFactory)?;
+    catalog.register(
+        &cordis_plugin_include::PLUGIN_DEFINITION,
+        cordis_plugin_include::IncludeFactory,
+    )?;
     Ok(catalog)
 }

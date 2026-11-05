@@ -1,8 +1,6 @@
 //! Loader 的来源契约测试只使用内存后端，不依赖文件插件或编解码器。
 use async_trait::async_trait;
-use cordis_core::{
-    ConfigKey, Context, CoreError, Fiber, FiberState, Plugin, PluginKey, Runtime, ServiceKey,
-};
+use cordis_core::{ConfigKey, Context, CoreError, Fiber, FiberState, Plugin, Runtime, ServiceKey};
 use cordis_loader::{
     EntryOptions, EntryTreeSource, EntryUpdate, ExtensionCatalog, ExtensionFactory,
     ExtensionsConfig, LOADER, Loader, LoaderControlError, LoaderError, LoaderPlugin,
@@ -130,15 +128,10 @@ impl ExtensionFactory for Carrier {
     }
     fn prepare(&self, cfg: Empty) -> Result<PreparedExtension, LoaderError> {
         let source = self.0.clone();
-        Ok(PreparedExtension::tree(
-            PluginKey::new("test.source"),
-            (),
-            cfg,
-            move |_, _, _| {
-                let source = source.clone();
-                async move { Ok(source as Arc<dyn EntryTreeSource>) }
-            },
-        ))
+        Ok(PreparedExtension::tree((), cfg, move |_, _, _| {
+            let source = source.clone();
+            async move { Ok(source as Arc<dyn EntryTreeSource>) }
+        }))
     }
 }
 #[derive(serde::Serialize, Deserialize, JsonSchema)]
@@ -171,9 +164,6 @@ impl ExtensionFactory for LeafFactory {
 }
 #[async_trait]
 impl Plugin for Leaf {
-    fn key(&self) -> PluginKey {
-        PluginKey::new("test.leaf")
-    }
     fn inject(&self) -> Vec<cordis_core::ServiceId> {
         self.needs_dep.then_some(MISSING.id()).into_iter().collect()
     }
@@ -215,12 +205,25 @@ async fn mount() -> (Runtime, Fiber, Loader, Arc<MemorySource>) {
 
 async fn mount_source(source: Arc<MemorySource>) -> (Runtime, Fiber, Loader, Arc<MemorySource>) {
     let mut catalog = ExtensionCatalog::new();
-    catalog.register(Carrier(source.clone())).unwrap();
-    catalog.register(LeafFactory(source.clone())).unwrap();
+    catalog
+        .register(
+            &cordis_core::PluginDefinition::anonymous(),
+            Carrier(source.clone()),
+        )
+        .unwrap();
+    catalog
+        .register(
+            &cordis_core::PluginDefinition::anonymous(),
+            LeafFactory(source.clone()),
+        )
+        .unwrap();
     let runtime = Runtime::new().unwrap();
     let fiber = runtime
         .root()
-        .plugin(Arc::new(LoaderPlugin::new(catalog)))
+        .plugin(
+            &cordis_loader::PLUGIN_DEFINITION,
+            Arc::new(LoaderPlugin::new(catalog)),
+        )
         .await
         .unwrap();
     let loader = (*runtime.root().get(LOADER).unwrap()).clone();
@@ -419,7 +422,7 @@ async fn unchanged_source_still_retries_failed_and_manually_unmounted_entries() 
     assert!(source.prepares.load(Ordering::SeqCst) > prepares);
     let active = tree.snapshot().unwrap().entry("tree:leaf").unwrap().clone();
     assert_eq!(active.state, Some(FiberState::Active));
-    runtime.unmount(PluginKey::new("test.leaf")).await.unwrap();
+    runtime.unmount(active.definition_id).await.unwrap();
     tree.reload().await.unwrap();
     let restored = tree.snapshot().unwrap().entry("tree:leaf").unwrap().clone();
     assert_eq!(restored.state, Some(FiberState::Active));

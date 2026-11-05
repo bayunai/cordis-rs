@@ -4,7 +4,7 @@
 //! 生命周期动作与激活逻辑分别在 `lifecycle`、`activate`。
 
 use super::FiberInner;
-use crate::{diagnostics::UnavailableDependencySnapshot, plugin::PluginKey};
+use crate::{diagnostics::UnavailableDependencySnapshot, plugin::PluginDefinitionId};
 use std::sync::atomic::Ordering;
 
 /// Plugin Fiber 公开生命周期状态。
@@ -22,7 +22,8 @@ pub enum FiberState {
 #[derive(Debug, Clone)]
 pub struct FiberStateChange {
     pub fiber_id: u64,
-    pub plugin_key: PluginKey,
+    pub definition_id: PluginDefinitionId,
+    pub parent_fiber_id: Option<u64>,
     pub previous: Option<FiberState>,
     pub current: FiberState,
     /// 当前处于严格解析不可用状态、但仍已注册的依赖。
@@ -36,18 +37,6 @@ pub(crate) enum ActivateClaim {
 }
 
 impl FiberInner {
-    pub(crate) fn publish_initial_state(&self) {
-        if let Some(registry) = self.registry.upgrade() {
-            registry.publish_fiber_state(FiberStateChange {
-                fiber_id: self.id,
-                plugin_key: self.plugin_key,
-                previous: None,
-                current: FiberState::Pending,
-                unavailable_dependencies: self.unavailable_dependencies(),
-            });
-        }
-    }
-
     pub(super) fn publish_transition(&self, previous: FiberState, current: FiberState) {
         if previous == current {
             return;
@@ -55,7 +44,8 @@ impl FiberInner {
         if let Some(registry) = self.registry.upgrade() {
             registry.publish_fiber_state(FiberStateChange {
                 fiber_id: self.id,
-                plugin_key: self.plugin_key,
+                definition_id: self.definition.id(),
+                parent_fiber_id: self.parent_fiber_id,
                 previous: Some(previous),
                 current,
                 unavailable_dependencies: self.unavailable_dependencies(),

@@ -1,6 +1,6 @@
 //! 配置控制面读取必须把层数据与已加载 Schema 作为同一版本处理。
 use async_trait::async_trait;
-use cordis_core::{Context, CoreError, Fiber, Plugin, PluginKey, Runtime};
+use cordis_core::{Context, CoreError, Fiber, Plugin, Runtime};
 use cordis_loader::{
     EntryOptions, ExtensionCatalog, ExtensionFactory, LOADER, LoaderControlError, LoaderError,
     LoaderPlugin, PreparedExtension,
@@ -41,7 +41,7 @@ impl Serialize for FaultConfig {
 struct PublicFactory;
 struct SecretFactory;
 struct FaultFactory;
-struct Instance(&'static str);
+struct Instance;
 macro_rules! factory {
     ($factory:ty, $config:ty, $id:literal) => {
         impl ExtensionFactory for $factory {
@@ -50,7 +50,7 @@ macro_rules! factory {
                 $id
             }
             fn prepare(&self, _: Self::Config) -> Result<PreparedExtension, LoaderError> {
-                Ok(PreparedExtension::ordinary(|| Ok(Arc::new(Instance($id)))))
+                Ok(PreparedExtension::ordinary(|| Ok(Arc::new(Instance))))
             }
         }
     };
@@ -60,9 +60,6 @@ factory!(SecretFactory, SecretConfig, "secret");
 factory!(FaultFactory, FaultConfig, "fault");
 #[async_trait]
 impl Plugin for Instance {
-    fn key(&self) -> PluginKey {
-        PluginKey::new(self.0)
-    }
     async fn apply(&self, _: &Context) -> Result<(), CoreError> {
         Ok(())
     }
@@ -82,15 +79,32 @@ fn write_deploy(path: &std::path::Path, entry: EntryOptions) {
 }
 async fn mount(config: &ConfigEditorConfig, root: &std::path::Path) -> (Runtime, Vec<Fiber>) {
     let mut catalog = ExtensionCatalog::new();
-    catalog.register(PublicFactory).unwrap();
-    catalog.register(SecretFactory).unwrap();
-    catalog.register(FaultFactory).unwrap();
-    catalog.register(IncludeFactory).unwrap();
+    catalog
+        .register(
+            &cordis_core::PluginDefinition::named("public"),
+            PublicFactory,
+        )
+        .unwrap();
+    catalog
+        .register(
+            &cordis_core::PluginDefinition::named("secret"),
+            SecretFactory,
+        )
+        .unwrap();
+    catalog
+        .register(&cordis_core::PluginDefinition::named("fault"), FaultFactory)
+        .unwrap();
+    catalog
+        .register(&cordis_plugin_include::PLUGIN_DEFINITION, IncludeFactory)
+        .unwrap();
     let runtime = Runtime::new().unwrap();
     let mut fibers = vec![
         runtime
             .root()
-            .plugin(Arc::new(LoaderPlugin::new(catalog)))
+            .plugin(
+                &cordis_loader::PLUGIN_DEFINITION,
+                Arc::new(LoaderPlugin::new(catalog)),
+            )
             .await
             .unwrap(),
     ];
@@ -108,14 +122,20 @@ async fn mount(config: &ConfigEditorConfig, root: &std::path::Path) -> (Runtime,
     fibers.push(
         runtime
             .root()
-            .plugin(Arc::new(ConfigEditorPlugin::new(config.clone())))
+            .plugin(
+                &cordis_plugin_config_editor::PLUGIN_DEFINITION,
+                Arc::new(ConfigEditorPlugin::new(config.clone())),
+            )
             .await
             .unwrap(),
     );
     fibers.push(
         runtime
             .root()
-            .plugin(Arc::new(SettingsPlugin))
+            .plugin(
+                &cordis_plugin_settings::PLUGIN_DEFINITION,
+                Arc::new(SettingsPlugin),
+            )
             .await
             .unwrap(),
     );

@@ -94,10 +94,6 @@ impl EffectScope {
         }
     }
 
-    pub(crate) fn child(&self) -> Self {
-        self.child_named("effect")
-    }
-
     pub(crate) fn child_named(&self, name: impl Into<String>) -> Self {
         let lineage = Some(Arc::new(AncestorNode {
             id: self.inner.id,
@@ -247,6 +243,25 @@ impl EffectScope {
             .lock()
             .map(|resources| resources.cleanups.len())
             .unwrap_or(0)
+    }
+
+    /// Linearize registration and parent ownership against parent resource extraction.
+    pub(crate) fn register_owned<T>(
+        &self,
+        register: impl FnOnce() -> Result<T, CoreError>,
+        cleanup: impl FnOnce() + Send + 'static,
+    ) -> Result<T, CoreError> {
+        let mut resources = self
+            .inner
+            .resources
+            .lock()
+            .map_err(|_| CoreError::ContextDisposed)?;
+        if self.is_disposed() {
+            return Err(CoreError::ContextDisposed);
+        }
+        let value = register()?;
+        resources.cleanups.push(Box::new(cleanup));
+        Ok(value)
     }
 
     pub(crate) fn on_dispose(&self, cleanup: impl FnOnce() + Send + 'static) {

@@ -31,7 +31,7 @@ pub struct SecretFieldState {
 /// 可交给应用传输层的分层描述。
 #[derive(Clone, Debug)]
 pub struct EntryConfigView {
-    /// 包含 Group / Include 前缀的完整 Entry 路径。
+    /// 仅包含 Include 树前缀的完整 Entry 路径；Group 不增加地址前缀。
     pub path: EntryId,
     pub factory: String,
     /// 用于表单展示的安全投影；最终校验仍由 Rust 类型和 prepare 完成。

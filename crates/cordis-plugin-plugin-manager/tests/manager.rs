@@ -1,9 +1,7 @@
 //! PluginManager：库存与启停只经 user patch。
 
 use async_trait::async_trait;
-use cordis_core::{
-    Context, CoreError, FiberState, Plugin, PluginKey, Runtime, ServiceId, ServiceKey,
-};
+use cordis_core::{Context, CoreError, FiberState, Plugin, Runtime, ServiceId, ServiceKey};
 use cordis_loader::{
     EntryOptions, EntryUpdate, ExtensionCatalog, ExtensionFactory, ExtensionsConfig, LOADER,
     LoaderControlError, LoaderError, LoaderPlugin, PreparedExtension,
@@ -40,9 +38,6 @@ impl ExtensionFactory for Factory {
 
 #[async_trait]
 impl Plugin for Instance {
-    fn key(&self) -> PluginKey {
-        PluginKey::new("demo.row")
-    }
     async fn apply(&self, _: &Context) -> Result<(), CoreError> {
         Ok(())
     }
@@ -64,9 +59,6 @@ impl ExtensionFactory for PendingFactory {
 }
 #[async_trait]
 impl Plugin for PendingInstance {
-    fn key(&self) -> PluginKey {
-        PluginKey::new("demo.pending")
-    }
     fn inject(&self) -> Vec<ServiceId> {
         vec![PENDING_DEP.id()]
     }
@@ -94,9 +86,6 @@ impl ExtensionFactory for FailingFactory {
 
 #[async_trait]
 impl Plugin for FailingInstance {
-    fn key(&self) -> PluginKey {
-        PluginKey::new("demo.failing")
-    }
     async fn apply(&self, _: &Context) -> Result<(), CoreError> {
         FAIL_ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Err(CoreError::PluginApply("unsupported platform".into()))
@@ -147,14 +136,31 @@ async fn harness_with_failure(
     std::fs::write(dir.path().join("home.patches.toml"), "version = 1\n").unwrap();
 
     let mut catalog = ExtensionCatalog::new();
-    catalog.register(Factory).unwrap();
-    catalog.register(FailingFactory).unwrap();
-    catalog.register(PendingFactory).unwrap();
-    catalog.register(IncludeFactory).unwrap();
+    catalog
+        .register(&cordis_core::PluginDefinition::named("demo.row"), Factory)
+        .unwrap();
+    catalog
+        .register(
+            &cordis_core::PluginDefinition::named("demo.failing"),
+            FailingFactory,
+        )
+        .unwrap();
+    catalog
+        .register(
+            &cordis_core::PluginDefinition::named("demo.pending"),
+            PendingFactory,
+        )
+        .unwrap();
+    catalog
+        .register(&cordis_plugin_include::PLUGIN_DEFINITION, IncludeFactory)
+        .unwrap();
     let runtime = Runtime::new().unwrap();
     let loader_fiber = runtime
         .root()
-        .plugin(Arc::new(LoaderPlugin::new(catalog)))
+        .plugin(
+            &cordis_loader::PLUGIN_DEFINITION,
+            Arc::new(LoaderPlugin::new(catalog)),
+        )
         .await
         .unwrap();
     let editor_config = ConfigEditorConfig::new(
@@ -177,12 +183,18 @@ async fn harness_with_failure(
         .unwrap();
     let editor_fiber = runtime
         .root()
-        .plugin(Arc::new(ConfigEditorPlugin::new(editor_config)))
+        .plugin(
+            &cordis_plugin_config_editor::PLUGIN_DEFINITION,
+            Arc::new(ConfigEditorPlugin::new(editor_config)),
+        )
         .await
         .unwrap();
     let manager_fiber = runtime
         .root()
-        .plugin(Arc::new(PluginManagerPlugin))
+        .plugin(
+            &cordis_plugin_plugin_manager::PLUGIN_DEFINITION,
+            Arc::new(PluginManagerPlugin),
+        )
         .await
         .unwrap();
     (
@@ -200,7 +212,7 @@ async fn list_plugins_includes_rows_and_marks_groups_read_only() {
     let paths: Vec<_> = list.iter().map(|p| p.path.as_str()).collect();
     assert!(paths.contains(&"include:one"));
     assert!(paths.contains(&"include:bucket"));
-    assert!(paths.contains(&"include:bucket:nested"));
+    assert!(paths.contains(&"include:nested"));
     let group = list.iter().find(|p| p.path == "include:bucket").unwrap();
     assert_eq!(group.read_only_reason, Some(ReadOnlyReason::Group));
     let one = list.iter().find(|p| p.path == "include:one").unwrap();
@@ -360,7 +372,10 @@ async fn subscriptions_are_shared_and_close_on_unload_without_affecting_new_inst
     assert!(runtime.root().get(LOADER).is_ok());
     let mut new_fiber = runtime
         .root()
-        .plugin(Arc::new(PluginManagerPlugin))
+        .plugin(
+            &cordis_plugin_plugin_manager::PLUGIN_DEFINITION,
+            Arc::new(PluginManagerPlugin),
+        )
         .await
         .unwrap();
     let new_manager = runtime.root().get(PLUGIN_MANAGER).unwrap();

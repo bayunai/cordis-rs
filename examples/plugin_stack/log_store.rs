@@ -5,16 +5,14 @@
 //! （不经 Runtime Logger，避免 exporter 重入再次占满队列）。
 
 use async_trait::async_trait;
-use cordis_core::{
-    Context, CoreError, LogExporter, LogLevel, LogRecord, Plugin, PluginKey, ServiceId,
-};
+use cordis_core::{Context, CoreError, LogExporter, LogLevel, LogRecord, Plugin, ServiceId};
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
 };
 use tokio::sync::mpsc;
 
-use crate::keys::{DB, KEY_LOG_STORE};
+use crate::keys::DB;
 
 struct DbLogExporter {
     tx: mpsc::Sender<String>,
@@ -64,10 +62,6 @@ pub struct LogStorePlugin;
 
 #[async_trait]
 impl Plugin for LogStorePlugin {
-    fn key(&self) -> PluginKey {
-        KEY_LOG_STORE
-    }
-
     fn inject(&self) -> Vec<ServiceId> {
         vec![DB.id()]
     }
@@ -123,7 +117,8 @@ mod queue_tests {
             target: "test".into(),
             message: message.into(),
             fiber_id: None,
-            plugin_key: None,
+            definition_id: None,
+            plugin_name: None,
             default_level: LogLevel::Info,
         }
     }

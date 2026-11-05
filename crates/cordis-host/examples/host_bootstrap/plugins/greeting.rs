@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use cordis_core::{Context, CoreError, Plugin, PluginKey, ServiceKey};
+use cordis_core::{Context, CoreError, Plugin, ServiceKey};
 use cordis_loader::{ExtensionFactory, LoaderError, PreparedExtension};
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -40,11 +40,11 @@ struct GreetingPlugin {
 
 #[async_trait]
 impl Plugin for GreetingPlugin {
-    fn key(&self) -> PluginKey {
-        PluginKey::new("demo.greeting")
-    }
-
     async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
         ctx.provide(GREETING, Greeting(self.message.clone()))
     }
 }
+
+/// 示例插件的共享定义。
+pub static PLUGIN_DEFINITION: std::sync::LazyLock<cordis_core::PluginDefinition> =
+    std::sync::LazyLock::new(|| cordis_core::PluginDefinition::named("demo.greeting"));

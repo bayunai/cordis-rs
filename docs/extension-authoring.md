@@ -78,7 +78,7 @@ Settings 的 `config` 为原始字段编辑源，`value` 是仅 Active 存在的
 业务服务通过 `loader.entry_context("include:插件")` 读取；文件树 CRUD 可直接用完整路径
 （如 `loader.update("include:插件", …)`），Loader 按路径路由到来源树。也可用
 `loader.subtree("include")` 的局部路径。表单 `describe` / `mutate` 使用完整路径，由
-settings → config-editor → Loader 定位来源。仅内存根上的条目 CRUD 不持久化。
+settings → config-editor → Loader 定位来源。Group 不参与路径前缀，组内的 `worker` 仍使用 `include:worker`；只有嵌套 Include 才使用 `include:reports:worker`。每棵来源树内的条目 ID 必须唯一。仅内存根上的条目 CRUD 不持久化。
 
 需要文件目录时读取 Include 提供的 `INCLUDE_LOCATION`，不要假定 `EntryLocation` 包含文件信息。
 该元数据只在 Include 来源的上下文中存在；内存根中的 Include 应使用绝对路径。
@@ -90,18 +90,17 @@ settings → config-editor → Loader 定位来源。仅内存根上的条目 CR
 
 ```rust
 use async_trait::async_trait;
-use cordis_core::{Context, CoreError, Plugin, Runtime, ServiceKey};
-use std::sync::Arc;
+use cordis_core::{Context, CoreError, Plugin, PluginDefinition, Runtime, ServiceKey};
+use std::sync::{Arc, LazyLock};
+
+static GREETER_DEFINITION: LazyLock<PluginDefinition> =
+    LazyLock::new(|| PluginDefinition::named("demo.greeter"));
 
 struct Greeter;
 static GREETER: ServiceKey<&'static str> = ServiceKey::new("demo.greeter@1");
 
 #[async_trait]
 impl Plugin for Greeter {
-    fn key(&self) -> cordis_core::PluginKey {
-        cordis_core::PluginKey::new("demo.greeter")
-    }
-
     fn inject(&self) -> Vec<cordis_core::ServiceId> {
         // 可选：插件级依赖；未齐时 Fiber 保持 Pending
         Vec::new()
@@ -123,7 +122,7 @@ impl Plugin for Greeter {
 async fn main() -> Result<(), CoreError> {
     let runtime = Runtime::new()?;
     let root = runtime.root();
-    let mut fiber = root.plugin(Arc::new(Greeter)).await?;
+    let mut fiber = root.plugin(&GREETER_DEFINITION, Arc::new(Greeter)).await?;
     fiber.dispose_wait().await?;
     runtime.shutdown().await?;
     Ok(())
@@ -142,13 +141,13 @@ async fn main() -> Result<(), CoreError> {
 
 - `ctx.logger()?` / `ctx.logger_named("x")?` 使用 Runtime 唯一的 `LoggerService`；`isolate` / Group **不能**换成另一总线。
 - 全局总线**不过滤**：`Debug` 也会进入缓冲并送达全部 exporter。
-- 默认目标名：`LOGGER_CONFIG.name` → 当前 PluginKey → `root`；`LOGGER_CONFIG.level`（缺省 `Info`）写入 `LogRecord.default_level`，供 exporter 回退，不决定是否创建记录。
+- 默认目标名：`LOGGER_CONFIG.name` → 当前 Definition 的可选名称 → `root`；`LOGGER_CONFIG.level`（缺省 `Info`）写入 `LogRecord.default_level`，供 exporter 回退，不决定是否创建记录。
 - `ConfigUnavailable`（无 `LOGGER_CONFIG`）时使用上述默认；`ContextDisposed`、配置类型冲突等其他错误由 `logger()` 原样返回。
 - `ctx.register_log_exporter(exporter)` 挂到当前 Effect Scope；Scope/Fiber 卸载后自动移除。
 - 控制台输出用独立 crate `cordis-plugin-logger-console`（Host 显式挂载，先于 Loader）：
 
 ```rust
-let _console = host.root().plugin(Arc::new(ConsoleLoggerPlugin::default())).await?;
+let _console = host.root().plugin(&cordis_plugin_logger_console::PLUGIN_DEFINITION, Arc::new(ConsoleLoggerPlugin::default())).await?;
 ctx.logger()?.info("hello");
 ```
 
@@ -167,10 +166,10 @@ ctx.logger()?.info("hello");
 
 - `plugin()` 返回 `Fiber`（非旧 PluginHandle）。首次激活由内部协调器完成；调用方在返回前取消 wait 会撤销挂载（无残留 Fiber/诊断/服务）。若取消时 `apply` 已开始，协调器仍等 `apply` 结束再撤销，**不会** abort 用户 Future。
 - **`Plugin::apply` 不得无限阻塞**；长等、监听或后台刷新须用 `EffectContext::spawn` 并响应取消令牌，以便挂载取消、卸载与 `shutdown` 能收敛。
-- `restart()` 保留 Plugin 对象重跑；`replace(new)` 要求相同 `PluginKey`，先等旧任务结束再挂新实例。二者一旦开始，调用方取消不中断协调器，无需再手动 restart。
+- `restart()` 保留 Plugin 对象重跑；`replace(new)` 保留该 Fiber 的 Definition 身份，先等旧任务结束再挂新实例。二者一旦开始，调用方取消不中断协调器，无需再手动 restart。
 - `Loading` / `Unloading` 由内部协调器收敛，不会因取消而粘滞。
-- `apply` 失败 → `FiberState::Failed`，句柄仍返回；查 `last_error()`。
-- 热更新：同 Key → `fiber.replace(new)`；跨 Key → `Runtime::unmount(old)` 后再 `plugin(new)`。
+- `apply` 失败 → `FiberState::Failed`，句柄仍返回；查 `last_error()`。插件和派生注入均不会因依赖变化自动重试 Failed；显式调用 `restart()`，或对拥有型插件 Fiber 调用 `replace()` 恢复。
+- 更新执行对象调用 `fiber.replace(new)`，保留 Definition 身份。切换到另一个定义时，先 `Runtime::unmount(old_definition.id())`，再显式挂载新定义。
 - 生命周期回调内不得等待会反向等待自身 Scope 的 `dispose_wait` / `restart` / `replace`（`LifecycleReentrant { scope }`）。`unmount` 还拒绝同树或经服务依赖反向等待当前回调的目标（`UnmountReentrant`）；无关目标仍可卸载。同步及异步清理也受此检查约束。
 - `restart()`、`replace()` 和依赖 Provider 变更会先进入 `Unloading`，等待旧 Effect 的受控任务退出，再重新激活；不要在任务取消后继续使用旧实例资源。
 - 宿主可通过 `Runtime::subscribe_fiber_states()` 观察状态；这是可能丢失的广播流，收到 `Lagged` 后应使用 `Runtime::diagnostics()` 重建当前状态。
@@ -193,7 +192,7 @@ ctx.inject([QUEUE.id()], |services, effect| async move {
 
 插件级依赖则在 `Plugin::inject()` 中声明，并于 `apply()` 中通过 `ctx.get(KEY)?` 捕获服务。提供者进入 retiring 后，新的严格 `Context::get()` 不再返回该服务；清理闭包应使用已经取得的引用，不在清理时重新读取 Context。服务因网络或其他外部故障不可用，不属于 Core 的释放顺序保证。
 
-每次激活独立绑定 Provider 实例与执行 Scope，旧执行完整结束后才允许下一轮激活。派生注入可通过 `InjectionHandle::state()` 观察 `Loading` / `Unloading`。依赖与资源归属形成循环等待时，Core 返回 `DependencyCycle { scopes }` 并拒绝执行候选回调；不要通过重试、旁路读取或隐藏错误绕过它。
+每次激活独立绑定 Provider 实例与执行 Scope，旧执行完整结束后才允许下一轮激活。派生注入与插件使用相同 Fiber 模型；可通过 `FiberHandle::state()` 观察 `Loading` / `Unloading`，句柄 Clone 和 Drop 不改变资源归属。依赖与资源归属形成循环等待时，Core 返回 `DependencyCycle { scopes }` 并拒绝执行候选回调；不要通过重试、旁路读取或隐藏错误绕过它。
 
 ## 配置更新
 
@@ -207,7 +206,7 @@ use cordis_core::Plugin;
 use cordis_loader::{ExtensionFactory, LoaderError, PreparedExtension};
 use serde::Deserialize;
 use schemars::JsonSchema;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 struct GreeterFactory;
 
@@ -272,7 +271,7 @@ impl ExtensionFactory for GreeterFactory {
 计时器是独立能力插件，不在 Core，也不在 Loader builtin。Host 须先挂载并保留 Fiber：
 
 ```rust
-let _timer = host.root().plugin(Arc::new(TimerPlugin)).await?;
+let _timer = host.root().plugin(&cordis_plugin_timer::PLUGIN_DEFINITION, Arc::new(TimerPlugin)).await?;
 ```
 
 业务插件必须静态依赖 `TIMER`，并只在 `EffectContext` 上调用 `TimerExt`

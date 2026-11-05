@@ -1,7 +1,7 @@
 //! 配置启动编排与控制面生命周期隔离：业务失败必须可见且仍可修复。
 
 use async_trait::async_trait;
-use cordis_core::{Context, CoreError, Fiber, FiberState, Plugin, PluginKey, Runtime};
+use cordis_core::{Context, CoreError, Fiber, FiberState, Plugin, Runtime};
 use cordis_loader::{
     EntryOptions, ExtensionCatalog, ExtensionFactory, LOADER, LoaderError, LoaderPlugin,
     PreparedExtension,
@@ -52,10 +52,6 @@ impl ExtensionFactory for Factory {
 
 #[async_trait]
 impl Plugin for Instance {
-    fn key(&self) -> PluginKey {
-        PluginKey::new("startup.business")
-    }
-
     async fn apply(&self, _: &Context) -> Result<(), CoreError> {
         self.applies.fetch_add(1, Ordering::SeqCst);
         if self.fail {
@@ -94,11 +90,21 @@ fn write_config(dir: &std::path::Path) -> ConfigEditorConfig {
 
 async fn mount_loader(runtime: &Runtime, applies: Arc<AtomicUsize>) -> Fiber {
     let mut catalog = ExtensionCatalog::new();
-    catalog.register(Factory(applies)).unwrap();
-    catalog.register(IncludeFactory).unwrap();
+    catalog
+        .register(
+            &cordis_core::PluginDefinition::named("startup.business"),
+            Factory(applies),
+        )
+        .unwrap();
+    catalog
+        .register(&cordis_plugin_include::PLUGIN_DEFINITION, IncludeFactory)
+        .unwrap();
     runtime
         .root()
-        .plugin(Arc::new(LoaderPlugin::new(catalog)))
+        .plugin(
+            &cordis_loader::PLUGIN_DEFINITION,
+            Arc::new(LoaderPlugin::new(catalog)),
+        )
         .await
         .unwrap()
 }
@@ -107,17 +113,26 @@ async fn mount_controls(runtime: &Runtime, config: ConfigEditorConfig) -> Vec<Fi
     vec![
         runtime
             .root()
-            .plugin(Arc::new(ConfigEditorPlugin::new(config)))
+            .plugin(
+                &cordis_plugin_config_editor::PLUGIN_DEFINITION,
+                Arc::new(ConfigEditorPlugin::new(config)),
+            )
             .await
             .unwrap(),
         runtime
             .root()
-            .plugin(Arc::new(SettingsPlugin))
+            .plugin(
+                &cordis_plugin_settings::PLUGIN_DEFINITION,
+                Arc::new(SettingsPlugin),
+            )
             .await
             .unwrap(),
         runtime
             .root()
-            .plugin(Arc::new(PluginManagerPlugin))
+            .plugin(
+                &cordis_plugin_plugin_manager::PLUGIN_DEFINITION,
+                Arc::new(PluginManagerPlugin),
+            )
             .await
             .unwrap(),
     ]

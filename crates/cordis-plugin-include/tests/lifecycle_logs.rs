@@ -1,7 +1,5 @@
 use async_trait::async_trait;
-use cordis_core::{
-    Context, CoreError, Fiber, LogLevel, Plugin, PluginKey, Runtime, ServiceId, ServiceKey,
-};
+use cordis_core::{Context, CoreError, Fiber, LogLevel, Plugin, Runtime, ServiceId, ServiceKey};
 use cordis_loader::{
     EntryOptions, EntryUpdate, ExtensionCatalog, ExtensionFactory, ExtensionsConfig, LOADER,
     Loader, LoaderError, LoaderPlugin, PreparedExtension,
@@ -40,9 +38,6 @@ impl ExtensionFactory for Factory {
 }
 #[async_trait]
 impl Plugin for Instance {
-    fn key(&self) -> PluginKey {
-        PluginKey::new("log-test")
-    }
     fn inject(&self) -> Vec<ServiceId> {
         if self.dependency {
             vec![SERVICE.id()]
@@ -61,9 +56,6 @@ impl Plugin for Instance {
 struct Provider;
 #[async_trait]
 impl Plugin for Provider {
-    fn key(&self) -> PluginKey {
-        PluginKey::new("log-test.provider")
-    }
     async fn apply(&self, ctx: &Context) -> Result<(), CoreError> {
         ctx.provide(SERVICE, ())?;
         Ok(())
@@ -98,12 +90,19 @@ fn include(id: &str, path: &Path, logs: Option<bool>) -> EntryOptions {
 }
 async fn mount(entries: Vec<EntryOptions>) -> (Runtime, Fiber, Loader) {
     let mut catalog = ExtensionCatalog::new();
-    catalog.register(IncludeFactory).unwrap();
-    catalog.register(Factory).unwrap();
+    catalog
+        .register(&cordis_plugin_include::PLUGIN_DEFINITION, IncludeFactory)
+        .unwrap();
+    catalog
+        .register(&cordis_core::PluginDefinition::anonymous(), Factory)
+        .unwrap();
     let runtime = Runtime::new().unwrap();
     let fiber = runtime
         .root()
-        .plugin(Arc::new(LoaderPlugin::new(catalog)))
+        .plugin(
+            &cordis_loader::PLUGIN_DEFINITION,
+            Arc::new(LoaderPlugin::new(catalog)),
+        )
         .await
         .unwrap();
     let loader = (*runtime.root().get(LOADER).unwrap()).clone();
@@ -138,10 +137,10 @@ async fn lifecycle_logs_cover_mount_hot_reload_disable_and_reenable_without_dupl
         vec![EntryOptions::group("group", vec![leaf("worker", 1, false, false)]).unwrap()],
     );
     let (runtime, _fiber, loader) = mount(vec![include("include", &path, Some(true))]).await;
-    assert_eq!(count(&runtime, "挂载", "include:group:worker"), 1);
+    assert_eq!(count(&runtime, "挂载", "include:worker"), 1);
     let tree = loader.subtree("include").unwrap();
     tree.update(
-        "group:worker",
+        "worker",
         EntryUpdate {
             config: Some(leaf("worker", 2, false, false).config),
             ..Default::default()
@@ -151,10 +150,10 @@ async fn lifecycle_logs_cover_mount_hot_reload_disable_and_reenable_without_dupl
     )
     .await
     .unwrap();
-    assert_eq!(count(&runtime, "重载", "include:group:worker"), 1);
-    assert_eq!(count(&runtime, "挂载", "include:group:worker"), 1);
+    assert_eq!(count(&runtime, "重载", "include:worker"), 1);
+    assert_eq!(count(&runtime, "挂载", "include:worker"), 1);
     tree.update(
-        "group:worker",
+        "worker",
         EntryUpdate {
             disabled: Some(true),
             ..Default::default()
@@ -164,9 +163,9 @@ async fn lifecycle_logs_cover_mount_hot_reload_disable_and_reenable_without_dupl
     )
     .await
     .unwrap();
-    assert_eq!(count(&runtime, "卸载", "include:group:worker"), 1);
+    assert_eq!(count(&runtime, "卸载", "include:worker"), 1);
     tree.update(
-        "group:worker",
+        "worker",
         EntryUpdate {
             disabled: Some(false),
             ..Default::default()
@@ -176,7 +175,7 @@ async fn lifecycle_logs_cover_mount_hot_reload_disable_and_reenable_without_dupl
     )
     .await
     .unwrap();
-    assert_eq!(count(&runtime, "挂载", "include:group:worker"), 2);
+    assert_eq!(count(&runtime, "挂载", "include:worker"), 2);
     let before = messages(&runtime);
     tree.reload().await.unwrap();
     assert_eq!(messages(&runtime), before);
@@ -186,7 +185,7 @@ async fn lifecycle_logs_cover_mount_hot_reload_disable_and_reenable_without_dupl
             .all(|m| !m.contains("must-not-appear") && !m.contains("cordis.loader.group"))
     );
     runtime.shutdown().await.unwrap();
-    assert_eq!(count(&runtime, "卸载", "include:group:worker"), 2);
+    assert_eq!(count(&runtime, "卸载", "include:worker"), 2);
 }
 
 #[tokio::test]
@@ -274,13 +273,27 @@ async fn dependency_loss_and_reactivation_use_the_same_lifecycle_log_stream() {
     save(&path, vec![leaf("worker", 1, false, true)]);
     let (runtime, _fiber, loader) = mount(vec![include("include", &path, Some(true))]).await;
     assert_eq!(count(&runtime, "挂载", "include:worker"), 0);
-    let mut provider = runtime.root().plugin(Arc::new(Provider)).await.unwrap();
+    let mut provider = runtime
+        .root()
+        .plugin(
+            &cordis_core::PluginDefinition::anonymous(),
+            Arc::new(Provider),
+        )
+        .await
+        .unwrap();
     loader.await_idle().await.unwrap();
     cordis_testkit::wait_until(|| count(&runtime, "挂载", "include:worker") == 1).await;
     provider.dispose_wait().await.unwrap();
     loader.await_idle().await.unwrap();
     cordis_testkit::wait_until(|| count(&runtime, "卸载", "include:worker") == 1).await;
-    let _provider = runtime.root().plugin(Arc::new(Provider)).await.unwrap();
+    let _provider = runtime
+        .root()
+        .plugin(
+            &cordis_core::PluginDefinition::anonymous(),
+            Arc::new(Provider),
+        )
+        .await
+        .unwrap();
     loader.await_idle().await.unwrap();
     cordis_testkit::wait_until(|| count(&runtime, "挂载", "include:worker") == 2).await;
     assert_eq!(count(&runtime, "卸载", "include:worker"), 1);

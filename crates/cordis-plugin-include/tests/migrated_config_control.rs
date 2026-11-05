@@ -1,7 +1,5 @@
 use async_trait::async_trait;
-use cordis_core::{
-    Context, CoreError, Fiber, FiberState, Plugin, PluginKey, Runtime, ServiceId, ServiceKey,
-};
+use cordis_core::{Context, CoreError, Fiber, FiberState, Plugin, Runtime, ServiceId, ServiceKey};
 use cordis_loader::{
     ConfigRef, EntryOptions, ExtensionCatalog, ExtensionFactory, ExtensionsConfig, LOADER, Loader,
     LoaderControlError, LoaderError, LoaderPlugin, PreparedExtension,
@@ -71,9 +69,6 @@ impl ExtensionFactory for Factory {
 }
 #[async_trait]
 impl Plugin for Instance {
-    fn key(&self) -> PluginKey {
-        PluginKey::new("editable")
-    }
     fn inject(&self) -> Vec<ServiceId> {
         if self.address == "pending" {
             vec![MISSING.id()]
@@ -134,9 +129,17 @@ impl Harness {
         std::fs::write(dir.path().join("home.patches.toml"), "version = 1\n").unwrap();
         let counts = Arc::new(Counts::default());
         let mut catalog = ExtensionCatalog::new();
-        catalog.register(Factory(counts.clone())).unwrap();
         catalog
-            .register(cordis_plugin_include::IncludeFactory)
+            .register(
+                &cordis_core::PluginDefinition::anonymous(),
+                Factory(counts.clone()),
+            )
+            .unwrap();
+        catalog
+            .register(
+                &cordis_plugin_include::PLUGIN_DEFINITION,
+                cordis_plugin_include::IncludeFactory,
+            )
             .unwrap();
         let runtime = Runtime::new().unwrap();
         let (fibers, settings) = mount_file(
@@ -506,9 +509,17 @@ async fn nested_include_is_readable_but_not_editable_via_root_user_layer() {
     std::fs::write(dir.path().join("home.patches.toml"), "version = 1\n").unwrap();
     let counts = Arc::new(Counts::default());
     let mut catalog = ExtensionCatalog::new();
-    catalog.register(Factory(counts.clone())).unwrap();
     catalog
-        .register(cordis_plugin_include::IncludeFactory)
+        .register(
+            &cordis_core::PluginDefinition::anonymous(),
+            Factory(counts.clone()),
+        )
+        .unwrap();
+    catalog
+        .register(
+            &cordis_plugin_include::PLUGIN_DEFINITION,
+            cordis_plugin_include::IncludeFactory,
+        )
         .unwrap();
     let runtime = Runtime::new().unwrap();
     let (_fibers, settings) = mount_file(
@@ -530,18 +541,11 @@ async fn nested_include_is_readable_but_not_editable_via_root_user_layer() {
         .unwrap()
         .fiber_id;
     let tree = loader.subtree("include:nested").unwrap();
-    let form = settings
-        .describe("include:nested:group:child")
-        .await
-        .unwrap();
-    assert_eq!(form.path.as_str(), "include:nested:group:child");
+    let form = settings.describe("include:nested:child").await.unwrap();
+    assert_eq!(form.path.as_str(), "include:nested:child");
     assert!(matches!(
         settings
-            .mutate(
-                "include:nested:group:child",
-                form.revision,
-                vec![set("limit", 8)],
-            )
+            .mutate("include:nested:child", form.revision, vec![set("limit", 8)],)
             .await,
         Err(LoaderControlError::ConfigNotEditable)
     ));
@@ -569,7 +573,7 @@ async fn nested_include_is_readable_but_not_editable_via_root_user_layer() {
         .unwrap();
     assert!(tree.entries().is_err());
     assert!(matches!(
-        settings.describe("include:nested:group:child").await,
+        settings.describe("include:nested:child").await,
         Err(LoaderControlError::EntryNotFound { .. })
     ));
     runtime.shutdown().await.unwrap();
@@ -696,9 +700,14 @@ async fn instance_edits_preserve_other_instance_config_and_fiber() {
     std::fs::write(dir.path().join("home.patches.toml"), "version = 1\n").unwrap();
     let counts = Arc::new(Counts::default());
     let mut catalog = ExtensionCatalog::new();
-    catalog.register(Factory(counts)).unwrap();
     catalog
-        .register(cordis_plugin_include::IncludeFactory)
+        .register(&cordis_core::PluginDefinition::anonymous(), Factory(counts))
+        .unwrap();
+    catalog
+        .register(
+            &cordis_plugin_include::PLUGIN_DEFINITION,
+            cordis_plugin_include::IncludeFactory,
+        )
         .unwrap();
     let runtime = Runtime::new().unwrap();
     let (_fibers, settings) = mount_file(
@@ -807,7 +816,10 @@ async fn mount_file(
         .unwrap();
     let loader_fiber = runtime
         .root()
-        .plugin(Arc::new(LoaderPlugin::new(catalog)))
+        .plugin(
+            &cordis_loader::PLUGIN_DEFINITION,
+            Arc::new(LoaderPlugin::new(catalog)),
+        )
         .await
         .unwrap();
     runtime
@@ -819,12 +831,18 @@ async fn mount_file(
         .unwrap();
     let editor_fiber = runtime
         .root()
-        .plugin(Arc::new(ConfigEditorPlugin::new(config)))
+        .plugin(
+            &cordis_plugin_config_editor::PLUGIN_DEFINITION,
+            Arc::new(ConfigEditorPlugin::new(config)),
+        )
         .await
         .unwrap();
     let settings_fiber = runtime
         .root()
-        .plugin(Arc::new(SettingsPlugin))
+        .plugin(
+            &cordis_plugin_settings::PLUGIN_DEFINITION,
+            Arc::new(SettingsPlugin),
+        )
         .await
         .unwrap();
     let settings = (*runtime.root().get(SETTINGS).unwrap()).clone();

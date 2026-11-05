@@ -1,7 +1,7 @@
 //! 受信任 Host 将配置描述交给管理 UI；传输与认证不属于 Loader。
 //! 表单写入本机 user patch，不 bake 进空根或 deploy patch。
 use async_trait::async_trait;
-use cordis_core::{Context, CoreError, Plugin, PluginKey, Runtime};
+use cordis_core::{Context, CoreError, Plugin, Runtime};
 use cordis_loader::{
     EntryOptions, ExtensionCatalog, ExtensionFactory, LOADER, LoaderError, LoaderPlugin,
     PreparedExtension,
@@ -44,9 +44,6 @@ impl ExtensionFactory for Factory {
 }
 #[async_trait]
 impl Plugin for ExamplePlugin {
-    fn key(&self) -> PluginKey {
-        PluginKey::new("example.config")
-    }
     async fn apply(&self, _: &Context) -> Result<(), CoreError> {
         Ok(())
     }
@@ -73,12 +70,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     fs::write(directory.path().join("home.patches.toml"), "version = 1\n")?;
     let deploy_before = fs::read(&deploy_path)?;
     let mut catalog = ExtensionCatalog::new();
-    catalog.register(Factory)?;
-    catalog.register(IncludeFactory)?;
+    catalog.register(
+        &cordis_core::PluginDefinition::named("example.config"),
+        Factory,
+    )?;
+    catalog.register(&cordis_plugin_include::PLUGIN_DEFINITION, IncludeFactory)?;
     let runtime = Runtime::new()?;
     let _loader = runtime
         .root()
-        .plugin(Arc::new(LoaderPlugin::new(catalog)))
+        .plugin(
+            &cordis_loader::PLUGIN_DEFINITION,
+            Arc::new(LoaderPlugin::new(catalog)),
+        )
         .await?;
     let loader = runtime.root().get(LOADER)?;
     let editor_config = ConfigEditorConfig::new(
@@ -95,9 +98,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
     let _editor = runtime
         .root()
-        .plugin(Arc::new(ConfigEditorPlugin::new(editor_config)))
+        .plugin(
+            &cordis_plugin_config_editor::PLUGIN_DEFINITION,
+            Arc::new(ConfigEditorPlugin::new(editor_config)),
+        )
         .await?;
-    let _settings = runtime.root().plugin(Arc::new(SettingsPlugin)).await?;
+    let _settings = runtime
+        .root()
+        .plugin(
+            &cordis_plugin_settings::PLUGIN_DEFINITION,
+            Arc::new(SettingsPlugin),
+        )
+        .await?;
     let settings = runtime.root().get(SETTINGS)?;
     let before = settings.describe("include:ocr").await?;
     assert!(before.user.is_none());

@@ -19,10 +19,9 @@ mod runtime;
 mod service;
 
 pub use config::{ConfigId, ConfigKey};
-pub use context::{Context, EffectContext, InjectionHandle, InjectionState};
+pub use context::{Context, EffectContext};
 pub use diagnostics::{
-    EffectSnapshot, FiberStateSnapshot, InjectFiberSnapshot, IsolationSnapshot,
-    PluginFiberSnapshot, PluginRegistryFiberSnapshot, PluginRegistrySnapshot, ProviderSnapshot,
+    EffectSnapshot, FiberSnapshot, IsolationSnapshot, PluginDefinitionSnapshot, ProviderSnapshot,
     RuntimeSnapshot, UnavailableDependencySnapshot,
 };
 pub use effect::EffectHandle;
@@ -30,13 +29,13 @@ pub use error::CoreError;
 pub use event::{
     EventKey, ListenFilter, ListenOptions, Next, ParallelKey, SerialKey, Unsubscribe, WaterfallKey,
 };
-pub use fiber::{Fiber, FiberState, FiberStateChange};
+pub use fiber::{Fiber, FiberHandle, FiberState, FiberStateChange};
 pub use isolation::IsolationLabel;
 pub use logger::{
     LOG_BUFFER_CAPACITY, LOGGER_CONFIG, LogExporter, LogLevel, LogRecord, Logger, LoggerConfig,
     LoggerService,
 };
-pub use plugin::{Plugin, PluginKey};
+pub use plugin::{Plugin, PluginDefinition, PluginDefinitionId};
 pub use registry::provider::ProviderHandle;
 pub use runtime::Runtime;
 pub use service::{ProviderAvailability, ServiceId, ServiceKey, Services};

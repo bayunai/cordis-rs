@@ -30,7 +30,7 @@ use axum::{
     },
     routing::{get, post},
 };
-use cordis_core::{CoreError, FiberState, FiberStateSnapshot, Plugin, Runtime};
+use cordis_core::{CoreError, FiberState, Plugin, Runtime};
 use cordis_loader::{
     EntryOptions, EntryUpdate, ExtensionCatalog, ExtensionFactory, ExtensionsConfig, IsolateValue,
     IsolationDescriptor, LOADER, Loader, LoaderError, LoaderPlugin, LoaderSnapshot,
@@ -41,7 +41,7 @@ use cordis_plugin_logger_console::ConsoleLoggerPlugin;
 use db::DbPlugin;
 use futures_util::stream::Stream;
 use http_client::{HttpConfig, HttpPlugin};
-use keys::{DB, HTTP, KEY_DB, KEY_HTTP, KEY_LOG_STORE, KEY_SIDE};
+use keys::{DB, DEFINITION_DB, DEFINITION_HTTP, DEFINITION_LOG_STORE, DEFINITION_SIDE, HTTP};
 use log_store::LogStorePlugin;
 use log_stream::{SseLogExporter, sse_stream};
 use schemars::JsonSchema;
@@ -213,29 +213,18 @@ fn fiber_state_name(state: FiberState) -> &'static str {
     }
 }
 
-fn snapshot_name(state: FiberStateSnapshot) -> &'static str {
-    match state {
-        FiberStateSnapshot::Pending => "Pending",
-        FiberStateSnapshot::Loading => "Loading",
-        FiberStateSnapshot::Active => "Active",
-        FiberStateSnapshot::Failed => "Failed",
-        FiberStateSnapshot::Unloading => "Unloading",
-        FiberStateSnapshot::Disposed => "Disposed",
-    }
-}
-
-fn plugin_label(key: &str) -> &'static str {
-    if key == KEY_DB.as_str() {
+fn plugin_label(name: &str) -> &'static str {
+    if name == "demo.stack.db" {
         "DB"
-    } else if key == KEY_LOG_STORE.as_str() {
+    } else if name == "demo.stack.log-store" {
         "LogStore"
-    } else if key == KEY_HTTP.as_str() {
+    } else if name == "demo.stack.http" {
         "HTTP"
-    } else if key == KEY_SIDE.as_str() {
+    } else if name == "demo.stack.side" {
         "Side"
-    } else if key == "cordis.loader.group" {
+    } else if name == "cordis.loader.group" {
         "Group"
-    } else if key.starts_with("cordis.loader") {
+    } else if name.starts_with("cordis.loader") {
         "Loader"
     } else {
         "Plugin"
@@ -258,11 +247,11 @@ fn build_graph(runtime: &Runtime) -> GraphJson {
         .iter()
         .map(|p| p.context_depth)
         .max()
-        .or_else(|| snap.plugin_fibers.iter().map(|f| f.context_depth).max())
+        .or_else(|| snap.fibers.iter().map(|f| f.context_depth).max())
         .unwrap_or(1);
 
     let fibers: Vec<GraphFiberJson> = snap
-        .plugin_fibers
+        .fibers
         .iter()
         .map(|f| {
             let provides = snap
@@ -281,9 +270,9 @@ fn build_graph(runtime: &Runtime) -> GraphJson {
                 .collect();
             GraphFiberJson {
                 id: f.id,
-                plugin: f.plugin_key.to_string(),
-                label: plugin_label(f.plugin_key).into(),
-                state: snapshot_name(f.state).into(),
+                plugin: f.definition_id.to_string(),
+                label: plugin_label(f.name.as_deref().unwrap_or("anonymous")).into(),
+                state: fiber_state_name(f.state).into(),
                 dependencies: f.dependencies.iter().map(|s| (*s).to_string()).collect(),
                 missing_dependencies: f
                     .missing_dependencies
@@ -308,10 +297,10 @@ fn build_graph(runtime: &Runtime) -> GraphJson {
                     .and_then(|e| e.fiber_id)
             });
             let owner_plugin = owner_fiber.and_then(|fid| {
-                snap.plugin_fibers
+                snap.fibers
                     .iter()
                     .find(|f| f.id == fid)
-                    .map(|f| f.plugin_key.to_string())
+                    .map(|f| f.definition_id.to_string())
             });
             GraphProviderJson {
                 provider_id: p.provider_id,
@@ -362,19 +351,23 @@ async fn collect_state(app: &AppState) -> StateJson {
         .and_then(|ctx| ctx.get(DB).ok())
         .map(|db| db.recent(80))
         .unwrap_or_default();
-    let registry = app
-        .runtime
-        .diagnostics()
-        .plugin_registry
+    let runtime_snapshot = app.runtime.diagnostics();
+    let registry = runtime_snapshot
+        .definitions
         .iter()
-        .map(|g| GroupJson {
-            key: g.plugin_key.to_string(),
-            fibers: g
+        .map(|definition| GroupJson {
+            key: format!(
+                "{} #{}",
+                definition.name.as_deref().unwrap_or("匿名"),
+                definition.definition_id
+            ),
+            fibers: runtime_snapshot
                 .fibers
                 .iter()
-                .map(|f| FiberJson {
-                    id: f.id,
-                    state: snapshot_name(f.state).into(),
+                .filter(|fiber| fiber.definition_id == definition.definition_id)
+                .map(|fiber| FiberJson {
+                    id: fiber.id,
+                    state: fiber_state_name(fiber.state).into(),
                 })
                 .collect(),
         })
@@ -610,20 +603,29 @@ async fn api_clear_db(
 
 fn build_catalog() -> Result<ExtensionCatalog, LoaderError> {
     let mut catalog = ExtensionCatalog::new();
-    catalog.register(IncludeFactory)?;
-    catalog.register(SimpleFactory {
-        id: "demo.stack.side",
-        build: || Arc::new(SidePlugin) as Arc<dyn Plugin>,
-    })?;
-    catalog.register(SimpleFactory {
-        id: "demo.stack.db",
-        build: || Arc::new(DbPlugin) as Arc<dyn Plugin>,
-    })?;
-    catalog.register(SimpleFactory {
-        id: "demo.stack.log-store",
-        build: || Arc::new(LogStorePlugin) as Arc<dyn Plugin>,
-    })?;
-    catalog.register(HttpFactory)?;
+    catalog.register(&cordis_plugin_include::PLUGIN_DEFINITION, IncludeFactory)?;
+    catalog.register(
+        &DEFINITION_SIDE,
+        SimpleFactory {
+            id: "demo.stack.side",
+            build: || Arc::new(SidePlugin) as Arc<dyn Plugin>,
+        },
+    )?;
+    catalog.register(
+        &DEFINITION_DB,
+        SimpleFactory {
+            id: "demo.stack.db",
+            build: || Arc::new(DbPlugin) as Arc<dyn Plugin>,
+        },
+    )?;
+    catalog.register(
+        &DEFINITION_LOG_STORE,
+        SimpleFactory {
+            id: "demo.stack.log-store",
+            build: || Arc::new(LogStorePlugin) as Arc<dyn Plugin>,
+        },
+    )?;
+    catalog.register(&DEFINITION_HTTP, HttpFactory)?;
     catalog.register_isolation(IsolationDescriptor::new("db", DB))?;
     catalog.register_isolation(IsolationDescriptor::new("http", HTTP))?;
     Ok(catalog)
@@ -671,14 +673,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let runtime = Runtime::new()?;
     let _console = runtime
         .root()
-        .plugin(Arc::new(ConsoleLoggerPlugin::default()))
+        .plugin(
+            &cordis_plugin_logger_console::PLUGIN_DEFINITION,
+            Arc::new(ConsoleLoggerPlugin::default()),
+        )
         .await?;
     let sse = Arc::new(SseLogExporter::default());
     runtime.root().register_log_exporter(sse.clone())?;
 
     let catalog = build_catalog()?;
     let plugin = LoaderPlugin::new(catalog);
-    let loader_fiber = runtime.root().plugin(Arc::new(plugin)).await?;
+    let loader_fiber = runtime
+        .root()
+        .plugin(&cordis_loader::PLUGIN_DEFINITION, Arc::new(plugin))
+        .await?;
     let loader = (*runtime.root().get(LOADER)?).clone();
     loader
         .create(include_root_entry("include", &cordis)?, None, None)

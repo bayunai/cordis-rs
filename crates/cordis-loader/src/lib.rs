@@ -7,6 +7,9 @@
 //! [`PreparedExtension::volatile`] 可将配置划分为普通部分与热部分，后者通过只读
 //! [`ConfigRef`] 原地提交完整快照，不重建 Active 插件的服务和 Effect。
 
+//! 工厂以 `catalog.register(&definition, factory)` 登记。配置中的 `name` 仅寻址工厂，
+//! 挂载、替换与批量卸载使用该工厂持有的 `PluginDefinition`，禁用条目也保留定义 ID。
+
 mod catalog;
 mod config;
 mod config_control;
@@ -36,6 +39,7 @@ pub use config_control::{ConfigRevision, EntryConfigSnapshot};
 pub use error::{ConfigProjectionError, LoaderError};
 pub use loader::{
     ConfigTransaction, EntryUpdate, LOADER, Loader, LoaderControlError, LoaderEvent, LoaderSubtree,
+    MovePersistence,
 };
 pub use meta::{ENTRY_LOCATION, EntryLocation};
 pub use plugin::LoaderPlugin;
@@ -46,3 +50,10 @@ pub use volatile::{ConfigClosed, ConfigRef, ConfigSnapshot, ConfigSubscription};
 
 pub use schemars;
 pub use toml;
+
+/// Loader 插件的运行时定义。
+pub static PLUGIN_DEFINITION: std::sync::LazyLock<cordis_core::PluginDefinition> =
+    std::sync::LazyLock::new(|| cordis_core::PluginDefinition::named("cordis.loader"));
+/// 内建分组的运行时定义。
+pub static GROUP_DEFINITION: std::sync::LazyLock<cordis_core::PluginDefinition> =
+    std::sync::LazyLock::new(|| cordis_core::PluginDefinition::named("cordis.loader.group"));

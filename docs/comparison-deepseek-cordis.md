@@ -51,7 +51,7 @@ vendor/
 | 提供者等待已绑定消费者清理 | Provider `dependents` → Fiber unload | Provider 实例 → 消费者执行 Scope；覆盖插件与派生注入 |
 | 内置日志总线与独立 Console exporter | LoggerService + logger-console | Runtime LoggerService + cordis-plugin-logger-console |
 | 事件：emit / parallel / serial / waterfall；prepend / global / once | ✅ | ✅ |
-| 同插件多实例归组与批量卸载 | `registry.delete` | `Runtime::unmount` |
+| 同定义多实例归组与批量卸载 | `registry.delete` | `Runtime::unmount(definition.id())` |
 | 依赖变化时 unload → 再激活 | epoch / inertia | provider id 集合 + scheduler |
 
 ### 2.2 TS 有、Rust 更薄或没有
@@ -60,7 +60,7 @@ vendor/
 | --- | --- | --- | --- |
 | Proxy + Reflect | `reflect.ts`：`ctx.foo` 穿透、`mixin` / `accessor`、`internal/get\|set` | 无；显式 `get` / `provide` | **不进核心**（刻意） |
 | Service 基类 | `service.ts`：构造时自动 provide、可选 `check`、可调用 Service | `ServiceKey` / `Services` + `provide_checked` / `ProviderHandle` | 不进 Core；扩展层有重复样板后再封装 |
-| 多形态 Plugin | fn / class / `{apply}`；`@Inject`；`Config` StandardSchema | 单一 `Plugin` trait + `PluginKey` | 当前不做宏；待真实插件重复样板稳定后，宏只生成 key / inject |
+| 多形态 Plugin | fn / class / `{apply}`；`@Inject`；`Config` StandardSchema | 单一 `Plugin` trait + 显式 `PluginDefinition` | 当前不做宏；待真实插件重复样板稳定后，宏只生成 Definition 声明 / inject |
 | `fiber.update(config)` | 校验后 restart + `internal/update` | 无；宿主校验后 **`Fiber::replace`** | 保持现状 |
 | 事件 `bail` | 同步短路：首个非 `null` / `false` / `undefined` 结果获胜 | 未提供；现有 `serial()` 已提供异步逐个等待、`Some` 短路的等价主路径 | **预留槽位，不实现**；仅出现“必须在同步函数中做首个结果选择”的真实场景时再增加 |
 | provide 的 `check` 谓词 | `check` 在 Fiber 依赖刷新时决定是否可注入 | `provide_checked` + `ProviderHandle::refresh`；支持 Ready / Unavailable | Rust 的就绪语义更统一、显式 |
@@ -74,13 +74,13 @@ vendor/
 | --- | --- | --- |
 | 显式 `Runtime` | `new` / `root` / `settle` / `shutdown` / `unmount` / `diagnostics` / `subscribe_fiber_states` | 根即 `new Context()`，无独立关闭协议 |
 | 类型化 Key | `ServiceKey` / `ConfigKey` / `EventKey` / … + `TypeId` 锁定 | 字符串名 + 类型增强 |
-| `Fiber::replace` | 同 Key 换不可变插件实例 | 靠 `update` + restart |
+| `Fiber::replace` | 同 Definition 换不可变插件实例 | 靠 `update` + restart |
 | Config ≠ Service | `ConfigKey` 独立表 | intercept 挂在服务名上 |
-| inject ≠ Plugin Fiber | `InjectionHandle` 与 `Fiber` 分诊断 | `inject` 是 `plugin({inject, apply})` 语法糖 |
+| 统一 Fiber 模型 | 插件返回拥有型 `Fiber`，派生注入返回非拥有型 `FiberHandle`；共用状态和诊断 | `inject` 是 `plugin({inject, apply})` 语法糖 |
 | 跨 Runtime 隔离令牌 | `IsolationLabel` 绑 Runtime | Symbol label，无 runtime 令牌校验 |
-| 结构化 diagnostics | providers / plugin_registry / inject_fibers / effects 快照 | 主要是 `getEffects()` label 树 |
+| 结构化 diagnostics | fibers / definitions / providers / effects / isolations 快照 | 主要是 `getEffects()` label 树 |
 | 取消安全协调器 | Loading / Unloading 不因 wait cancel 卡死 | 靠 fiber inertia / epoch |
-| 插件 panic 隔离 | `key` / `inject` / `apply` 边界 catch | JS 异常路径不同 |
+| 插件 panic 隔离 | `inject` / `apply` 边界 catch | JS 异常路径不同 |
 
 ---
 
@@ -130,7 +130,7 @@ Rust 只跟踪 `Plugin::inject` / `Context::inject` 的显式依赖；解析与�
 | 主题 | TS | Rust |
 | --- | --- | --- |
 | Context | Proxy；mixin `events`/`logger`/`reflect`/`registry`；每 ctx 绑 `fiber`；Reflect 内部可 non-strict 读取 | 显式方法；Context **不可 dispose**，资源归 Runtime / Effect / Fiber；公开读取始终严格 |
-| Plugin | 多形态 + 可选 schema + inject map | `async apply` + `inject() -> Vec<ServiceId>` + `PluginKey` |
+| Plugin | 多形态 + 可选 schema + inject map | `async apply` + `inject() -> Vec<ServiceId>`；挂载显式传 `PluginDefinition` |
 | Effect | `fiber.effect(execute, label)` 收集 disposer | `effect()` → `EffectContext`；`on_dispose` / `on_dispose_async` / `spawn`；`dispose_wait` |
 | Fiber | `restart` / `update`；无 `replace` | `restart` / **`replace`**；`dispose` / `dispose_wait` |
 
@@ -167,7 +167,7 @@ Rust 只跟踪 `Plugin::inject` / `Context::inject` 的显式依赖；解析与�
 
 1. 同步事件 `bail`（**已预留，暂不实现**）：现有 `serial()` 已覆盖异步“首个结果获胜”。仅在同步函数中必须完成首个结果选择时，新增独立 `BailKey` / `bail()`；不得用它替代异步插件、生命周期或服务依赖处理。
 2. `AnyOf` / 替代依赖表达式（需要独立设计，不把多个候选直接塞进 `Plugin::inject()`）
-3. 可选 `cordis-macros`：仅在多个真实插件出现稳定重复样板后生成 `PluginKey` / `inject` / `ServiceKey`，**不**把 Fiber、scheduler、配置或健康检查宏化
+3. 可选 `cordis-macros`：仅在多个真实插件出现稳定重复样板后生成 `PluginDefinition` 声明 / `inject` / `ServiceKey`，**不**把 Fiber、scheduler、配置或健康检查宏化
 
 ### 跨项目复用方式
 
@@ -184,3 +184,5 @@ cordis-macros        ← 可选糖：声明样板
 ## 6. 一句话
 
 概念层（Context 树、isolate/intercept、provide/get/inject、Plugin Fiber、事件多模式、Effect 清理）对齐。两边都有内置 Logger 与消费者先卸载的依赖语义；TS 另有 Proxy / Reflect、多形态插件与 `update(config)`，Rust 提供显式 Runtime、类型化 Key、`replace`、隔离令牌、结构化 diagnostics、Provider Ready 语义与受控异步关闭。性能结论必须以同机基准为准，不能只凭抽象结构下定论。
+
+Rust 使用显式 Definition 身份，名称只用于展示；同名的新 Definition 不归为同一组。插件与派生注入的 Failed 均须显式 restart，插件也可 replace；依赖变化不会自动重试失败执行。

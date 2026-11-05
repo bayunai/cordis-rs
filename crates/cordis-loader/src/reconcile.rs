@@ -12,7 +12,7 @@ use crate::{
     tree::{PreparedTreePlan, RuntimeTree},
 };
 use async_trait::async_trait;
-use cordis_core::{Context, CoreError, FiberState, Plugin, PluginKey, ServiceId};
+use cordis_core::{Context, CoreError, FiberState, Plugin, PluginDefinition, ServiceId};
 use std::{
     collections::{BTreeMap, BTreeSet},
     panic::{AssertUnwindSafe, catch_unwind},
@@ -28,7 +28,7 @@ pub(crate) struct DesiredNode {
     pub(crate) options: EntryOptions,
     children: Vec<EntryId>,
     plugin: Option<Arc<dyn Plugin>>,
-    plugin_key: Option<PluginKey>,
+    definition: PluginDefinition,
     binding: Option<Arc<dyn ConfigBinding>>,
     resolved: Option<serde_json::Value>,
 }
@@ -111,8 +111,14 @@ impl RuntimeTree {
                 })
             })
             .collect();
+        // 不跨持有 order / entries 两把锁；快照按 entries → order 读取。
+        let current_order = self.order.lock().expect("entry order").clone();
         // 1) 后序删除整节点
-        let remove_order = postorder_among(&plan.remove, &self.order.lock().expect("entry order"));
+        let remove_order = postorder_among(
+            &plan.remove,
+            &current_order,
+            &self.entries.lock().expect("entries"),
+        );
         for path in remove_order {
             record_lifecycle_result(
                 self.dispose_and_remove(&path).await,
@@ -124,7 +130,8 @@ impl RuntimeTree {
         // 2) 后序仅释放 Fiber（禁用）
         let dispose_order = postorder_among(
             &plan.dispose_fiber,
-            &self.order.lock().expect("entry order"),
+            &current_order,
+            &self.entries.lock().expect("entries"),
         );
         for path in dispose_order {
             record_lifecycle_result(
@@ -385,7 +392,6 @@ impl RuntimeTree {
                 return Ok(());
             };
             entry.enabled = false;
-            entry.plugin_key = None;
             entry.binding = None;
             entry.fiber.take()
         };
@@ -441,9 +447,6 @@ impl RuntimeTree {
             }
             if fiber.is_disposed() {
                 entry.binding = None;
-            }
-            if replace_result.is_ok() && !failed {
-                entry.plugin_key = node.plugin_key;
             }
             entry.fiber = Some(fiber);
         }
@@ -529,12 +532,12 @@ impl RuntimeTree {
                 .resolve_injections(node.options.inject.as_ref(), path.as_str(), domain)?;
         let context = self.inject_entry_location(path, context);
 
-        let (fiber, plugin_key, mount_failed, mount_error) = if node.options.group {
+        let (fiber, mount_failed, mount_error) = if node.options.group {
             let fiber = context
-                .plugin(Arc::new(ConfiguredPlugin::new(
-                    Arc::new(GroupPlugin),
-                    dependencies,
-                )))
+                .plugin(
+                    &node.definition,
+                    Arc::new(ConfiguredPlugin::new(Arc::new(GroupPlugin), dependencies)),
+                )
                 .await
                 .map_err(|source| LoaderError::Lifecycle {
                     instance: path.to_string(),
@@ -542,19 +545,17 @@ impl RuntimeTree {
                 })?;
             let failed = fiber.state() == FiberState::Failed;
             let last_error = fiber.last_error();
-            (
-                Some(fiber),
-                Some(PluginKey::new("cordis.loader.group")),
-                failed,
-                last_error,
-            )
+            (Some(fiber), failed, last_error)
         } else if enabled {
             let plugin = node
                 .plugin
                 .clone()
                 .expect("enabled ordinary entry must be built");
             let fiber = context
-                .plugin(Arc::new(ConfiguredPlugin::new(plugin, dependencies)))
+                .plugin(
+                    &node.definition,
+                    Arc::new(ConfiguredPlugin::new(plugin, dependencies)),
+                )
                 .await
                 .map_err(|source| LoaderError::Lifecycle {
                     instance: path.to_string(),
@@ -562,9 +563,9 @@ impl RuntimeTree {
                 })?;
             let failed = fiber.state() == FiberState::Failed;
             let last_error = fiber.last_error();
-            (Some(fiber), node.plugin_key, failed, last_error)
+            (Some(fiber), failed, last_error)
         } else {
-            (None, None, false, None)
+            (None, false, None)
         };
 
         let log_state = (!node.options.group)
@@ -579,7 +580,7 @@ impl RuntimeTree {
                 group: node.options.group,
                 enabled,
                 fiber,
-                plugin_key,
+                definition_id: node.definition.id(),
                 context,
                 factory: (!node.options.group).then(|| node.options.name.clone()),
                 options: node.options.clone(),
@@ -628,11 +629,12 @@ pub(crate) fn index_desired_tree(
 ) -> Result<(BTreeMap<EntryId, DesiredNode>, Vec<EntryId>), LoaderError> {
     config.validate(catalog)?;
     let mut out = BTreeMap::new();
-    let roots = index_entries(&config.extensions, None, prefix, &mut out)?;
+    let roots = index_entries(catalog, &config.extensions, None, prefix, &mut out)?;
     Ok((out, roots))
 }
 
 fn index_entries(
+    catalog: &ExtensionCatalog,
     entries: &[EntryOptions],
     parent: Option<&str>,
     prefix: Option<&str>,
@@ -640,19 +642,20 @@ fn index_entries(
 ) -> Result<Vec<EntryId>, LoaderError> {
     let mut child_ids = Vec::new();
     for options in entries {
-        let path = EntryId::from(match parent {
-            Some(parent) => format!("{parent}:{id}", id = options.id),
-            None => match prefix {
-                Some(prefix) if !prefix.is_empty() => {
-                    format!("{prefix}:{id}", id = options.id)
-                }
-                _ => options.id.clone(),
-            },
+        let path = EntryId::from(match prefix {
+            Some(prefix) if !prefix.is_empty() => format!("{prefix}:{}", options.id),
+            _ => options.id.clone(),
         });
         // 子树顶层条目的 parent 为 None：mount 时挂到 RuntimeTree.owner。
         let node_parent = parent.map(EntryId::from);
         let children = if options.group {
-            index_entries(&options.children()?, Some(path.as_str()), prefix, out)?
+            index_entries(
+                catalog,
+                &options.children()?,
+                Some(path.as_str()),
+                prefix,
+                out,
+            )?
         } else {
             Vec::new()
         };
@@ -664,7 +667,14 @@ fn index_entries(
                 options: options.clone(),
                 children,
                 plugin: None,
-                plugin_key: None,
+                definition: if options.group {
+                    crate::GROUP_DEFINITION.clone()
+                } else {
+                    catalog
+                        .definition(&options.name)
+                        .expect("validated factory")
+                        .clone()
+                },
                 binding: None,
                 resolved: None,
             },
@@ -727,6 +737,9 @@ pub(crate) fn plan_reconcile(
             }
         }
 
+        if current.parent != node.parent {
+            rebuild_subtrees.insert(path.clone());
+        }
         if node.options.group {
             let unavailable = current.fiber.as_ref().is_none_or(|fiber| {
                 matches!(fiber.state(), FiberState::Failed | FiberState::Disposed)
@@ -925,14 +938,12 @@ pub(crate) async fn build_plan_plugins(
     plan: &mut ReconcilePlan,
     mounted: &Mutex<BTreeMap<EntryId, RuntimeEntry>>,
     mut prepared: Option<(EntryId, crate::PreparedExtension)>,
+    refresh_unchanged_bindings: bool,
 ) -> Result<(), LoaderError> {
     // 只复制预检元数据，不复制拥有释放语义的 Fiber。调用扩展时不持有条目锁。
     struct BuildEntry {
         binding: Option<Arc<dyn ConfigBinding>>,
         active_fiber: Option<u64>,
-        group: bool,
-        factory: Option<String>,
-        plugin_key: Option<PluginKey>,
     }
     let mounted: BTreeMap<_, _> = mounted
         .lock()
@@ -948,9 +959,6 @@ pub(crate) async fn build_plan_plugins(
                         .as_ref()
                         .filter(|fiber| fiber.state() == FiberState::Active)
                         .map(|fiber| fiber.id()),
-                    group: entry.group,
-                    factory: entry.factory.clone(),
-                    plugin_key: entry.plugin_key,
                 },
             )
         })
@@ -960,7 +968,8 @@ pub(crate) async fn build_plan_plugins(
     }
     let mut candidates = plan.build.clone();
     for (path, entry) in mounted.iter() {
-        if entry.binding.is_some()
+        if refresh_unchanged_bindings
+            && entry.binding.is_some()
             && desired.contains_key(path)
             && !plan.remove.contains(path)
             && !plan.mount.contains(path)
@@ -1049,6 +1058,7 @@ pub(crate) async fn build_plan_plugins(
                         None,
                         plan.required.clone(),
                         false,
+                        true,
                     )
                     .await?;
                 let fiber_id = current
@@ -1096,25 +1106,7 @@ pub(crate) async fn build_plan_plugins(
         if !plan.mount.contains(path) {
             plan.replace.insert(path.clone());
         }
-        let plugin_key = catch_unwind(AssertUnwindSafe(|| plugin.key())).map_err(|payload| {
-            LoaderError::PluginPanic {
-                message: format_panic_message("plugin key", payload),
-            }
-        })?;
-        if let Some(current) = mounted.get(path)
-            && !current.group
-            && current.factory.as_deref() == Some(node.options.name.as_str())
-            && let Some(expected) = current.plugin_key
-            && expected != plugin_key
-        {
-            return Err(LoaderError::PluginKeyChanged {
-                instance: path.to_string(),
-                expected,
-                actual: plugin_key,
-            });
-        }
         node.plugin = Some(plugin);
-        node.plugin_key = Some(plugin_key);
         node.binding = binding;
     }
     Ok(())
@@ -1134,29 +1126,33 @@ fn ancestor_disabled(path: &EntryId, desired: &BTreeMap<EntryId, DesiredNode>) -
     false
 }
 
-fn postorder_among(paths: &BTreeSet<EntryId>, current_order: &[EntryId]) -> Vec<EntryId> {
-    let mut result = current_order
-        .iter()
-        .rev()
-        .filter(|path| paths.contains(path))
-        .cloned()
-        .collect::<Vec<_>>();
-    // 失败 reconcile 可能已插入节点、但尚未来得及提交 order。它们也必须在
-    // 下一次收敛中被释放；按路径深度倒序保证父节点晚于后代处理。
-    let mut unlisted = paths
-        .iter()
-        .filter(|path| !result.contains(path))
-        .cloned()
-        .collect::<Vec<_>>();
-    unlisted.sort_by(|left, right| {
-        right
-            .as_str()
-            .matches(':')
-            .count()
-            .cmp(&left.as_str().matches(':').count())
+pub(crate) fn postorder_among(
+    paths: &BTreeSet<EntryId>,
+    current_order: &[EntryId],
+    mounted: &BTreeMap<EntryId, RuntimeEntry>,
+) -> Vec<EntryId> {
+    let mut result: Vec<_> = paths.iter().cloned().collect();
+    let depth = |path: &EntryId| {
+        let mut depth = 0;
+        let mut parent = mounted.get(path).and_then(|entry| entry.parent.as_ref());
+        while let Some(id) = parent {
+            depth += 1;
+            parent = mounted.get(id).and_then(|entry| entry.parent.as_ref());
+        }
+        depth
+    };
+    // Group 深度来自真实 parent；失败协调中尚未发布 order 的节点也正确后序释放。
+    result.sort_by(|left, right| {
+        depth(right)
+            .cmp(&depth(left))
+            .then_with(|| {
+                current_order
+                    .iter()
+                    .position(|id| id == right)
+                    .cmp(&current_order.iter().position(|id| id == left))
+            })
             .then_with(|| left.cmp(right))
     });
-    result.extend(unlisted);
     result
 }
 
@@ -1164,10 +1160,6 @@ struct GroupPlugin;
 
 #[async_trait]
 impl Plugin for GroupPlugin {
-    fn key(&self) -> PluginKey {
-        PluginKey::new("cordis.loader.group")
-    }
-
     async fn apply(&self, _: &Context) -> Result<(), CoreError> {
         Ok(())
     }
@@ -1191,10 +1183,6 @@ impl ConfiguredPlugin {
 
 #[async_trait]
 impl Plugin for ConfiguredPlugin {
-    fn key(&self) -> PluginKey {
-        self.inner.key()
-    }
-
     fn inject(&self) -> Vec<ServiceId> {
         let mut dependencies = self.dependencies.clone();
         for dependency in self.inner.inject() {
@@ -1219,9 +1207,6 @@ mod tests {
     struct FailedParent;
     #[async_trait]
     impl Plugin for FailedParent {
-        fn key(&self) -> PluginKey {
-            PluginKey::new("failed.parent")
-        }
         async fn apply(&self, _: &Context) -> Result<(), CoreError> {
             Err(CoreError::PluginApply("parent failed".into()))
         }
@@ -1230,7 +1215,12 @@ mod tests {
     #[tokio::test]
     async fn missing_or_failed_parent_never_mounts_descendant_in_root_context() {
         let runtime = Runtime::new().unwrap();
-        let parent = runtime.root().plugin(Arc::new(FailedParent)).await.unwrap();
+        let definition = cordis_core::PluginDefinition::named("failed.parent");
+        let parent = runtime
+            .root()
+            .plugin(&definition, Arc::new(FailedParent))
+            .await
+            .unwrap();
         let tree = RuntimeTree::new_root(ExtensionCatalog::new(), runtime.root()).unwrap();
         tree.entries.lock().unwrap().insert(
             EntryId::from("blocked"),
@@ -1239,7 +1229,7 @@ mod tests {
                 name: "cordis:group".into(),
                 group: true,
                 enabled: true,
-                plugin_key: Some(PluginKey::new("failed.parent")),
+                definition_id: definition.id(),
                 fiber: Some(parent),
                 context: runtime.root(),
                 factory: None,
@@ -1248,7 +1238,7 @@ mod tests {
                 resolved: None,
             },
         );
-        let path = EntryId::from("blocked:child");
+        let path = EntryId::from("child");
         let desired = BTreeMap::from([(
             path.clone(),
             DesiredNode {
@@ -1256,7 +1246,7 @@ mod tests {
                 options: EntryOptions::new("child", "unused"),
                 children: vec![],
                 plugin: None,
-                plugin_key: None,
+                definition: cordis_core::PluginDefinition::anonymous(),
                 binding: None,
                 resolved: None,
             },

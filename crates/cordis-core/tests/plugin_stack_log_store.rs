@@ -8,13 +8,15 @@ mod log_store;
 mod url_redact;
 
 mod keys {
-    use cordis_core::{PluginKey, ServiceKey};
+    use cordis_core::{PluginDefinition, ServiceKey};
 
     use crate::db::Db;
 
     pub static DB: ServiceKey<Db> = ServiceKey::new("demo.stack.db@1");
-    pub static KEY_DB: PluginKey = PluginKey::new("demo.stack.db");
-    pub static KEY_LOG_STORE: PluginKey = PluginKey::new("demo.stack.log-store");
+    pub static KEY_DB: std::sync::LazyLock<PluginDefinition> =
+        std::sync::LazyLock::new(|| PluginDefinition::named("demo.stack.db"));
+    pub static KEY_LOG_STORE: std::sync::LazyLock<PluginDefinition> =
+        std::sync::LazyLock::new(|| PluginDefinition::named("demo.stack.log-store"));
 }
 
 use cordis_core::{FiberState, Runtime};
@@ -41,10 +43,14 @@ fn http_redact_strips_query_and_fragment() {
 #[tokio::test]
 async fn log_store_writes_runtime_logs_into_db() {
     let runtime = Runtime::new().unwrap();
-    let mut db_fiber = runtime.root().plugin(Arc::new(DbPlugin)).await.unwrap();
+    let mut db_fiber = runtime
+        .root()
+        .plugin(&keys::KEY_DB, Arc::new(DbPlugin))
+        .await
+        .unwrap();
     let mut store = runtime
         .root()
-        .plugin(Arc::new(LogStorePlugin))
+        .plugin(&keys::KEY_LOG_STORE, Arc::new(LogStorePlugin))
         .await
         .unwrap();
     runtime.settle().await;
@@ -79,7 +85,7 @@ async fn log_store_pending_without_db() {
     let runtime = Runtime::new().unwrap();
     let mut store = runtime
         .root()
-        .plugin(Arc::new(LogStorePlugin))
+        .plugin(&keys::KEY_LOG_STORE, Arc::new(LogStorePlugin))
         .await
         .unwrap();
     runtime.settle().await;

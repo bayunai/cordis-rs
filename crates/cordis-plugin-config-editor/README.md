@@ -25,7 +25,7 @@ let config = ConfigEditorConfig::new(
 );
 let entry = prepare_root_include("cordis.toml", &config).await?;
 loader.create(entry, None, None).await?;
-ctx.plugin(Arc::new(ConfigEditorPlugin::new(config))).await?;
+ctx.plugin(&cordis_plugin_config_editor::PLUGIN_DEFINITION, Arc::new(ConfigEditorPlugin::new(config))).await?;
 ```
 
 `prepare_root_include` 是独立的异步启动组合函数，不依赖运行中的 ConfigEditor 服务，
@@ -85,4 +85,4 @@ OS 自动释放锁。锁等待也在阻塞任务内，不阻塞异步工作线�
 
 浏览器安全描述与字段操作由 [`cordis-plugin-settings`](../cordis-plugin-settings) 提供。
 
-PluginKey：`cordis.config-editor`。
+共享定义的展示名称：`cordis.config-editor`。

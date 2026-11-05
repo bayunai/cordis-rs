@@ -42,8 +42,7 @@ mod tests {
     };
     use async_trait::async_trait;
     use cordis_core::{
-        Context, CoreError, Fiber, FiberState, FiberStateChange, LogLevel, Plugin, PluginKey,
-        Runtime,
+        Context, CoreError, Fiber, FiberState, FiberStateChange, LogLevel, Plugin, Runtime,
     };
     use schemars::JsonSchema;
     use serde::Deserialize;
@@ -96,15 +95,10 @@ mod tests {
         }
         fn prepare(&self, _: Empty) -> Result<PreparedExtension, LoaderError> {
             let source = self.0.clone();
-            Ok(PreparedExtension::tree(
-                PluginKey::new("event-gap.carrier"),
-                (),
-                (),
-                move |_, _, _| {
-                    let source = source.clone();
-                    async move { Ok(source as Arc<dyn EntryTreeSource>) }
-                },
-            ))
+            Ok(PreparedExtension::tree((), (), move |_, _, _| {
+                let source = source.clone();
+                async move { Ok(source as Arc<dyn EntryTreeSource>) }
+            }))
         }
     }
     struct LeafFactory;
@@ -120,9 +114,6 @@ mod tests {
     }
     #[async_trait]
     impl Plugin for Leaf {
-        fn key(&self) -> PluginKey {
-            PluginKey::new("event-gap.leaf")
-        }
         async fn apply(&self, _: &Context) -> Result<(), CoreError> {
             Ok(())
         }
@@ -131,13 +122,21 @@ mod tests {
     async fn fixture(logs: bool) -> (Runtime, Fiber, Loader) {
         let mut catalog = ExtensionCatalog::new();
         catalog
-            .register(Carrier(Arc::new(TestSource(logs))))
+            .register(
+                &cordis_core::PluginDefinition::anonymous(),
+                Carrier(Arc::new(TestSource(logs))),
+            )
             .unwrap();
-        catalog.register(LeafFactory).unwrap();
+        catalog
+            .register(&cordis_core::PluginDefinition::anonymous(), LeafFactory)
+            .unwrap();
         let runtime = Runtime::new().unwrap();
         let fiber = runtime
             .root()
-            .plugin(Arc::new(LoaderPlugin::new(catalog)))
+            .plugin(
+                &crate::PLUGIN_DEFINITION,
+                Arc::new(LoaderPlugin::new(catalog)),
+            )
             .await
             .unwrap();
         let loader = (*runtime.root().get(LOADER).unwrap()).clone();
@@ -186,7 +185,13 @@ mod tests {
             let before = info_count(&runtime);
             let change = |current| FiberStateChange {
                 fiber_id: id,
-                plugin_key: PluginKey::new("event-gap.leaf"),
+                definition_id: subtree
+                    .snapshot()
+                    .unwrap()
+                    .entry("tree:leaf")
+                    .unwrap()
+                    .definition_id,
+                parent_fiber_id: None,
                 previous: Some(FiberState::Loading),
                 current,
                 unavailable_dependencies: vec![],
@@ -249,7 +254,14 @@ mod tests {
 
         // 真实 Core 卸载经过已有订阅输出一次，不受受控测试通道替代。
         runtime
-            .unmount(PluginKey::new("event-gap.leaf"))
+            .unmount(
+                subtree
+                    .snapshot()
+                    .unwrap()
+                    .entry("tree:leaf")
+                    .unwrap()
+                    .definition_id,
+            )
             .await
             .unwrap();
         wait_until(|| info_count(&runtime) == before + 1).await;

@@ -1,6 +1,6 @@
 //! EntryTree 诊断快照。
 
-use cordis_core::{FiberState, PluginKey};
+use cordis_core::{FiberState, PluginDefinitionId};
 use std::fmt;
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
@@ -32,12 +32,14 @@ pub struct LoaderSnapshot {
 }
 #[derive(Debug, Clone)]
 pub struct EntrySnapshot {
+    /// Include 树前缀与本地 ID 组成的地址，不含 Group 层级。
     pub path: EntryId,
+    /// 真实父 Group，或承载所属树的 Include；不通过地址前缀推导。
     pub parent: Option<EntryId>,
     pub name: String,
     pub group: bool,
     pub enabled: bool,
-    pub plugin_key: Option<PluginKey>,
+    pub definition_id: PluginDefinitionId,
     pub fiber_id: Option<u64>,
     pub state: Option<FiberState>,
     pub last_error: Option<String>,
