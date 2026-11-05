@@ -162,6 +162,7 @@ pub fn assert_service_unavailable<T: Send + Sync + 'static>(ctx: &Context, key: 
     ));
 }
 
-/// TestPlugin 的共享定义；需要独立身份时由测试显式创建其他定义。
-pub static PLUGIN_DEFINITION: std::sync::LazyLock<cordis_core::PluginDefinition> =
-    std::sync::LazyLock::new(|| cordis_core::PluginDefinition::named("testkit.plugin"));
+cordis_core::plugin_definition!(
+    /// TestPlugin 的共享定义；需要独立身份时由测试显式创建其他定义。
+    pub static PLUGIN_DEFINITION = "testkit.plugin";
+);

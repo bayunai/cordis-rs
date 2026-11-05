@@ -62,7 +62,7 @@ Host 在代码中挂根 Include（空根 `cordis.toml`），不使用独立 boot
 
 ## 插件定义
 
-各内置插件 crate 导出 `pub static PLUGIN_DEFINITION: LazyLock<PluginDefinition>`。Host 挂载时显式传入对应定义；名称是可选展示信息，不作为相等或分组依据。Loader 另导出 `GROUP_DEFINITION`，供内存 Group 使用。
+各内置插件 crate 通过 `cordis_core::plugin_definition!(pub static PLUGIN_DEFINITION = "plugin.name";);` 导出共享定义（展开类型仍为 `LazyLock<PluginDefinition>`）。Host 挂载时显式传入对应定义；名称是可选展示信息，不作为相等或分组依据。Loader 另导出 `GROUP_DEFINITION`，供内存 Group 使用。
 
 挂载顺序：Loader → `prepare_root_include(path, &config).await` 组合完整 patches →
 `loader.create(entry, None, None).await` 初次挂载根 Include → `ConfigEditorPlugin::new(config)` →

@@ -45,16 +45,15 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
 ```rust
 use async_trait::async_trait;
-use cordis_core::{Context, CoreError, Plugin, PluginDefinition, Runtime, ServiceKey};
-use std::sync::{Arc, LazyLock};
+use cordis_core::{Context, CoreError, Plugin, Runtime, ServiceKey};
+use std::sync::Arc;
 
 #[derive(Debug)]
 struct Clock;
 
 static CLOCK: ServiceKey<Clock> = ServiceKey::new("example.clock@1");
 
-static CLOCK_DEFINITION: LazyLock<PluginDefinition> =
-    LazyLock::new(|| PluginDefinition::named("example.clock"));
+cordis_core::plugin_definition!(static CLOCK_DEFINITION = "example.clock";);
 
 struct ClockPlugin;
 

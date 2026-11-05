@@ -1,9 +1,9 @@
 //! 最小 Plugin + Service + inject + Event 示例。
 
 use async_trait::async_trait;
-use cordis_core::{Context, CoreError, EventKey, Plugin, PluginDefinition, Runtime, ServiceKey};
+use cordis_core::{Context, CoreError, EventKey, Plugin, Runtime, ServiceKey};
 use cordis_plugin_logger_console::ConsoleLoggerPlugin;
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 
 #[derive(Debug)]
 struct Clock;
@@ -14,8 +14,7 @@ struct Tick(u64);
 static CLOCK: ServiceKey<Clock> = ServiceKey::new("example.clock@1");
 static TICK: EventKey<Tick> = EventKey::new("example.tick@1");
 
-static CLOCK_DEFINITION: LazyLock<PluginDefinition> =
-    LazyLock::new(|| PluginDefinition::named("example.clock"));
+cordis_core::plugin_definition!(static CLOCK_DEFINITION = "example.clock";);
 
 struct ClockPlugin;
 

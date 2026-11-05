@@ -33,8 +33,7 @@ async fn plugin_mount_provides_and_dispose_clears_resources() {
 
 struct FailingPlugin;
 
-static FAILINGPLUGIN_DEFINITION: std::sync::LazyLock<cordis_core::PluginDefinition> =
-    std::sync::LazyLock::new(|| cordis_core::PluginDefinition::named("test.failingplugin"));
+cordis_core::plugin_definition!(static FAILINGPLUGIN_DEFINITION = "test.failingplugin";);
 
 #[async_trait]
 impl Plugin for FailingPlugin {
@@ -59,8 +58,7 @@ struct SettleInApplyPlugin {
     runtime: Runtime,
 }
 
-static SETTLEINAPPLYPLUGIN_DEFINITION: std::sync::LazyLock<cordis_core::PluginDefinition> =
-    std::sync::LazyLock::new(|| cordis_core::PluginDefinition::named("test.settle-in-apply"));
+cordis_core::plugin_definition!(static SETTLEINAPPLYPLUGIN_DEFINITION = "test.settle-in-apply";);
 
 #[async_trait]
 impl Plugin for SettleInApplyPlugin {
@@ -109,8 +107,7 @@ async fn plugin_apply_calling_settle_does_not_deadlock() {
 
 struct PanicApplyPlugin;
 
-static PANICAPPLYPLUGIN_DEFINITION: std::sync::LazyLock<cordis_core::PluginDefinition> =
-    std::sync::LazyLock::new(|| cordis_core::PluginDefinition::named("test.panic-apply"));
+cordis_core::plugin_definition!(static PANICAPPLYPLUGIN_DEFINITION = "test.panic-apply";);
 
 #[async_trait]
 impl Plugin for PanicApplyPlugin {
@@ -127,8 +124,7 @@ struct HealthyAfterPanicPlugin {
     runs: Arc<AtomicUsize>,
 }
 
-static HEALTHYAFTERPANICPLUGIN_DEFINITION: std::sync::LazyLock<cordis_core::PluginDefinition> =
-    std::sync::LazyLock::new(|| cordis_core::PluginDefinition::named("test.healthy-after-panic"));
+cordis_core::plugin_definition!(static HEALTHYAFTERPANICPLUGIN_DEFINITION = "test.healthy-after-panic";);
 
 #[async_trait]
 impl Plugin for HealthyAfterPanicPlugin {
@@ -182,8 +178,7 @@ struct ShutdownInApplyPlugin {
     runtime: Runtime,
 }
 
-static SHUTDOWNINAPPLYPLUGIN_DEFINITION: std::sync::LazyLock<cordis_core::PluginDefinition> =
-    std::sync::LazyLock::new(|| cordis_core::PluginDefinition::named("test.shutdown-in-apply"));
+cordis_core::plugin_definition!(static SHUTDOWNINAPPLYPLUGIN_DEFINITION = "test.shutdown-in-apply";);
 
 #[async_trait]
 impl Plugin for ShutdownInApplyPlugin {
@@ -238,8 +233,7 @@ async fn plugin_apply_shutdown_fails_fast_and_scheduler_continues() {
     runtime.shutdown().await.expect("host shutdown");
 }
 
-static METADATA_KEY: std::sync::LazyLock<cordis_core::PluginDefinition> =
-    std::sync::LazyLock::new(|| cordis_core::PluginDefinition::named("test.metadata"));
+cordis_core::plugin_definition!(static METADATA_KEY = "test.metadata";);
 
 struct ValuePlugin(usize);
 
@@ -319,8 +313,7 @@ async fn plugin_remount_does_not_accumulate_child_scopes() {
         struct TaskPlugin {
             finished: Arc<AtomicUsize>,
         }
-        static TASKPLUGIN_DEFINITION: std::sync::LazyLock<cordis_core::PluginDefinition> =
-            std::sync::LazyLock::new(|| cordis_core::PluginDefinition::named("test.taskplugin"));
+        cordis_core::plugin_definition!(static TASKPLUGIN_DEFINITION = "test.taskplugin";);
 
         #[async_trait]
         impl Plugin for TaskPlugin {
@@ -367,8 +360,7 @@ async fn plugin_dispose_wait_awaits_owned_tasks() {
         cancelled_tx: Mutex<Option<oneshot::Sender<()>>>,
     }
 
-    static WAITPLUGIN_DEFINITION: std::sync::LazyLock<cordis_core::PluginDefinition> =
-        std::sync::LazyLock::new(|| cordis_core::PluginDefinition::named("test.waitplugin"));
+    cordis_core::plugin_definition!(static WAITPLUGIN_DEFINITION = "test.waitplugin";);
 
     #[async_trait]
     impl Plugin for WaitPlugin {
@@ -423,8 +415,7 @@ async fn plugin_hot_replace_after_dispose_wait() {
         finished: Arc<AtomicBool>,
     }
 
-    static PLUGINA_DEFINITION: std::sync::LazyLock<cordis_core::PluginDefinition> =
-        std::sync::LazyLock::new(|| cordis_core::PluginDefinition::named("test.plugina"));
+    cordis_core::plugin_definition!(static PLUGINA_DEFINITION = "test.plugina";);
 
     #[async_trait]
     impl Plugin for PluginA {
@@ -443,8 +434,7 @@ async fn plugin_hot_replace_after_dispose_wait() {
 
     struct PluginB;
 
-    static PLUGINB_DEFINITION: std::sync::LazyLock<cordis_core::PluginDefinition> =
-        std::sync::LazyLock::new(|| cordis_core::PluginDefinition::named("test.pluginb"));
+    cordis_core::plugin_definition!(static PLUGINB_DEFINITION = "test.pluginb";);
 
     #[async_trait]
     impl Plugin for PluginB {
@@ -489,8 +479,7 @@ async fn plugin_apply_races_parent_dispose_returns_no_handle() {
         gate: Arc<Mutex<Option<oneshot::Receiver<()>>>>,
     }
 
-    static SLOWPLUGIN_DEFINITION: std::sync::LazyLock<cordis_core::PluginDefinition> =
-        std::sync::LazyLock::new(|| cordis_core::PluginDefinition::named("test.slowplugin"));
+    cordis_core::plugin_definition!(static SLOWPLUGIN_DEFINITION = "test.slowplugin";);
 
     #[async_trait]
     impl Plugin for SlowPlugin {
@@ -537,8 +526,7 @@ async fn isolation_provider_change_reactivates_plugin_fiber() {
     provider.provide(NUMBER, Number(1)).unwrap();
 
     struct DepPlugin;
-    static DEPPLUGIN_DEFINITION: std::sync::LazyLock<cordis_core::PluginDefinition> =
-        std::sync::LazyLock::new(|| cordis_core::PluginDefinition::named("test.depplugin"));
+    cordis_core::plugin_definition!(static DEPPLUGIN_DEFINITION = "test.depplugin";);
 
     #[async_trait]
     impl Plugin for DepPlugin {
@@ -572,10 +560,7 @@ async fn isolation_provider_change_reactivates_plugin_fiber() {
 
 #[tokio::test]
 async fn definition_groups_and_unmount_waits() {
-    use cordis_core::PluginDefinition;
-
-    static KEY: std::sync::LazyLock<PluginDefinition> =
-        std::sync::LazyLock::new(|| PluginDefinition::named("test.registry.group"));
+    cordis_core::plugin_definition!(static KEY = "test.registry.group";);
     let runtime = runtime();
     let root = runtime.root();
     let finished = Arc::new(AtomicUsize::new(0));
@@ -637,10 +622,7 @@ async fn definition_groups_and_unmount_waits() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn unmount_rejects_concurrent_mount_for_shared_definition() {
-    use cordis_core::PluginDefinition;
-
-    static KEY_A: std::sync::LazyLock<PluginDefinition> =
-        std::sync::LazyLock::new(|| PluginDefinition::named("test.registry.a"));
+    cordis_core::plugin_definition!(static KEY_A = "test.registry.a";);
 
     let (gate_tx, gate_rx) = oneshot::channel::<()>();
     let gate_rx = Arc::new(Mutex::new(Some(gate_rx)));
@@ -726,10 +708,7 @@ async fn unmount_rejects_concurrent_mount_for_shared_definition() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cancelled_unmount_waiter_does_not_leave_plugin_group_locked() {
-    use cordis_core::PluginDefinition;
-
-    static KEY: std::sync::LazyLock<PluginDefinition> =
-        std::sync::LazyLock::new(|| PluginDefinition::named("test.unmount-cancel-safe"));
+    cordis_core::plugin_definition!(static KEY = "test.unmount-cancel-safe";);
 
     struct GatePlugin {
         entered: Arc<Mutex<Option<oneshot::Sender<()>>>>,
@@ -814,10 +793,7 @@ async fn cancelled_unmount_waiter_does_not_leave_plugin_group_locked() {
 
 #[tokio::test]
 async fn plugin_dispose_clears_registry_index() {
-    use cordis_core::PluginDefinition;
-
-    static KEY: std::sync::LazyLock<PluginDefinition> =
-        std::sync::LazyLock::new(|| PluginDefinition::named("test.registry.solo"));
+    cordis_core::plugin_definition!(static KEY = "test.registry.solo";);
     struct Solo;
     #[async_trait]
     impl Plugin for Solo {
@@ -850,10 +826,7 @@ async fn plugin_dispose_clears_registry_index() {
 
 #[tokio::test]
 async fn unmount_and_shutdown_return_dispose_errors_after_cleanup() {
-    use cordis_core::PluginDefinition;
-
-    static KEY: std::sync::LazyLock<PluginDefinition> =
-        std::sync::LazyLock::new(|| PluginDefinition::named("test.async.dispose.unmount"));
+    cordis_core::plugin_definition!(static KEY = "test.async.dispose.unmount";);
     let runtime = runtime();
     let root = runtime.root();
 
@@ -891,10 +864,7 @@ async fn unmount_and_shutdown_return_dispose_errors_after_cleanup() {
 
 #[tokio::test]
 async fn unmount_self_from_apply_returns_unmount_reentrant() {
-    use cordis_core::PluginDefinition;
-
-    static KEY: std::sync::LazyLock<PluginDefinition> =
-        std::sync::LazyLock::new(|| PluginDefinition::named("test.unmount-self-apply"));
+    cordis_core::plugin_definition!(static KEY = "test.unmount-self-apply";);
     let runtime = runtime();
     let root = runtime.root();
     let runtime_for_plugin = runtime.clone();
@@ -929,12 +899,8 @@ async fn unmount_self_from_apply_returns_unmount_reentrant() {
 
 #[tokio::test]
 async fn unmount_unrelated_key_from_apply_succeeds() {
-    use cordis_core::PluginDefinition;
-
-    static SELF_KEY: std::sync::LazyLock<PluginDefinition> =
-        std::sync::LazyLock::new(|| PluginDefinition::named("test.unmount-unrelated-self"));
-    static OTHER_KEY: std::sync::LazyLock<PluginDefinition> =
-        std::sync::LazyLock::new(|| PluginDefinition::named("test.unmount-unrelated-other"));
+    cordis_core::plugin_definition!(static SELF_KEY = "test.unmount-unrelated-self";);
+    cordis_core::plugin_definition!(static OTHER_KEY = "test.unmount-unrelated-other";);
     let runtime = runtime();
     let root = runtime.root();
 
@@ -984,10 +950,7 @@ async fn unmount_unrelated_key_from_apply_succeeds() {
 
 #[tokio::test]
 async fn unmount_self_from_inject_spawn_and_async_disposer_returns_reentrant() {
-    use cordis_core::PluginDefinition;
-
-    static KEY: std::sync::LazyLock<PluginDefinition> =
-        std::sync::LazyLock::new(|| PluginDefinition::named("test.unmount-self-lifecycle"));
+    cordis_core::plugin_definition!(static KEY = "test.unmount-self-lifecycle";);
     let runtime = runtime();
     let root = runtime.root();
     root.provide(NUMBER, Number(1)).unwrap();
@@ -1077,10 +1040,7 @@ async fn unmount_self_from_inject_spawn_and_async_disposer_returns_reentrant() {
 
 #[tokio::test]
 async fn dispose_now_async_disposer_unmount_self_returns_reentrant() {
-    use cordis_core::PluginDefinition;
-
-    static KEY: std::sync::LazyLock<PluginDefinition> =
-        std::sync::LazyLock::new(|| PluginDefinition::named("test.dispose-now-unmount-self"));
+    cordis_core::plugin_definition!(static KEY = "test.dispose-now-unmount-self";);
     let runtime = runtime();
     let root = runtime.root();
     let runtime_clone = runtime.clone();
@@ -1171,13 +1131,8 @@ async fn dispose_now_async_disposer_unmount_self_returns_reentrant() {
 
 #[tokio::test]
 async fn dispose_now_async_disposer_can_unmount_unrelated_definition() {
-    use cordis_core::PluginDefinition;
-
-    static SELF_KEY: std::sync::LazyLock<PluginDefinition> =
-        std::sync::LazyLock::new(|| PluginDefinition::named("test.dispose-now-unmount-other-self"));
-    static OTHER_KEY: std::sync::LazyLock<PluginDefinition> = std::sync::LazyLock::new(|| {
-        PluginDefinition::named("test.dispose-now-unmount-other-target")
-    });
+    cordis_core::plugin_definition!(static SELF_KEY = "test.dispose-now-unmount-other-self";);
+    cordis_core::plugin_definition!(static OTHER_KEY = "test.dispose-now-unmount-other-target";);
     let runtime = runtime();
     let root = runtime.root();
 

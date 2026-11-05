@@ -152,8 +152,7 @@ struct LoggingPlugin {
     records: Arc<Mutex<Vec<LogRecord>>>,
 }
 
-static LOGGINGPLUGIN_DEFINITION: std::sync::LazyLock<cordis_core::PluginDefinition> =
-    std::sync::LazyLock::new(|| cordis_core::PluginDefinition::named("demo.logger.plugin"));
+cordis_core::plugin_definition!(static LOGGINGPLUGIN_DEFINITION = "demo.logger.plugin";);
 
 #[async_trait]
 impl Plugin for LoggingPlugin {

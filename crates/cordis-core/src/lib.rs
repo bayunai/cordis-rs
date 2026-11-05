@@ -13,6 +13,7 @@ mod event;
 mod fiber;
 mod isolation;
 mod logger;
+mod macros;
 mod plugin;
 mod registry;
 mod runtime;

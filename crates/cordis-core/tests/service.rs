@@ -359,8 +359,7 @@ async fn key_type_conflict_across_plugins() {
     a.dispose();
 
     struct OtherPlugin;
-    static OTHERPLUGIN_DEFINITION: std::sync::LazyLock<cordis_core::PluginDefinition> =
-        std::sync::LazyLock::new(|| cordis_core::PluginDefinition::named("test.otherplugin"));
+    cordis_core::plugin_definition!(static OTHERPLUGIN_DEFINITION = "test.otherplugin";);
 
     #[async_trait]
     impl Plugin for OtherPlugin {

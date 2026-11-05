@@ -129,8 +129,7 @@ async fn checked_provider_handle_fails_after_owner_scope_is_disposed() {
 async fn provider_from_loading_plugin_is_only_available_after_plugin_becomes_active() {
     struct SelfProviding;
 
-    static SELFPROVIDING_DEFINITION: std::sync::LazyLock<cordis_core::PluginDefinition> =
-        std::sync::LazyLock::new(|| cordis_core::PluginDefinition::named("test.self-providing@1"));
+    cordis_core::plugin_definition!(static SELFPROVIDING_DEFINITION = "test.self-providing@1";);
 
     #[async_trait]
     impl Plugin for SelfProviding {
@@ -193,10 +192,7 @@ async fn checked_provider_drives_plugin_pending_unload_and_reactivation() {
         runs: Arc<AtomicUsize>,
     }
 
-    static CONSUMER_DEFINITION: std::sync::LazyLock<cordis_core::PluginDefinition> =
-        std::sync::LazyLock::new(|| {
-            cordis_core::PluginDefinition::named("test.checked-provider-consumer@1")
-        });
+    cordis_core::plugin_definition!(static CONSUMER_DEFINITION = "test.checked-provider-consumer@1";);
 
     #[async_trait]
     impl Plugin for Consumer {

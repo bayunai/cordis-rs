@@ -45,6 +45,7 @@ impl Plugin for GreetingPlugin {
     }
 }
 
-/// 示例插件的共享定义。
-pub static PLUGIN_DEFINITION: std::sync::LazyLock<cordis_core::PluginDefinition> =
-    std::sync::LazyLock::new(|| cordis_core::PluginDefinition::named("demo.greeting"));
+cordis_core::plugin_definition!(
+    /// 示例插件的共享定义。
+    pub static PLUGIN_DEFINITION = "demo.greeting";
+);

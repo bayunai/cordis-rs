@@ -254,8 +254,7 @@ async fn intercept_type_conflict_and_plugin_can_read_config() {
     ));
 
     struct ConfigReader;
-    static CONFIGREADER_DEFINITION: std::sync::LazyLock<cordis_core::PluginDefinition> =
-        std::sync::LazyLock::new(|| cordis_core::PluginDefinition::named("test.configreader"));
+    cordis_core::plugin_definition!(static CONFIGREADER_DEFINITION = "test.configreader";);
 
     #[async_trait]
     impl Plugin for ConfigReader {

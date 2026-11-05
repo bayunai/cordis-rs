@@ -46,8 +46,7 @@ async fn fiber_restart_and_replace_wait_for_tasks() {
         finished: Arc<AtomicBool>,
         value: usize,
     }
-    static TASKFUL_DEFINITION: std::sync::LazyLock<cordis_core::PluginDefinition> =
-        std::sync::LazyLock::new(|| cordis_core::PluginDefinition::named("test.taskful"));
+    cordis_core::plugin_definition!(static TASKFUL_DEFINITION = "test.taskful";);
 
     #[async_trait]
     impl Plugin for Taskful {
@@ -102,8 +101,7 @@ async fn fiber_restart_and_replace_wait_for_tasks() {
 async fn fiber_state_subscription_reports_ordered_lifecycle_transitions() {
     struct NoopPlugin;
 
-    static NOOPPLUGIN_DEFINITION: std::sync::LazyLock<cordis_core::PluginDefinition> =
-        std::sync::LazyLock::new(|| cordis_core::PluginDefinition::named("test.lifecycle-events"));
+    cordis_core::plugin_definition!(static NOOPPLUGIN_DEFINITION = "test.lifecycle-events";);
 
     #[async_trait]
     impl Plugin for NoopPlugin {
@@ -157,8 +155,7 @@ async fn fiber_state_subscription_reports_ordered_lifecycle_transitions() {
 async fn state_subscriber_reports_lag_and_diagnostics_remain_available() {
     struct NoopPlugin;
 
-    static NOOPPLUGIN_DEFINITION: std::sync::LazyLock<cordis_core::PluginDefinition> =
-        std::sync::LazyLock::new(|| cordis_core::PluginDefinition::named("test.lifecycle-lag"));
+    cordis_core::plugin_definition!(static NOOPPLUGIN_DEFINITION = "test.lifecycle-lag";);
 
     #[async_trait]
     impl Plugin for NoopPlugin {
@@ -197,10 +194,7 @@ async fn provider_rebind_waits_for_old_plugin_effect_before_reactivation() {
         release: Arc<Mutex<Option<oneshot::Receiver<()>>>>,
     }
 
-    static GATEDDEPENDENTPLUGIN_DEFINITION: std::sync::LazyLock<cordis_core::PluginDefinition> =
-        std::sync::LazyLock::new(|| {
-            cordis_core::PluginDefinition::named("test.rebind-waits-for-unload")
-        });
+    cordis_core::plugin_definition!(static GATEDDEPENDENTPLUGIN_DEFINITION = "test.rebind-waits-for-unload";);
 
     #[async_trait]
     impl Plugin for GatedDependentPlugin {
@@ -279,8 +273,7 @@ async fn concurrent_mount_and_scheduler_apply_once() {
         gate: Arc<Mutex<Option<oneshot::Receiver<()>>>>,
     }
 
-    static GATEDPLUGIN_DEFINITION: std::sync::LazyLock<cordis_core::PluginDefinition> =
-        std::sync::LazyLock::new(|| cordis_core::PluginDefinition::named("test.gatedplugin"));
+    cordis_core::plugin_definition!(static GATEDPLUGIN_DEFINITION = "test.gatedplugin";);
 
     #[async_trait]
     impl Plugin for GatedPlugin {
@@ -367,10 +360,7 @@ async fn initial_mount_not_preempted_by_inflight_scheduler() {
         apply_count: Arc<AtomicUsize>,
     }
 
-    static COUNTINGDEPPLUGIN_DEFINITION: std::sync::LazyLock<cordis_core::PluginDefinition> =
-        std::sync::LazyLock::new(|| {
-            cordis_core::PluginDefinition::named("test.initial-mount-no-preempt")
-        });
+    cordis_core::plugin_definition!(static COUNTINGDEPPLUGIN_DEFINITION = "test.initial-mount-no-preempt";);
 
     #[async_trait]
     impl Plugin for CountingDepPlugin {
@@ -450,8 +440,7 @@ async fn provider_revoked_during_loading_does_not_stick_active() {
         gate: Arc<Mutex<Option<oneshot::Receiver<()>>>>,
     }
 
-    static GATEDDEPPLUGIN_DEFINITION: std::sync::LazyLock<cordis_core::PluginDefinition> =
-        std::sync::LazyLock::new(|| cordis_core::PluginDefinition::named("test.gateddepplugin"));
+    cordis_core::plugin_definition!(static GATEDDEPPLUGIN_DEFINITION = "test.gateddepplugin";);
 
     #[async_trait]
     impl Plugin for GatedDepPlugin {
@@ -516,8 +505,7 @@ async fn provider_replaced_during_loading_reactivates_with_fresh() {
         seen: Arc<AtomicUsize>,
     }
 
-    static GATEDDEPPLUGIN_DEFINITION: std::sync::LazyLock<cordis_core::PluginDefinition> =
-        std::sync::LazyLock::new(|| cordis_core::PluginDefinition::named("test.gateddepplugin"));
+    cordis_core::plugin_definition!(static GATEDDEPPLUGIN_DEFINITION = "test.gateddepplugin";);
 
     #[async_trait]
     impl Plugin for GatedDepPlugin {
@@ -584,8 +572,7 @@ async fn restart_during_parent_dispose_keeps_disposed() {
         finished: Arc<AtomicBool>,
     }
 
-    static SLOWDISPOSEPLUGIN_DEFINITION: std::sync::LazyLock<cordis_core::PluginDefinition> =
-        std::sync::LazyLock::new(|| cordis_core::PluginDefinition::named("test.slowdisposeplugin"));
+    cordis_core::plugin_definition!(static SLOWDISPOSEPLUGIN_DEFINITION = "test.slowdisposeplugin";);
 
     #[async_trait]
     impl Plugin for SlowDisposePlugin {
@@ -650,8 +637,7 @@ async fn replace_during_parent_dispose_keeps_disposed_and_skips_new_plugin() {
         release: Arc<Mutex<Option<oneshot::Receiver<()>>>>,
     }
 
-    static SLOWDISPOSEPLUGIN_DEFINITION: std::sync::LazyLock<cordis_core::PluginDefinition> =
-        std::sync::LazyLock::new(|| cordis_core::PluginDefinition::named("test.slowdisposeplugin"));
+    cordis_core::plugin_definition!(static SLOWDISPOSEPLUGIN_DEFINITION = "test.slowdisposeplugin";);
 
     #[async_trait]
     impl Plugin for SlowDisposePlugin {
@@ -724,10 +710,7 @@ async fn replace_during_parent_dispose_keeps_disposed_and_skips_new_plugin() {
 
 #[tokio::test]
 async fn fiber_restart_stops_on_async_dispose_failure() {
-    use cordis_core::PluginDefinition;
-
-    static KEY: std::sync::LazyLock<PluginDefinition> =
-        std::sync::LazyLock::new(|| PluginDefinition::named("test.async.dispose.restart"));
+    cordis_core::plugin_definition!(static KEY = "test.async.dispose.restart";);
     let runtime = runtime();
     let root = runtime.root();
     let apply_count = Arc::new(AtomicUsize::new(0));
@@ -767,10 +750,7 @@ async fn fiber_restart_stops_on_async_dispose_failure() {
 
 #[tokio::test]
 async fn fiber_replace_stops_on_async_dispose_failure() {
-    use cordis_core::PluginDefinition;
-
-    static KEY: std::sync::LazyLock<PluginDefinition> =
-        std::sync::LazyLock::new(|| PluginDefinition::named("test.async.dispose.replace"));
+    cordis_core::plugin_definition!(static KEY = "test.async.dispose.replace";);
     let runtime = runtime();
     let root = runtime.root();
     let apply_count = Arc::new(AtomicUsize::new(0));
@@ -826,10 +806,7 @@ async fn fiber_replace_stops_on_async_dispose_failure() {
 
 #[tokio::test]
 async fn provider_recompute_marks_failed_when_async_dispose_errors() {
-    use cordis_core::PluginDefinition;
-
-    static KEY: std::sync::LazyLock<PluginDefinition> =
-        std::sync::LazyLock::new(|| PluginDefinition::named("test.async.dispose.provider"));
+    cordis_core::plugin_definition!(static KEY = "test.async.dispose.provider";);
     let runtime = runtime();
     let root = runtime.root();
     let apply_count = Arc::new(AtomicUsize::new(0));
@@ -884,10 +861,7 @@ async fn provider_recompute_marks_failed_when_async_dispose_errors() {
 
 #[tokio::test]
 async fn cancelled_restart_coordinator_converges_without_second_restart() {
-    use cordis_core::PluginDefinition;
-
-    static KEY: std::sync::LazyLock<PluginDefinition> =
-        std::sync::LazyLock::new(|| PluginDefinition::named("test.cancelled-restart"));
+    cordis_core::plugin_definition!(static KEY = "test.cancelled-restart";);
     let runtime = runtime();
     let root = runtime.root();
     let (cancelled_tx, mut cancelled_rx) = oneshot::channel::<()>();
@@ -951,10 +925,7 @@ async fn cancelled_restart_coordinator_converges_without_second_restart() {
 
 #[tokio::test]
 async fn cancelled_replace_coordinator_converges_to_new_plugin() {
-    use cordis_core::PluginDefinition;
-
-    static KEY: std::sync::LazyLock<PluginDefinition> =
-        std::sync::LazyLock::new(|| PluginDefinition::named("test.cancelled-replace"));
+    cordis_core::plugin_definition!(static KEY = "test.cancelled-replace";);
     let runtime = runtime();
     let root = runtime.root();
     let (gate_tx, gate_rx) = oneshot::channel::<()>();
@@ -1028,10 +999,7 @@ async fn cancelled_replace_coordinator_converges_to_new_plugin() {
 
 #[tokio::test]
 async fn cancelled_initial_plugin_mount_revokes_fiber() {
-    use cordis_core::PluginDefinition;
-
-    static KEY: std::sync::LazyLock<PluginDefinition> =
-        std::sync::LazyLock::new(|| PluginDefinition::named("test.cancelled-initial-mount"));
+    cordis_core::plugin_definition!(static KEY = "test.cancelled-initial-mount";);
     let runtime = runtime();
     let root = runtime.root();
     let (entered_tx, entered_rx) = oneshot::channel::<()>();
@@ -1112,10 +1080,8 @@ async fn cancelled_initial_plugin_mount_revokes_fiber() {
 async fn cancelled_initial_mount_before_apply_revokes_without_apply() {
     // 覆盖「abandon 已置位且 apply 尚未开始」：见 `activate::initial_mount_revoke_tests`。
     // 此处用门控 apply 验证调用方取消后不提交服务（温和：等 apply 返回再撤销）。
-    use cordis_core::PluginDefinition;
 
-    static KEY: std::sync::LazyLock<PluginDefinition> =
-        std::sync::LazyLock::new(|| PluginDefinition::named("test.cancelled-initial-before-apply"));
+    cordis_core::plugin_definition!(static KEY = "test.cancelled-initial-before-apply";);
     let runtime = runtime();
     let root = runtime.root();
     let (entered_tx, entered_rx) = oneshot::channel::<()>();
@@ -1180,10 +1146,7 @@ async fn cancelled_initial_mount_before_apply_revokes_without_apply() {
 
 #[tokio::test]
 async fn unload_registers_pending_wait_for_concurrent_unmount_reentry() {
-    use cordis_core::PluginDefinition;
-
-    static KEY: std::sync::LazyLock<PluginDefinition> =
-        std::sync::LazyLock::new(|| PluginDefinition::named("test.unload-pending-wait-reentry"));
+    cordis_core::plugin_definition!(static KEY = "test.unload-pending-wait-reentry";);
     let runtime = runtime();
     let root = runtime.root();
     let runtime_clone = runtime.clone();
@@ -1262,10 +1225,7 @@ async fn unload_registers_pending_wait_for_concurrent_unmount_reentry() {
 
 #[tokio::test]
 async fn fiber_dispose_then_dispose_wait_preserves_async_errors() {
-    use cordis_core::PluginDefinition;
-
-    static KEY: std::sync::LazyLock<PluginDefinition> =
-        std::sync::LazyLock::new(|| PluginDefinition::named("test.async.dispose.then.wait"));
+    cordis_core::plugin_definition!(static KEY = "test.async.dispose.then.wait";);
     let runtime = runtime();
     let root = runtime.root();
 
@@ -1290,10 +1250,7 @@ async fn fiber_dispose_then_dispose_wait_preserves_async_errors() {
 
 #[tokio::test]
 async fn delayed_dispose_wait_after_dispose_preserves_async_errors() {
-    use cordis_core::PluginDefinition;
-
-    static KEY: std::sync::LazyLock<PluginDefinition> =
-        std::sync::LazyLock::new(|| PluginDefinition::named("test.delayed.dispose.wait.error"));
+    cordis_core::plugin_definition!(static KEY = "test.delayed.dispose.wait.error";);
     let runtime = runtime();
     let root = runtime.root();
     let (entered_tx, entered_rx) = oneshot::channel::<()>();
@@ -1363,10 +1320,7 @@ async fn delayed_dispose_wait_after_dispose_preserves_async_errors() {
 
 #[tokio::test]
 async fn dispose_during_unload_keeps_registry_until_release_finishes() {
-    use cordis_core::PluginDefinition;
-
-    static KEY: std::sync::LazyLock<PluginDefinition> =
-        std::sync::LazyLock::new(|| PluginDefinition::named("test.dispose-during-unload"));
+    cordis_core::plugin_definition!(static KEY = "test.dispose-during-unload";);
     let runtime = runtime();
     let root = runtime.root();
     let (entered_tx, entered_rx) = oneshot::channel::<()>();
@@ -1461,10 +1415,7 @@ async fn dispose_during_unload_keeps_registry_until_release_finishes() {
 // P1-1: Loading 期 unmount 等待 Activating Scope 的 DisposeCompletion，完成前保留 definitions。
 #[tokio::test]
 async fn p1_unmount_during_loading_waits_for_pending_effect_disposer() {
-    use cordis_core::PluginDefinition;
-
-    static KEY: std::sync::LazyLock<PluginDefinition> =
-        std::sync::LazyLock::new(|| PluginDefinition::named("test.p1.loading-pending-effect"));
+    cordis_core::plugin_definition!(static KEY = "test.p1.loading-pending-effect";);
     let runtime = runtime();
     let root = runtime.root();
     let (apply_entered_tx, apply_entered_rx) = oneshot::channel::<()>();
@@ -1597,10 +1548,7 @@ async fn p1_unmount_during_loading_waits_for_pending_effect_disposer() {
 // （更窄的「revoke 检查之后、commit 之前」窗口需内部 hook，本测覆盖可稳定复现的公开路径。）
 #[tokio::test]
 async fn p1_abandon_while_apply_gated_before_return_leaves_no_orphan() {
-    use cordis_core::PluginDefinition;
-
-    static KEY: std::sync::LazyLock<PluginDefinition> =
-        std::sync::LazyLock::new(|| PluginDefinition::named("test.p1.abandon-toctou"));
+    cordis_core::plugin_definition!(static KEY = "test.p1.abandon-toctou";);
     let runtime = runtime();
     let root = runtime.root();
     let (ready_tx, ready_rx) = oneshot::channel::<()>();

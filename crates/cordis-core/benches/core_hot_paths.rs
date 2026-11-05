@@ -1,12 +1,11 @@
 use async_trait::async_trait;
 use cordis_core::{
-    Context, CoreError, EventKey, Plugin, PluginDefinition, ProviderAvailability, Runtime,
-    SerialKey, ServiceKey,
+    Context, CoreError, EventKey, Plugin, ProviderAvailability, Runtime, SerialKey, ServiceKey,
 };
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 use std::{
     sync::{
-        Arc, LazyLock,
+        Arc,
         atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
@@ -15,8 +14,7 @@ use std::{
 const COUNTER: ServiceKey<u64> = ServiceKey::new("bench.counter");
 const OBSERVE: EventKey<u64> = EventKey::new("bench.observe");
 const DECIDE: SerialKey<u64, u64> = SerialKey::new("bench.decide");
-static BATCH_DEFINITION: LazyLock<PluginDefinition> =
-    LazyLock::new(|| PluginDefinition::named("bench.lifecycle.noop@1"));
+cordis_core::plugin_definition!(static BATCH_DEFINITION = "bench.lifecycle.noop@1";);
 const CONSUMER_DEPENDENCY: ServiceKey<u64> = ServiceKey::new("bench.lifecycle.dependency");
 
 struct NoopPlugin;

@@ -17,6 +17,8 @@
 
 ### 新增
 
+- 增加 `cordis_core::plugin_definition!` 声明宏，统一静态具名定义的写法，支持文档、属性、可见性与函数内声明。宏展开为既有 `LazyLock<PluginDefinition>`，身份、挂载、依赖及生命周期语义不变；动态与匿名定义继续使用现有构造接口。
+
 - 显式注入按 Provider 实例与消费者执行 Scope 建立生命周期绑定，覆盖 Loading、Active、失败清理与在途卸载；提供者等待消费者全部清理完成后才取消任务和释放资源，适用于普通 Effect、插件重启替换、批量卸载与 Runtime shutdown。
 - 新增 `DependencyCycle { scopes }` 与 `LifecycleReentrant { scope }` 错误；`unmount` 的专用重入检查覆盖跨树服务依赖。
 - Loader 支持跨 Include 移动条目及 Group 同树成员。两侧全量预检后协调运行时，按目标、源顺序写回；目标写入失败不写源，`LoaderControlError::Move` 与 `MovePersistence` 分别报告实际快照、生命周期错误和两侧持久化状态；同树移动也使用该错误且只写所属来源一次。不回滚已发生的变更，取消等待不取消协调。

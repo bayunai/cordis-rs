@@ -15,6 +15,7 @@ pub use cordis_plugin_config_editor::{
     ConfigReadOnlyReason,
 };
 
-/// 此插件的共享定义；展示名称不参与身份比较。
-pub static PLUGIN_DEFINITION: std::sync::LazyLock<cordis_core::PluginDefinition> =
-    std::sync::LazyLock::new(|| cordis_core::PluginDefinition::named("cordis.settings"));
+cordis_core::plugin_definition!(
+    /// 此插件的共享定义；展示名称不参与身份比较。
+    pub static PLUGIN_DEFINITION = "cordis.settings";
+);

@@ -473,10 +473,9 @@ mod initial_mount_revoke_tests {
 
     #[tokio::test]
     async fn p1_ready_for_handle_abandon_leaves_no_orphan() {
-        use crate::{PluginDefinition, Runtime, ServiceKey};
+        use crate::{Runtime, ServiceKey};
 
-        static KEY: std::sync::LazyLock<PluginDefinition> =
-            std::sync::LazyLock::new(|| PluginDefinition::named("test.p1.ready-for-handle"));
+        crate::plugin_definition!(static KEY = "test.p1.ready-for-handle";);
         static VALUE: ServiceKey<u64> = ServiceKey::new("test.p1.ready-for-handle.n@1");
 
         struct ProvidePlugin;

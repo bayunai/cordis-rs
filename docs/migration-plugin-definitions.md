@@ -6,10 +6,8 @@
 
 ```rust
 use cordis_core::PluginDefinition;
-use std::sync::LazyLock;
 
-pub static PLUGIN_DEFINITION: LazyLock<PluginDefinition> =
-    LazyLock::new(|| PluginDefinition::named("app.storage"));
+cordis_core::plugin_definition!(pub static PLUGIN_DEFINITION = "app.storage";);
 
 let shared = PLUGIN_DEFINITION.clone();
 assert_eq!(shared.id(), PLUGIN_DEFINITION.id());
@@ -18,6 +16,8 @@ assert_ne!(another.id(), PLUGIN_DEFINITION.id());
 let anonymous = PluginDefinition::anonymous();
 assert!(anonymous.name().is_none());
 ```
+
+静态共享定义推荐使用 `cordis_core::plugin_definition!`，可保留文档、属性和可见性，调用方不必导入 `LazyLock` 或 `PluginDefinition`。宏只封装已有静态初始化方式：每个声明身份独立，Clone 共享身份。运行时名称继续使用 `PluginDefinition::named()`，匿名注入仍由 Core 自动创建定义，不使用声明宏。
 
 `name()` 仅用于展示；同名独立定义不是同一身份。Definition 可以跨 Runtime 复用，`Runtime::unmount(definition.id())` 只影响调用它的 Runtime。`PluginDefinitionId` 支持 Copy、相等比较、排序、Hash、Display；需要数值传输时调用 `as_u64()`。名称和进程内 Definition ID 均不应被当作配置文件中的插件寻址协议。
 

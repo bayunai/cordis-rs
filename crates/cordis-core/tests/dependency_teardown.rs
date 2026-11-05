@@ -1,9 +1,7 @@
 //! 显式依赖保护实际服务资源直到消费者执行、清理和任务全部结束。
 
 use async_trait::async_trait;
-use cordis_core::{
-    Context, CoreError, EffectContext, Plugin, PluginDefinition, Runtime, ServiceId, ServiceKey,
-};
+use cordis_core::{Context, CoreError, EffectContext, Plugin, Runtime, ServiceId, ServiceKey};
 use std::{
     future::Future,
     sync::{
@@ -18,8 +16,7 @@ static RESOURCE: ServiceKey<Resource> = ServiceKey::new("test.teardown.resource@
 static LEFT: ServiceKey<Resource> = ServiceKey::new("test.teardown.left@1");
 static RIGHT: ServiceKey<Resource> = ServiceKey::new("test.teardown.right@1");
 static INDEPENDENT: ServiceKey<Resource> = ServiceKey::new("test.teardown.independent@1");
-static PROVIDER_KEY: std::sync::LazyLock<PluginDefinition> =
-    std::sync::LazyLock::new(|| PluginDefinition::named("test.teardown.provider"));
+cordis_core::plugin_definition!(static PROVIDER_KEY = "test.teardown.provider";);
 
 #[derive(Default)]
 struct ResourceState {
@@ -182,8 +179,7 @@ struct Consumer {
     gates: Arc<Gates>,
 }
 
-static CONSUMER_DEFINITION: std::sync::LazyLock<cordis_core::PluginDefinition> =
-    std::sync::LazyLock::new(|| cordis_core::PluginDefinition::named("test.teardown.consumer"));
+cordis_core::plugin_definition!(static CONSUMER_DEFINITION = "test.teardown.consumer";);
 
 #[async_trait]
 impl Plugin for Consumer {

@@ -29,7 +29,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     convert::Infallible,
     sync::{
-        Arc, LazyLock, Mutex,
+        Arc, Mutex,
         atomic::{AtomicU32, AtomicU64, Ordering},
     },
     time::Duration,
@@ -52,12 +52,9 @@ static GREETING: ServiceKey<Greeting> = ServiceKey::new("demo.greeting@1");
 static COUNTER: ServiceKey<Counter> = ServiceKey::new("demo.counter@1");
 static NOTE: EventKey<String> = EventKey::new("demo.note@1");
 
-static DEFINITION_NOTE: LazyLock<PluginDefinition> =
-    LazyLock::new(|| PluginDefinition::named("demo.note"));
-static DEFINITION_GREETER: LazyLock<PluginDefinition> =
-    LazyLock::new(|| PluginDefinition::named("demo.greeter"));
-static DEFINITION_COUNTER: LazyLock<PluginDefinition> =
-    LazyLock::new(|| PluginDefinition::named("demo.counter"));
+cordis_core::plugin_definition!(static DEFINITION_NOTE = "demo.note";);
+cordis_core::plugin_definition!(static DEFINITION_GREETER = "demo.greeter";);
+cordis_core::plugin_definition!(static DEFINITION_COUNTER = "demo.counter";);
 
 // --- Plugins -----------------------------------------------------------------
 

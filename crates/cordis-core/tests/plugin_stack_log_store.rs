@@ -8,15 +8,13 @@ mod log_store;
 mod url_redact;
 
 mod keys {
-    use cordis_core::{PluginDefinition, ServiceKey};
+    use cordis_core::ServiceKey;
 
     use crate::db::Db;
 
     pub static DB: ServiceKey<Db> = ServiceKey::new("demo.stack.db@1");
-    pub static KEY_DB: std::sync::LazyLock<PluginDefinition> =
-        std::sync::LazyLock::new(|| PluginDefinition::named("demo.stack.db"));
-    pub static KEY_LOG_STORE: std::sync::LazyLock<PluginDefinition> =
-        std::sync::LazyLock::new(|| PluginDefinition::named("demo.stack.log-store"));
+    cordis_core::plugin_definition!(pub static KEY_DB = "demo.stack.db";);
+    cordis_core::plugin_definition!(pub static KEY_LOG_STORE = "demo.stack.log-store";);
 }
 
 use cordis_core::{FiberState, Runtime};

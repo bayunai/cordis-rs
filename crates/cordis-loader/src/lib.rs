@@ -51,9 +51,11 @@ pub use volatile::{ConfigClosed, ConfigRef, ConfigSnapshot, ConfigSubscription};
 pub use schemars;
 pub use toml;
 
-/// Loader 插件的运行时定义。
-pub static PLUGIN_DEFINITION: std::sync::LazyLock<cordis_core::PluginDefinition> =
-    std::sync::LazyLock::new(|| cordis_core::PluginDefinition::named("cordis.loader"));
-/// 内建分组的运行时定义。
-pub static GROUP_DEFINITION: std::sync::LazyLock<cordis_core::PluginDefinition> =
-    std::sync::LazyLock::new(|| cordis_core::PluginDefinition::named("cordis.loader.group"));
+cordis_core::plugin_definition!(
+    /// Loader 插件的运行时定义。
+    pub static PLUGIN_DEFINITION = "cordis.loader";
+);
+cordis_core::plugin_definition!(
+    /// 内建分组的运行时定义。
+    pub static GROUP_DEFINITION = "cordis.loader.group";
+);

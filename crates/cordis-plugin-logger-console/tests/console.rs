@@ -6,8 +6,7 @@ use cordis_plugin_logger_console::{
 };
 use std::{collections::BTreeMap, sync::Arc, time::SystemTime};
 
-static APP_DEFINITION: std::sync::LazyLock<cordis_core::PluginDefinition> =
-    std::sync::LazyLock::new(|| cordis_core::PluginDefinition::named("demo.app"));
+cordis_core::plugin_definition!(static APP_DEFINITION = "demo.app";);
 
 fn record(level: LogLevel, target: &str, message: &str, default_level: LogLevel) -> LogRecord {
     LogRecord {

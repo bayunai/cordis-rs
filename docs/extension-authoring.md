@@ -90,11 +90,10 @@ settings → config-editor → Loader 定位来源。Group 不参与路径前缀
 
 ```rust
 use async_trait::async_trait;
-use cordis_core::{Context, CoreError, Plugin, PluginDefinition, Runtime, ServiceKey};
-use std::sync::{Arc, LazyLock};
+use cordis_core::{Context, CoreError, Plugin, Runtime, ServiceKey};
+use std::sync::Arc;
 
-static GREETER_DEFINITION: LazyLock<PluginDefinition> =
-    LazyLock::new(|| PluginDefinition::named("demo.greeter"));
+cordis_core::plugin_definition!(static GREETER_DEFINITION = "demo.greeter";);
 
 struct Greeter;
 static GREETER: ServiceKey<&'static str> = ServiceKey::new("demo.greeter@1");
@@ -206,7 +205,7 @@ use cordis_core::Plugin;
 use cordis_loader::{ExtensionFactory, LoaderError, PreparedExtension};
 use serde::Deserialize;
 use schemars::JsonSchema;
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 
 struct GreeterFactory;
 
@@ -304,3 +303,7 @@ Runtime shutdown 都会停止未触发回调；等待中的 `sleep` / `ticks` �
 - 不要给 `Context` 做 Timer mixin；未挂载 `TimerPlugin` 时不得假定计时器可用。
 
 Provider 应注册在实际拥有服务资源的 Scope。该 Scope 的普通子 Effect 资源也会等待消费者完成；直接和传递消费者分支必须先清理。将服务注册到 Root 等过宽 Scope，可能与其他服务的资源归属形成循环等待并得到 `DependencyCycle`。宿主可通过 `let owner = root.effect()?; owner.provide(KEY, service)?;` 为服务建立独立资源归属。
+
+## 静态插件定义声明
+
+推荐用 `cordis_core::plugin_definition!(pub static PLUGIN_DEFINITION = "app.plugin";);` 声明共享定义。文档注释和属性写在宏参数内部，直接修饰生成的静态定义；支持 `pub(crate)` 等可见性及函数内声明。宏只接受名称字面量，不关联执行类型、不自动登记 Factory。动态定义继续使用 `PluginDefinition::named(name)`，匿名定义使用 `anonymous()`；每次创建新定义都获得独立身份，克隆才共享身份。挂载与 Catalog 登记仍显式引用定义句柄。
