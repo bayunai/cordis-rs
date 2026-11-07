@@ -215,7 +215,7 @@ checksum = "1c133bc6a41be0d194c306b5506d15e6feeea7b1d6604bd3f8310dfb2ca96486"
 
 [[package]]
 name = "cordis-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -237,7 +237,7 @@ dependencies = [
 
 [[package]]
 name = "cordis-host"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "cordis-core",
@@ -252,7 +252,7 @@ dependencies = [
 
 [[package]]
 name = "cordis-loader"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "cordis-core",
@@ -268,7 +268,7 @@ dependencies = [
 
 [[package]]
 name = "cordis-plugin-config-editor"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "cordis-core",
@@ -285,7 +285,7 @@ dependencies = [
 
 [[package]]
 name = "cordis-plugin-include"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "cordis-core",
@@ -305,7 +305,7 @@ dependencies = [
 
 [[package]]
 name = "cordis-plugin-logger-console"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "cordis-core",
@@ -315,7 +315,7 @@ dependencies = [
 
 [[package]]
 name = "cordis-plugin-plugin-manager"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "cordis-core",
@@ -333,7 +333,7 @@ dependencies = [
 
 [[package]]
 name = "cordis-plugin-settings"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "cordis-core",
@@ -347,7 +347,7 @@ dependencies = [
 
 [[package]]
 name = "cordis-plugin-timer"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "cordis-core",
@@ -362,7 +362,7 @@ dependencies = [
 
 [[package]]
 name = "cordis-testkit"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "cordis-core",

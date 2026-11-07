@@ -4,7 +4,7 @@
 资源归属、事件与运行时诊断。它不是 HTTP 框架、数据库抽象或动态插件加载器；这些能力应由
 应用或独立扩展实现。
 
-> 最近发布版本为 [`0.2.0`](CHANGELOG.md#020---2026-09-20)。本文展示当前工作区的未发布 API；接入前请阅读 [Definition 与 Fiber 迁移说明](docs/migration-plugin-definitions.md)。公共 API 尚未稳定。
+> 当前版本为 [`0.3.0`](CHANGELOG.md#030---2026-11-07)。从 0.2.x 升级前请阅读 [Definition 与 Fiber 迁移说明](docs/migration-plugin-definitions.md)及 [Loader／Include 迁移说明](docs/include.md#破坏性-api-迁移)。公共 API 尚未稳定。
 
 ## 适用场景
 
@@ -32,16 +32,16 @@
 
 ## 快速开始
 
-在应用的 `Cargo.toml` 中通过本地路径接入当前工作区的未发布版本：
+在应用的 `Cargo.toml` 中通过 Git 标签接入 0.3.0：
 
 ```toml
 [dependencies]
 async-trait = "0.1"
-cordis-core = { path = "/path/to/cordis-rs/crates/cordis-core" }
+cordis-core = { git = "https://github.com/bayunai/cordis-rs", tag = "v0.3.0" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
-> 将 `path` 替换为本地 checkout 的绝对路径。正式发布后再改用包含本次 API 的固定发布版本。
+> 其他 `cordis-*` crate 使用相同的 Git 仓库与 `v0.3.0` 标签；本版本以 Git 标签发布，不要求通过 crates.io 接入。
 
 ```rust
 use async_trait::async_trait;

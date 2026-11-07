@@ -4,7 +4,12 @@
 
 ## Unreleased
 
+## 0.3.0 - 2026-11-07
+
 ### 破坏性变更
+
+- 最低 Rust 版本提升为 1.99.0。Host 与 Loader 解耦；Loader 通过 `LoaderPlugin::new(catalog)` 创建空内存根，所有条目统一通过 `create()` 登记。
+- 文件编解码、Include 初始配置及 patches 迁入 `cordis-plugin-include`；自定义来源使用异步 `EntryTreeSource`，Factory 统一为 `prepare()` 与 `PreparedExtension`。
 
 - `dispose()` 立即禁止 Scope 树新增工作，任务取消及同步、异步清理由协调器按依赖顺序执行；`on_dispose` 不再保证返回前运行。子 Scope 使用独立取消令牌。
 - `PluginDefinition` 身份与 Plugin 对象分离；挂载和 Catalog 登记显式传 Definition。插件与派生注入统一为 Fiber，状态直接使用 `FiberState`。
@@ -17,8 +22,10 @@
 
 ### 新增
 
-- 增加 `cordis_core::plugin_definition!` 声明宏，统一静态具名定义的写法，支持文档、属性、可见性与函数内声明。宏展开为既有 `LazyLock<PluginDefinition>`，身份、挂载、依赖及生命周期语义不变；动态与匿名定义继续使用现有构造接口。
+- 新增配置控制插件 `cordis-plugin-config-editor`、`cordis-plugin-settings` 和 `cordis-plugin-plugin-manager`，提供分层配置投影、Schema 表单、秘密字段处理与插件库存／启停控制。
+- 支持 `PreparedExtension::volatile()` 类型化热配置与 `ConfigRef`，普通配置未变时原地提交热值；Loader 提供受管 Fiber 状态通知和稳定快照。
 
+- 增加 `cordis_core::plugin_definition!` 声明宏，统一静态具名定义的写法，支持文档、属性、可见性与函数内声明。宏展开为既有 `LazyLock<PluginDefinition>`，身份、挂载、依赖及生命周期语义不变；动态与匿名定义继续使用现有构造接口。
 - 显式注入按 Provider 实例与消费者执行 Scope 建立生命周期绑定，覆盖 Loading、Active、失败清理与在途卸载；提供者等待消费者全部清理完成后才取消任务和释放资源，适用于普通 Effect、插件重启替换、批量卸载与 Runtime shutdown。
 - 新增 `DependencyCycle { scopes }` 与 `LifecycleReentrant { scope }` 错误；`unmount` 的专用重入检查覆盖跨树服务依赖。
 - Loader 支持跨 Include 移动条目及 Group 同树成员。两侧全量预检后协调运行时，按目标、源顺序写回；目标写入失败不写源，`LoaderControlError::Move` 与 `MovePersistence` 分别报告实际快照、生命周期错误和两侧持久化状态；同树移动也使用该错误且只写所属来源一次。不回滚已发生的变更，取消等待不取消协调。
@@ -53,3 +60,5 @@
 - 补充 Effect、日志、生命周期、Loader、Include 与 Timer 的回归测试和架构文档。
 
 [0.2.0]: https://github.com/bayunai/cordis-rs/releases/tag/v0.2.0
+
+[0.3.0]: https://github.com/bayunai/cordis-rs/releases/tag/v0.3.0
