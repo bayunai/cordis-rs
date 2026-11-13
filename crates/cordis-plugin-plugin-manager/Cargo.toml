@@ -5,7 +5,6 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-homepage.workspace = true
 documentation.workspace = true
 readme = "README.md"
 description = "Entry inventory and enable/disable facade over ConfigEditor (DSH plugin-manager peer)."
